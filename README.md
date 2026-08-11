@@ -30,7 +30,7 @@ Three positions, enforced in code:
 ## Usage
 
 ```console
-$ systemd-mcpd --grant units:read,journal:read
+$ systemd-mcpd --grant units:read,journal:read,boot:read
 ```
 
 Claude Desktop / any MCP client:
@@ -40,15 +40,22 @@ Claude Desktop / any MCP client:
   "mcpServers": {
     "systemd": {
       "command": "/usr/local/bin/systemd-mcpd",
-      "args": ["--grant", "units:read,journal:read"]
+      "args": ["--grant", "units:read,journal:read,boot:read"]
     }
   }
 }
 ```
 
+Every scope is independent — grant less if you want less.
+
 Then ask your model: *"which units failed since boot, and why?"* — it will
 find `failed_units`, pull `unit_logs` for each, and answer from structured
-data instead of scraping `systemctl status` prose.
+data instead of scraping `systemctl status` prose. Or *"what made boot
+slow?"* — that lands on `boot_times` and `critical_chain`.
+
+Note that `journal:read` sees exactly what the invoking user can read:
+run as a member of the `systemd-journal` group to read the full journal
+(the shipped unit file already arranges this).
 
 ## Tools
 
@@ -110,4 +117,4 @@ irony, it's layering.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
