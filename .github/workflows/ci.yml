@@ -1,0 +1,25 @@
+# CI: format, lint, test, build. No third-party actions beyond checkout —
+# the supply chain of a security-posture project should be short enough
+# to read aloud.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup update stable && rustup default stable
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+      - name: Release build
+        run: cargo build --release
