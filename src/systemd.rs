@@ -29,23 +29,28 @@ pub enum Scope {
 }
 
 impl Scope {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "units:read" => Some(Scope::UnitsRead),
-            "journal:read" => Some(Scope::JournalRead),
-            "boot:read" => Some(Scope::BootRead),
-            _ => None,
+    /// Every scope, in display order. `parse` and error text derive from
+    /// this; a new scope is one variant, one `name` arm, one entry here.
+    const ALL: &'static [Scope] = &[Scope::UnitsRead, Scope::JournalRead, Scope::BootRead];
+
+    /// The wire name. The one place a scope spells itself — the compiler
+    /// forces a new variant to add its arm, and everything else derives.
+    fn name(self) -> &'static str {
+        match self {
+            Scope::UnitsRead => "units:read",
+            Scope::JournalRead => "journal:read",
+            Scope::BootRead => "boot:read",
         }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Scope::ALL.iter().copied().find(|scope| scope.name() == s)
     }
 }
 
 impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Scope::UnitsRead => write!(f, "units:read"),
-            Scope::JournalRead => write!(f, "journal:read"),
-            Scope::BootRead => write!(f, "boot:read"),
-        }
+        f.write_str(self.name())
     }
 }
 
@@ -58,7 +63,8 @@ impl Grants {
         let mut scopes = Vec::new();
         for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             let scope = Scope::parse(part).ok_or_else(|| {
-                format!("unknown scope '{part}' (known: units:read, journal:read, boot:read)")
+                let known: Vec<&str> = Scope::ALL.iter().map(|s| s.name()).collect();
+                format!("unknown scope '{part}' (known: {})", known.join(", "))
             })?;
             if !scopes.contains(&scope) {
                 scopes.push(scope);
@@ -137,29 +143,37 @@ fn run_json(program: &str, args: &[&str]) -> Result<Value, BackendError> {
         .map_err(|e| BackendError(format!("{program} produced invalid JSON: {e}")))
 }
 
-/// Runs `systemctl show`-style commands and collects the `Key=Value` lines.
-fn run_key_values(program: &str, args: &[&str]) -> Result<Vec<(String, String)>, BackendError> {
+/// Runs `systemctl show`-style commands and collects the `Key=Value` lines
+/// into an object, keyed for lookup (systemctl doesn't repeat keys).
+fn run_key_values(
+    program: &str,
+    args: &[&str],
+) -> Result<serde_json::Map<String, Value>, BackendError> {
     let stdout = run(program, args)?;
     let text = String::from_utf8_lossy(&stdout);
     Ok(text
         .lines()
         .filter_map(|line| {
             let (key, value) = line.split_once('=')?;
-            Some((key.to_string(), value.to_string()))
+            Some((key.to_string(), Value::String(value.to_string())))
         })
         .collect())
 }
 
+/// Unit states accepted by the `list_units` filter. Also the schema enum
+/// advertised in `tools/list` — one list, so the contract can't drift from
+/// the check.
+pub const STATES: &[&str] = &["active", "inactive", "failed", "activating", "deactivating"];
+
 /// `list_units`: all currently loaded units, optionally filtered by state.
 ///
-/// Prefers PID 1's native varlink socket (systemd ≥ 257) and falls back to
+/// Prefers PID 1's native varlink socket (systemd ≥ 258) and falls back to
 /// systemctl on any surprise — same JSON shape either way, so the caller
-/// never learns which backend answered. That's the contract.
+/// never learns which backend answered. That's the contract, which is also
+/// why the state filter is applied here, once, after either backend: filter
+/// semantics defined per backend is how the backends drift apart.
 pub fn list_units(state: Option<&str>) -> Result<Value, BackendError> {
     if let Some(state) = state {
-        // Vetted filter values; systemctl would reject others anyway, but an
-        // allowlist keeps the contract obvious.
-        const STATES: &[&str] = &["active", "inactive", "failed", "activating", "deactivating"];
         if !STATES.contains(&state) {
             return Err(BackendError(format!(
                 "unknown state filter '{state}' (known: {})",
@@ -168,21 +182,27 @@ pub fn list_units(state: Option<&str>) -> Result<Value, BackendError> {
         }
     }
 
-    if let Ok(units) = crate::varlink::list_units() {
-        let filtered: Vec<Value> = units
+    let units = match crate::varlink::list_units() {
+        Ok(units) => units,
+        Err(_) => match run_json(
+            "systemctl",
+            &["list-units", "--all", "--output=json", "--no-pager"],
+        )? {
+            Value::Array(units) => units,
+            _ => {
+                return Err(BackendError(
+                    "systemctl list-units did not produce a JSON array".into(),
+                ))
+            }
+        },
+    };
+
+    Ok(Value::Array(
+        units
             .into_iter()
             .filter(|u| state.is_none_or(|s| u["active"] == s))
-            .collect();
-        return Ok(Value::Array(filtered));
-    }
-
-    let mut args = vec!["list-units", "--all", "--output=json", "--no-pager"];
-    let state_arg;
-    if let Some(state) = state {
-        state_arg = format!("--state={state}");
-        args.push(&state_arg);
-    }
-    run_json("systemctl", &args)
+            .collect(),
+    ))
 }
 
 /// `failed_units`: shorthand for the question every session starts with.
@@ -196,11 +216,7 @@ pub fn failed_units() -> Result<Value, BackendError> {
 /// into an object so the model gets structure, not a wall of text.
 pub fn unit_properties(name: &str) -> Result<Value, BackendError> {
     validate_unit_name(name)?;
-    let props: serde_json::Map<String, Value> =
-        run_key_values("systemctl", &["show", "--no-pager", "--", name])?
-            .into_iter()
-            .map(|(k, v)| (k, Value::String(v)))
-            .collect();
+    let props = run_key_values("systemctl", &["show", "--no-pager", "--", name])?;
 
     if props.is_empty() {
         return Err(BackendError(format!("no such unit: {name}")));
@@ -289,29 +305,25 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// through the stable `Key=Value` output of `systemctl show` — structured
 /// data at the source instead of parsing systemd-analyze's prose summary.
 pub fn boot_times() -> Result<Value, BackendError> {
-    let props = run_key_values(
-        "systemctl",
-        &[
-            "show",
-            "--no-pager",
-            "--property=FirmwareTimestampMonotonic,LoaderTimestampMonotonic,\
-             InitRDTimestampMonotonic,UserspaceTimestampMonotonic,FinishTimestampMonotonic",
-        ],
-    )?;
-    let get = |key: &str| {
+    // Spelled once: the same array asks systemctl for the properties and
+    // reads them back, so a typo can't silently read as "phase absent".
+    const PROPS: [&str; 5] = [
+        "FirmwareTimestampMonotonic",
+        "LoaderTimestampMonotonic",
+        "InitRDTimestampMonotonic",
+        "UserspaceTimestampMonotonic",
+        "FinishTimestampMonotonic",
+    ];
+    let prop_arg = format!("--property={}", PROPS.join(","));
+    let props = run_key_values("systemctl", &["show", "--no-pager", &prop_arg])?;
+    let [firmware, loader, initrd, userspace, finish] = PROPS.map(|key| {
         props
-            .iter()
-            .find(|(k, _)| k == key)
-            .and_then(|(_, v)| v.parse::<u64>().ok())
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0)
-    };
-    compute_boot_times(
-        get("FirmwareTimestampMonotonic"),
-        get("LoaderTimestampMonotonic"),
-        get("InitRDTimestampMonotonic"),
-        get("UserspaceTimestampMonotonic"),
-        get("FinishTimestampMonotonic"),
-    )
+    });
+    compute_boot_times(firmware, loader, initrd, userspace, finish)
 }
 
 /// The phase arithmetic, mirroring systemd-analyze: `firmware` and `loader`
@@ -389,17 +401,9 @@ fn parse_critical_chain(text: &str) -> Vec<Value> {
     let mut chain = Vec::new();
     for line in text.lines() {
         // Strip the tree drawing; what's left starts with the unit name.
-        let mut tree_chars = 0usize;
-        let mut start = line.len();
-        for (i, c) in line.char_indices() {
-            if matches!(c, ' ' | '└' | '├' | '│' | '─') {
-                tree_chars += 1;
-            } else {
-                start = i;
-                break;
-            }
-        }
-        let mut tokens = line[start..].split_whitespace();
+        let rest = line.trim_start_matches([' ', '└', '├', '│', '─']);
+        let depth = (line.chars().count() - rest.chars().count()) / 2;
+        let mut tokens = rest.split_whitespace();
         let Some(name) = tokens.next() else { continue };
         // The header prose ("The time when unit became active...") has no
         // unit-name shape; a dot is what separates ssh.service from a word.
@@ -407,38 +411,25 @@ fn parse_critical_chain(text: &str) -> Vec<Value> {
             continue;
         }
 
-        enum Field {
-            None,
-            Activated,
-            Duration,
-        }
         let mut activated: Option<String> = None;
         let mut duration: Option<String> = None;
-        let mut field = Field::None;
         for token in tokens {
             if let Some(t) = token.strip_prefix('@') {
                 activated = Some(t.to_string());
-                field = Field::Activated;
             } else if let Some(t) = token.strip_prefix('+') {
                 duration = Some(t.to_string());
-                field = Field::Duration;
-            } else {
-                // Continuation of a multi-token timespan: "@1min 30.5s".
-                let target = match field {
-                    Field::Activated => &mut activated,
-                    Field::Duration => &mut duration,
-                    Field::None => continue,
-                };
-                if let Some(s) = target {
-                    s.push(' ');
-                    s.push_str(token);
-                }
+            } else if let Some(span) = duration.as_mut().or(activated.as_mut()) {
+                // Continuation of a multi-token timespan ("@1min 30.5s").
+                // `+` only ever follows `@` on a line, so "duration if set,
+                // else activated" is exactly the field written last.
+                span.push(' ');
+                span.push_str(token);
             }
         }
 
         chain.push(json!({
             "unit": name,
-            "depth": tree_chars / 2,
+            "depth": depth,
             "activated": activated,
             "duration": duration,
         }));

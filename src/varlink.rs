@@ -19,13 +19,15 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::systemd::BackendError;
+
 const MANAGER_SOCKET: &str = "/run/systemd/io.systemd.Manager";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Units via `io.systemd.Unit.List`, normalized to the exact shape
 /// `systemctl list-units --output=json` emits — callers cannot tell the
 /// backends apart, which is the point.
-pub fn list_units() -> Result<Vec<Value>, String> {
+pub fn list_units() -> Result<Vec<Value>, BackendError> {
     call(MANAGER_SOCKET, "io.systemd.Unit.List")?
         .iter()
         .map(normalize_unit)
@@ -35,9 +37,9 @@ pub fn list_units() -> Result<Vec<Value>, String> {
 /// One streamed method call ("more" mode, which is how systemd's List*
 /// methods reply: one message per entry, `continues` on all but the last).
 /// Returns each reply's `parameters`, in order.
-fn call(socket_path: &str, method: &str) -> Result<Vec<Value>, String> {
-    let stream =
-        UnixStream::connect(socket_path).map_err(|e| format!("connect {socket_path}: {e}"))?;
+fn call(socket_path: &str, method: &str) -> Result<Vec<Value>, BackendError> {
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|e| BackendError(format!("connect {socket_path}: {e}")))?;
     stream.set_read_timeout(Some(TIMEOUT)).ok();
     stream.set_write_timeout(Some(TIMEOUT)).ok();
 
@@ -45,30 +47,38 @@ fn call(socket_path: &str, method: &str) -> Result<Vec<Value>, String> {
         serde_json::to_vec(&json!({ "method": method, "parameters": {}, "more": true }))
             .expect("static request serializes");
     request.push(0);
-    (&stream)
+    stream
         .write_all(&request)
-        .map_err(|e| format!("write to {socket_path}: {e}"))?;
+        .map_err(|e| BackendError(format!("write to {socket_path}: {e}")))?;
 
     let mut reader = BufReader::new(&stream);
     let mut replies = Vec::new();
+    let mut buf = Vec::new();
     loop {
-        let mut buf = Vec::new();
+        buf.clear();
         reader
             .read_until(0, &mut buf)
-            .map_err(|e| format!("read from {socket_path}: {e}"))?;
+            .map_err(|e| BackendError(format!("read from {socket_path}: {e}")))?;
         if buf.pop() != Some(0) {
-            return Err("truncated varlink reply".into());
+            return Err(BackendError("truncated varlink reply".into()));
         }
-        let reply: Value =
-            serde_json::from_slice(&buf).map_err(|e| format!("bad varlink JSON: {e}"))?;
+        let mut reply: Value = serde_json::from_slice(&buf)
+            .map_err(|e| BackendError(format!("bad varlink JSON: {e}")))?;
         if let Some(error) = reply.get("error").and_then(Value::as_str) {
-            return Err(format!("varlink error: {error}"));
+            return Err(BackendError(format!("varlink error: {error}")));
         }
         let continues = reply
             .get("continues")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        replies.push(reply.get("parameters").cloned().unwrap_or(json!({})));
+        // Move the per-unit payload out rather than deep-cloning it — this
+        // is the hot path that exists to be the cheap backend.
+        replies.push(
+            reply
+                .get_mut("parameters")
+                .map(Value::take)
+                .unwrap_or(json!({})),
+        );
         if !continues {
             return Ok(replies);
         }
@@ -80,13 +90,13 @@ fn call(socket_path: &str, method: &str) -> Result<Vec<Value>, String> {
 /// shape goes out either way. A missing required field means the interface
 /// isn't what we expect — refuse and let the CLI answer, rather than emit
 /// half a unit.
-fn normalize_unit(entry: &Value) -> Result<Value, String> {
+fn normalize_unit(entry: &Value) -> Result<Value, BackendError> {
     let field = |section: &str, key: &str| {
         entry
             .get(section)
             .and_then(|s| s.get(key))
             .and_then(Value::as_str)
-            .ok_or_else(|| format!("varlink unit entry missing '{section}.{key}'"))
+            .ok_or_else(|| BackendError(format!("varlink unit entry missing '{section}.{key}'")))
     };
     Ok(json!({
         "unit": field("context", "ID")?,
@@ -148,7 +158,7 @@ mod tests {
     fn error_replies_and_dead_sockets_are_errors() {
         let (path, _server) = serve(&[r#"{"error":"org.varlink.service.MethodNotFound"}"#]);
         let err = call(path.to_str().unwrap(), "io.systemd.Unit.List").unwrap_err();
-        assert!(err.contains("MethodNotFound"), "got: {err}");
+        assert!(err.0.contains("MethodNotFound"), "got: {err}");
         // No socket at all — the everyday case on systemd < 258.
         assert!(call("/no/such/socket", "x").is_err());
     }

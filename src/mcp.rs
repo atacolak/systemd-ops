@@ -11,23 +11,44 @@ use std::io::{BufRead, Write};
 
 use serde_json::{json, Value};
 
-use crate::systemd::{self, Grants, Scope};
+use crate::systemd::{self, BackendError, Grants, Scope};
 
 /// Protocol revisions we know, newest first. Per spec: echo the client's
 /// requested version if we support it, otherwise answer with our newest and
 /// let the client decide whether to proceed.
 const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
-/// One tool: its wire description and the scope that gates it.
+/// A tool call fails one of two ways, and they travel differently on the
+/// wire: bad arguments are a protocol error (JSON-RPC -32602), backend
+/// failures are tool-level errors (`isError: true`) the model reacts to.
+enum CallError {
+    Args(&'static str),
+    Backend(BackendError),
+}
+
+impl From<BackendError> for CallError {
+    fn from(e: BackendError) -> Self {
+        CallError::Backend(e)
+    }
+}
+
+fn required_unit(args: &Value) -> Result<&str, CallError> {
+    args.get("unit")
+        .and_then(Value::as_str)
+        .ok_or(CallError::Args("missing required argument: unit"))
+}
+
+/// One tool: its wire description, the scope that gates it, and its handler.
 struct Tool {
     name: &'static str,
     scope: Scope,
     description: &'static str,
     input_schema: fn() -> Value,
+    run: fn(&Value) -> Result<Value, CallError>,
 }
 
-/// The registry. Adding a tool means adding one entry here and one match arm
-/// in `call_tool` — the compiler complains if you forget the second half.
+/// The registry. Adding a tool is one entry — schema, scope, and handler
+/// together; there is no second dispatch site to forget.
 const TOOLS: &[Tool] = &[
     Tool {
         name: "list_units",
@@ -40,11 +61,16 @@ const TOOLS: &[Tool] = &[
                 "properties": {
                     "state": {
                         "type": "string",
-                        "enum": ["active", "inactive", "failed", "activating", "deactivating"],
+                        "enum": systemd::STATES,
                         "description": "Only return units in this state."
                     }
                 }
             })
+        },
+        run: |args| {
+            Ok(systemd::list_units(
+                args.get("state").and_then(Value::as_str),
+            )?)
         },
     },
     Tool {
@@ -53,6 +79,7 @@ const TOOLS: &[Tool] = &[
         description: "List units that are currently in the failed state. \
                       The usual first question on an unhealthy machine.",
         input_schema: || json!({ "type": "object", "properties": {} }),
+        run: |_| Ok(systemd::failed_units()?),
     },
     Tool {
         name: "unit_properties",
@@ -68,6 +95,7 @@ const TOOLS: &[Tool] = &[
                 "required": ["unit"]
             })
         },
+        run: |args| Ok(systemd::unit_properties(required_unit(args)?)?),
     },
     Tool {
         name: "unit_logs",
@@ -89,6 +117,10 @@ const TOOLS: &[Tool] = &[
                 "required": ["unit"]
             })
         },
+        run: |args| {
+            let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(50);
+            Ok(systemd::unit_logs(required_unit(args)?, lines)?)
+        },
     },
     Tool {
         name: "boot_times",
@@ -97,6 +129,7 @@ const TOOLS: &[Tool] = &[
                       and userspace phases. Microsecond values, read from the same manager \
                       timestamps systemd-analyze uses. Phases that did not occur are omitted.",
         input_schema: || json!({ "type": "object", "properties": {} }),
+        run: |_| Ok(systemd::boot_times()?),
     },
     Tool {
         name: "critical_chain",
@@ -115,6 +148,11 @@ const TOOLS: &[Tool] = &[
                     }
                 }
             })
+        },
+        run: |args| {
+            Ok(systemd::critical_chain(
+                args.get("unit").and_then(Value::as_str),
+            )?)
         },
     },
 ];
@@ -220,30 +258,12 @@ fn tools_call(id: Value, params: &Value, grants: &Grants) -> String {
         );
     }
 
-    let result = match name {
-        "list_units" => systemd::list_units(args.get("state").and_then(Value::as_str)),
-        "failed_units" => systemd::failed_units(),
-        "unit_properties" => match args.get("unit").and_then(Value::as_str) {
-            Some(unit) => systemd::unit_properties(unit),
-            None => return error_reply(id, -32602, "missing required argument: unit"),
-        },
-        "unit_logs" => match args.get("unit").and_then(Value::as_str) {
-            Some(unit) => {
-                let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(50);
-                systemd::unit_logs(unit, lines)
-            }
-            None => return error_reply(id, -32602, "missing required argument: unit"),
-        },
-        "boot_times" => systemd::boot_times(),
-        "critical_chain" => systemd::critical_chain(args.get("unit").and_then(Value::as_str)),
-        _ => unreachable!("tool in registry but not dispatched: {name}"),
-    };
-
     // Backend failures are tool-level errors (isError: true), not protocol
     // errors: the conversation goes on, the model just learns what happened.
-    let (text, is_error) = match result {
+    let (text, is_error) = match (tool.run)(&args) {
         Ok(value) => (value.to_string(), false),
-        Err(e) => (e.to_string(), true),
+        Err(CallError::Args(msg)) => return error_reply(id, -32602, msg),
+        Err(CallError::Backend(e)) => (e.to_string(), true),
     };
     result_reply(
         id,
@@ -279,6 +299,16 @@ mod tests {
             .unwrap()
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// The advertised tool names in a tools/list reply.
+    fn tool_names(reply: &Value) -> Vec<&str> {
+        reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
             .collect()
     }
 
@@ -325,14 +355,11 @@ mod tests {
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"unit_logs","arguments":{"unit":"ssh.service"}}}
 "#,
         );
-        let names: Vec<&str> = replies[0]["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
         // journal- and boot-scoped tools are invisible without their scopes...
-        assert_eq!(names, ["list_units", "failed_units", "unit_properties"]);
+        assert_eq!(
+            tool_names(&replies[0]),
+            ["list_units", "failed_units", "unit_properties"]
+        );
         // ...and calling one anyway is refused, not routed.
         let msg = replies[1]["error"]["message"].as_str().unwrap();
         assert!(msg.contains("journal:read"), "got: {msg}");
@@ -347,13 +374,7 @@ mod tests {
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_units"}}
 "#,
         );
-        let names: Vec<&str> = replies[0]["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(names, ["boot_times", "critical_chain"]);
+        assert_eq!(tool_names(&replies[0]), ["boot_times", "critical_chain"]);
         let msg = replies[1]["error"]["message"].as_str().unwrap();
         assert!(msg.contains("units:read"), "got: {msg}");
     }

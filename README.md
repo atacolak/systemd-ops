@@ -1,7 +1,7 @@
 # systemd-mcpd
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server for systemd.
-Read-only. Capability-scoped. Two dependencies. 543 KB.
+Read-only. Capability-scoped. Two dependencies. 544 KB.
 
 PID 1 as a tool call — but only the tools you explicitly handed over.
 
