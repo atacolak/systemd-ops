@@ -28,24 +28,62 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// `systemctl list-units --output=json` emits — callers cannot tell the
 /// backends apart, which is the point.
 pub fn list_units() -> Result<Vec<Value>, BackendError> {
-    call(MANAGER_SOCKET, "io.systemd.Unit.List")?
+    call(MANAGER_SOCKET, "io.systemd.Unit.List", true)?
         .iter()
         .map(normalize_unit)
         .collect()
 }
 
-/// One streamed method call ("more" mode, which is how systemd's List*
-/// methods reply: one message per entry, `continues` on all but the last).
-/// Returns each reply's `parameters`, in order.
-fn call(socket_path: &str, method: &str) -> Result<Vec<Value>, BackendError> {
+/// Boot timestamps via `io.systemd.Manager.Describe` (a plain method, no
+/// streaming): the same five monotonic values `systemctl show` serves,
+/// in the [firmware, loader, initrd, userspace, finish] order
+/// `compute_boot_times` expects. Absent or null phases map to 0, matching
+/// the CLI's semantics; a reply without `UserspaceTimestamp` at all is
+/// not the interface we expect and refuses, so the CLI answers.
+pub fn boot_timestamps() -> Result<[u64; 5], BackendError> {
+    let replies = call(MANAGER_SOCKET, "io.systemd.Manager.Describe", false)?;
+    extract_boot_timestamps(
+        replies
+            .first()
+            .ok_or_else(|| BackendError("empty varlink Describe reply".into()))?,
+    )
+}
+
+fn extract_boot_timestamps(reply: &Value) -> Result<[u64; 5], BackendError> {
+    let runtime = reply
+        .get("runtime")
+        .ok_or_else(|| BackendError("varlink Describe reply has no runtime".into()))?;
+    let monotonic = |key: &str| {
+        runtime
+            .get(key)
+            .and_then(|t| t.get("monotonic"))
+            .and_then(Value::as_u64)
+    };
+    let userspace = monotonic("UserspaceTimestamp")
+        .ok_or_else(|| BackendError("varlink Describe reply has no UserspaceTimestamp".into()))?;
+    Ok([
+        monotonic("FirmwareTimestamp").unwrap_or(0),
+        monotonic("LoaderTimestamp").unwrap_or(0),
+        monotonic("InitRDTimestamp").unwrap_or(0),
+        userspace,
+        monotonic("FinishTimestamp").unwrap_or(0),
+    ])
+}
+
+/// One method call. With `more`, expect systemd's List-style streaming
+/// (one message per entry, `continues` on all but the last); without it,
+/// a single reply. Returns each reply's `parameters`, in order.
+fn call(socket_path: &str, method: &str, more: bool) -> Result<Vec<Value>, BackendError> {
     let mut stream = UnixStream::connect(socket_path)
         .map_err(|e| BackendError(format!("connect {socket_path}: {e}")))?;
     stream.set_read_timeout(Some(TIMEOUT)).ok();
     stream.set_write_timeout(Some(TIMEOUT)).ok();
 
-    let mut request =
-        serde_json::to_vec(&json!({ "method": method, "parameters": {}, "more": true }))
-            .expect("static request serializes");
+    let mut message = json!({ "method": method, "parameters": {} });
+    if more {
+        message["more"] = json!(true);
+    }
+    let mut request = serde_json::to_vec(&message).expect("static request serializes");
     request.push(0);
     stream
         .write_all(&request)
@@ -145,7 +183,7 @@ mod tests {
             r#"{"parameters":{"context":{"ID":"a.service"}},"continues":true}"#,
             r#"{"parameters":{"context":{"ID":"b.service"}}}"#,
         ]);
-        let replies = call(path.to_str().unwrap(), "io.systemd.Unit.List").unwrap();
+        let replies = call(path.to_str().unwrap(), "io.systemd.Unit.List", true).unwrap();
         assert_eq!(replies.len(), 2);
         assert_eq!(replies[1]["context"]["ID"], json!("b.service"));
         // The request asked for streaming, as systemd's List methods require.
@@ -155,12 +193,43 @@ mod tests {
     }
 
     #[test]
+    fn plain_methods_omit_more() {
+        let (path, server) = serve(&[r#"{"parameters":{"runtime":{}}}"#]);
+        let replies = call(path.to_str().unwrap(), "io.systemd.Manager.Describe", false).unwrap();
+        assert_eq!(replies.len(), 1);
+        // Describe is a plain method: the request must not ask to stream.
+        let request = server.join().unwrap();
+        assert!(request.get("more").is_none());
+    }
+
+    #[test]
+    fn boot_timestamp_extraction() {
+        // Shape per v261.2: runtime carries dual-clock Timestamp objects.
+        let reply = json!({
+            "context": {},
+            "runtime": {
+                "FirmwareTimestamp": { "realtime": 1, "monotonic": 5_000_000 },
+                "LoaderTimestamp": { "realtime": 2, "monotonic": 2_000_000 },
+                "InitRDTimestamp": null,
+                "UserspaceTimestamp": { "realtime": 3, "monotonic": 4_000_000 },
+                "FinishTimestamp": { "realtime": 4, "monotonic": 10_000_000 }
+            }
+        });
+        assert_eq!(
+            extract_boot_timestamps(&reply).unwrap(),
+            [5_000_000, 2_000_000, 0, 4_000_000, 10_000_000]
+        );
+        // No UserspaceTimestamp at all → not our interface → refuse.
+        assert!(extract_boot_timestamps(&json!({ "runtime": {} })).is_err());
+    }
+
+    #[test]
     fn error_replies_and_dead_sockets_are_errors() {
         let (path, _server) = serve(&[r#"{"error":"org.varlink.service.MethodNotFound"}"#]);
-        let err = call(path.to_str().unwrap(), "io.systemd.Unit.List").unwrap_err();
+        let err = call(path.to_str().unwrap(), "io.systemd.Unit.List", true).unwrap_err();
         assert!(err.0.contains("MethodNotFound"), "got: {err}");
         // No socket at all — the everyday case on systemd < 258.
-        assert!(call("/no/such/socket", "x").is_err());
+        assert!(call("/no/such/socket", "x", true).is_err());
     }
 
     #[test]

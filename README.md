@@ -1,7 +1,7 @@
 # systemd-mcpd
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server for systemd.
-Read-only. Capability-scoped. Two dependencies. 544 KB.
+Read-only. Capability-scoped. Two dependencies. 579 KB.
 
 PID 1 as a tool call — but only the tools you explicitly handed over.
 
@@ -59,14 +59,20 @@ run as a member of the `systemd-journal` group to read the full journal
 
 ## Tools
 
-| Tool              | Scope          | Does                                        |
-|-------------------|----------------|---------------------------------------------|
-| `list_units`      | `units:read`   | All loaded units, optional state filter     |
-| `failed_units`    | `units:read`   | Units currently failed                      |
-| `unit_properties` | `units:read`   | Full property set of one unit               |
-| `unit_logs`       | `journal:read` | Recent journal entries for one unit         |
-| `boot_times`      | `boot:read`    | Boot duration split by phase, in µs         |
-| `critical_chain`  | `boot:read`    | Units that gated reaching a target at boot  |
+| Tool                | Scope          | Does                                        |
+|---------------------|----------------|---------------------------------------------|
+| `list_units`        | `units:read`   | All loaded units, optional state filter     |
+| `failed_units`      | `units:read`   | Units currently failed                      |
+| `unit_properties`   | `units:read`   | Full property set of one unit               |
+| `list_timers`       | `units:read`   | Timer units: schedules and what they run    |
+| `list_sockets`      | `units:read`   | Socket units: listeners and what they run   |
+| `list_unit_files`   | `units:read`   | Installed unit files and enablement state   |
+| `unit_dependencies` | `units:read`   | One unit's dependency edges, by relation    |
+| `unit_security`     | `units:read`   | systemd-analyze's exposure analysis of one unit |
+| `unit_logs`         | `journal:read` | Recent journal entries, optional priority filter |
+| `boot_times`        | `boot:read`    | Boot duration split by phase, in µs         |
+| `critical_chain`    | `boot:read`    | Units that gated reaching a target at boot  |
+| `boot_blame`        | `boot:read`    | Units by own startup time, slowest first    |
 
 ## Design notes
 
@@ -75,13 +81,17 @@ run as a member of the `systemd-journal` group to read the full journal
   the server makes is a plain, auditable process invocation, and the binary
   survives systemd version skew the way the CLIs do.
 - **Native varlink where systemd serves it.** On systemd ≥ 258 unit listing
-  talks straight to PID 1's varlink socket (`io.systemd.Unit.List` on
+  and boot timestamps talk straight to PID 1's varlink socket
+  (`io.systemd.Unit.List` and `io.systemd.Manager.Describe` on
   `/run/systemd/io.systemd.Manager`, verified against the v261.2 interface
-  definitions) — spoken by ~90 lines of stdlib `UnixStream`, no varlink
+  definitions) — spoken by ~150 lines of stdlib `UnixStream`, no varlink
   crate. The probe is the `connect()` itself: any surprise — no socket, old
   systemd, unfamiliar reply shape — falls back to `systemctl` silently,
   with the same JSON shape either way, so the caller never learns which
-  backend answered.
+  backend answered. Journal reads stay on `journalctl` deliberately: the
+  varlink journal API (`io.systemd.JournalAccess`, systemd 260) is served
+  by exec'ing journalctl, not by a socket, so it would spawn the same
+  process for a worse interface.
 - **No async runtime.** MCP's stdio transport is line-delimited JSON-RPC on
   a pipe. A blocking read loop is the honest shape of that; tokio would be
   most of the binary for none of the benefit.
@@ -92,13 +102,15 @@ run as a member of the `systemd-journal` group to read the full journal
 - **Journal entries are pruned** to timestamp/priority/message/pid. Handing
   a model forty metadata fields per line is how context windows die. What
   survives is typed: RFC 3339 timestamps, integer priority and pid.
-- **One prose parser, fenced.** `critical_chain` is the single tool with no
-  machine-readable source anywhere in systemd — not D-Bus, not
-  `--output=json`. Its output is parsed by a pure function with tests over
-  captured output, and that function gets deleted the day systemd grows a
-  structured equivalent. `boot_times` needs no such apology: it reads the
-  same manager timestamps `systemd-analyze time` reads, via `systemctl
-  show`'s stable `Key=Value` output.
+- **Two prose parsers, fenced.** `critical_chain` and `boot_blame` are the
+  only tools with no machine-readable source anywhere in systemd — not
+  D-Bus, not varlink, not `--output=json`. Each is parsed by a pure
+  function with tests over captured output, and each gets deleted the day
+  systemd grows a structured equivalent. Everything else is JSON or
+  `Key=Value` at the source — `unit_dependencies` reads dependency edges
+  from unit properties rather than scraping `list-dependencies`' tree
+  drawing, and `boot_times` reads the manager timestamps `systemd-analyze
+  time` reads.
 
 ## Building
 

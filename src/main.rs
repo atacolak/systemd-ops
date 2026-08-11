@@ -25,9 +25,10 @@ Usage:
   systemd-mcpd --help | --version
 
 Scopes:
-  units:read      list units, failed units, unit properties
+  units:read      units, timers, sockets, unit files, properties,
+                  dependencies, security analysis
   journal:read    read journal entries per unit
-  boot:read       boot phase timings and the boot-time critical chain
+  boot:read       boot phase timings, critical chain, blame
 
 The server speaks MCP over stdio. Tools outside the granted scopes are
 neither advertised nor callable. There are no write scopes; there is

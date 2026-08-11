@@ -47,7 +47,7 @@ expect_error() { # expect_error <scopes> <tool> <args-json> <substring>
 echo "== scope gating"
 names=$(rpc units:read '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' |
   jq -r '.result.tools | map(.name) | join(",")')
-[ "$names" = "list_units,failed_units,unit_properties" ] ||
+[ "$names" = "list_units,failed_units,unit_properties,list_timers,list_sockets,list_unit_files,unit_dependencies,unit_security" ] ||
   fail "tools/list under units:read advertised: $names"
 expect_error units:read unit_logs '{"unit":"ssh.service"}' "journal:read"
 expect_error units:read boot_times '{}' "boot:read"
@@ -69,6 +69,27 @@ tool units:read unit_properties '{"unit":"systemd-journald.service"}' |
   jq -e '.properties.ExecStart | length > 0' >/dev/null ||
   fail "journald properties have no ExecStart"
 
+echo "== list_timers / list_sockets / list_unit_files"
+tool units:read list_timers '{}' | jq -e 'type == "array"' >/dev/null ||
+  fail "list_timers not an array"
+tool units:read list_sockets '{}' |
+  jq -e 'type == "array" and length > 0' >/dev/null ||
+  fail "list_sockets empty (journald sockets should always exist)"
+files=$(tool units:read list_unit_files '{}')
+jq -e 'map(.unit_file) | index("systemd-journald.service")' <<<"$files" >/dev/null ||
+  fail "journald missing from list_unit_files"
+tool units:read list_unit_files '{"state":"static"}' |
+  jq -e 'length > 0 and all(.[]; .state == "static")' >/dev/null ||
+  fail "list_unit_files state filter leaked non-static rows"
+
+echo "== unit_dependencies / unit_security"
+tool units:read unit_dependencies '{"unit":"multi-user.target"}' |
+  jq -e '.dependencies.After | length > 0' >/dev/null ||
+  fail "multi-user.target has no After edges"
+tool units:read unit_security '{"unit":"systemd-journald.service"}' |
+  jq -e '.analysis | type == "array" and length > 0' >/dev/null ||
+  fail "unit_security produced no analysis rows"
+
 echo "== unit_logs (canary through a transient unit)"
 $HOST systemd-run --unit=mcpd-canary.service --collect \
   /bin/sh -c 'echo mcpd-canary-marker' >/dev/null 2>&1
@@ -82,8 +103,18 @@ for _ in $(seq 15); do
   sleep 1
 done
 [ -n "$found" ] || fail "canary log line never appeared in unit_logs"
+# The lines cap holds...
+tool journal:read unit_logs '{"unit":"mcpd-canary.service","lines":3}' |
+  jq -e '.entries | length <= 3' >/dev/null || fail "lines cap not applied"
+# ...and the priority filter reaches journalctl: the canary logged at
+# info, so emerg-only must be empty and debug-and-above must include it.
+tool journal:read unit_logs '{"unit":"mcpd-canary.service","priority":0}' |
+  jq -e '.entries | length == 0' >/dev/null || fail "priority=0 returned entries"
+tool journal:read unit_logs '{"unit":"mcpd-canary.service","priority":7}' |
+  jq -e '.entries | map(.message) | index("mcpd-canary-marker")' >/dev/null ||
+  fail "priority=7 lost the canary"
 
-echo "== boot_times / critical_chain"
+echo "== boot_times / critical_chain / boot_blame"
 # Some hosts never finish startup — GitHub's runner VMs keep a unit
 # activating forever — and systemd is honest about it, so we are too.
 # Test whichever truth the host tells: real timings where bootup
@@ -95,10 +126,18 @@ if $HOST systemd-analyze time >/dev/null 2>&1; then
   tool boot:read critical_chain '{}' |
     jq -e '.chain | length > 0 and all(.[]; has("unit") and has("depth"))' >/dev/null ||
     fail "critical_chain empty or malformed"
+  tool boot:read critical_chain '{"unit":"systemd-journald.service"}' |
+    jq -e '.chain | length > 0' >/dev/null ||
+    fail "critical_chain with explicit unit came back empty"
+  tool boot:read boot_blame '{}' |
+    jq -e '.blame | length > 0 and all(.[]; has("unit") and has("time"))' >/dev/null ||
+    fail "boot_blame empty or malformed"
 else
   echo "   (bootup unfinished on this host - asserting the clean-error path)"
   expect_error boot:read boot_times '{}' "not yet finished"
   expect_error boot:read critical_chain '{}' "not yet finished"
+  expect_error boot:read critical_chain '{"unit":"systemd-journald.service"}' "not yet finished"
+  expect_error boot:read boot_blame '{}' "not yet finished"
 fi
 
 echo "PASS: all live integration tests"

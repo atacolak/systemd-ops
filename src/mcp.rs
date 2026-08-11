@@ -98,9 +98,82 @@ const TOOLS: &[Tool] = &[
         run: |args| Ok(systemd::unit_properties(required_unit(args)?)?),
     },
     Tool {
+        name: "list_timers",
+        scope: Scope::UnitsRead,
+        description: "List timer units: schedule, next elapse, last trigger, and the unit \
+                      each one activates.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        run: |_| Ok(systemd::list_timers()?),
+    },
+    Tool {
+        name: "list_sockets",
+        scope: Scope::UnitsRead,
+        description: "List socket units: what they listen on and the unit each one activates.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        run: |_| Ok(systemd::list_sockets()?),
+    },
+    Tool {
+        name: "list_unit_files",
+        scope: Scope::UnitsRead,
+        description: "List installed unit files and their enablement state — the on-disk \
+                      view, where list_units shows what is loaded. Optionally filter by \
+                      state (enabled, disabled, static, masked, generated, ...).",
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "state": {
+                        "type": "string",
+                        "description": "Only return unit files in this enablement state."
+                    }
+                }
+            })
+        },
+        run: |args| {
+            Ok(systemd::list_unit_files(
+                args.get("state").and_then(Value::as_str),
+            )?)
+        },
+    },
+    Tool {
+        name: "unit_dependencies",
+        scope: Scope::UnitsRead,
+        description: "One unit's dependency edges by relation, forward (Requires, Wants, \
+                      After, ...) and reverse (WantedBy, TriggeredBy, ...). Every relation \
+                      is present; empty ones are empty arrays.",
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "unit": { "type": "string", "description": "Unit name, e.g. ssh.service" }
+                },
+                "required": ["unit"]
+            })
+        },
+        run: |args| Ok(systemd::unit_dependencies(required_unit(args)?)?),
+    },
+    Tool {
+        name: "unit_security",
+        scope: Scope::UnitsRead,
+        description: "systemd-analyze's sandboxing exposure analysis of one running \
+                      service: which hardening options it uses, which it lacks, and the \
+                      overall exposure score.",
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "unit": { "type": "string", "description": "Unit name, e.g. ssh.service" }
+                },
+                "required": ["unit"]
+            })
+        },
+        run: |args| Ok(systemd::unit_security(required_unit(args)?)?),
+    },
+    Tool {
         name: "unit_logs",
         scope: Scope::JournalRead,
-        description: "Read the most recent journal entries for one unit.",
+        description: "Read the most recent journal entries for one unit, optionally \
+                      filtered by maximum priority.",
         input_schema: || {
             json!({
                 "type": "object",
@@ -112,6 +185,13 @@ const TOOLS: &[Tool] = &[
                         "maximum": 1000,
                         "default": 50,
                         "description": "How many entries, newest last."
+                    },
+                    "priority": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 7,
+                        "description": "Only entries at this syslog priority or more severe \
+                                        (0=emerg .. 7=debug)."
                     }
                 },
                 "required": ["unit"]
@@ -119,7 +199,8 @@ const TOOLS: &[Tool] = &[
         },
         run: |args| {
             let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(50);
-            Ok(systemd::unit_logs(required_unit(args)?, lines)?)
+            let priority = args.get("priority").and_then(Value::as_u64);
+            Ok(systemd::unit_logs(required_unit(args)?, lines, priority)?)
         },
     },
     Tool {
@@ -154,6 +235,15 @@ const TOOLS: &[Tool] = &[
                 args.get("unit").and_then(Value::as_str),
             )?)
         },
+    },
+    Tool {
+        name: "boot_blame",
+        scope: Scope::BootRead,
+        description: "Units ordered by how long their own startup took, slowest first. \
+                      Unlike critical_chain this includes units that did not gate the \
+                      boot; a slow entry here may still have run in parallel.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        run: |_| Ok(systemd::boot_blame()?),
     },
 ];
 
@@ -358,7 +448,16 @@ mod tests {
         // journal- and boot-scoped tools are invisible without their scopes...
         assert_eq!(
             tool_names(&replies[0]),
-            ["list_units", "failed_units", "unit_properties"]
+            [
+                "list_units",
+                "failed_units",
+                "unit_properties",
+                "list_timers",
+                "list_sockets",
+                "list_unit_files",
+                "unit_dependencies",
+                "unit_security",
+            ]
         );
         // ...and calling one anyway is refused, not routed.
         let msg = replies[1]["error"]["message"].as_str().unwrap();
@@ -374,7 +473,10 @@ mod tests {
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_units"}}
 "#,
         );
-        assert_eq!(tool_names(&replies[0]), ["boot_times", "critical_chain"]);
+        assert_eq!(
+            tool_names(&replies[0]),
+            ["boot_times", "critical_chain", "boot_blame"]
+        );
         let msg = replies[1]["error"]["message"].as_str().unwrap();
         assert!(msg.contains("units:read"), "got: {msg}");
     }

@@ -210,6 +210,106 @@ pub fn failed_units() -> Result<Value, BackendError> {
     list_units(Some("failed"))
 }
 
+/// `list_timers`: timer units with their schedules, next elapse, and what
+/// they activate — `systemctl list-timers --output=json` passed through.
+pub fn list_timers() -> Result<Value, BackendError> {
+    run_json(
+        "systemctl",
+        &["list-timers", "--all", "--output=json", "--no-pager"],
+    )
+}
+
+/// `list_sockets`: socket units, what they listen on and what they
+/// activate — `systemctl list-sockets --output=json` passed through.
+pub fn list_sockets() -> Result<Value, BackendError> {
+    run_json(
+        "systemctl",
+        &["list-sockets", "--all", "--output=json", "--no-pager"],
+    )
+}
+
+/// `list_unit_files`: installed unit files and their enablement state —
+/// the on-disk view, where `list_units` shows the loaded one.
+///
+/// The optional state filter is a plain equality match applied here, not
+/// an allowlist: unit-file states are version-dependent (enabled, static,
+/// masked, generated, transient, ...) and the value never reaches argv,
+/// so there is nothing to vet it against — an unknown state just matches
+/// nothing.
+pub fn list_unit_files(state: Option<&str>) -> Result<Value, BackendError> {
+    let files = run_json(
+        "systemctl",
+        &["list-unit-files", "--output=json", "--no-pager"],
+    )?;
+    let Value::Array(files) = files else {
+        return Err(BackendError(
+            "systemctl list-unit-files did not produce a JSON array".into(),
+        ));
+    };
+    Ok(Value::Array(
+        files
+            .into_iter()
+            .filter(|f| state.is_none_or(|s| f["state"] == s))
+            .collect(),
+    ))
+}
+
+/// The dependency properties `unit_dependencies` reports, forward and
+/// reverse. One list: the argv and the reply are built from the same rows.
+const DEPENDENCY_PROPS: &[&str] = &[
+    "Requires",
+    "Requisite",
+    "Wants",
+    "BindsTo",
+    "PartOf",
+    "Upholds",
+    "Conflicts",
+    "Before",
+    "After",
+    "WantedBy",
+    "RequiredBy",
+    "BoundBy",
+    "UpheldBy",
+    "TriggeredBy",
+    "Triggers",
+];
+
+/// `unit_dependencies`: one unit's dependency edges by relation.
+///
+/// `systemctl list-dependencies` draws a tree with no reliable JSON form;
+/// the same facts live in unit properties as space-separated lists (unit
+/// names cannot contain spaces), which is the structured source. Every
+/// relation is present in the reply, empty ones as empty arrays.
+pub fn unit_dependencies(name: &str) -> Result<Value, BackendError> {
+    validate_unit_name(name)?;
+    let prop_arg = format!("--property={}", DEPENDENCY_PROPS.join(","));
+    let props = run_key_values("systemctl", &["show", "--no-pager", &prop_arg, "--", name])?;
+    let deps: serde_json::Map<String, Value> = DEPENDENCY_PROPS
+        .iter()
+        .map(|&key| {
+            let units: Vec<&str> = props
+                .get(key)
+                .and_then(Value::as_str)
+                .map(|v| v.split_whitespace().collect())
+                .unwrap_or_default();
+            (key.to_string(), json!(units))
+        })
+        .collect();
+    Ok(json!({ "unit": name, "dependencies": deps }))
+}
+
+/// `unit_security`: systemd-analyze's sandboxing exposure analysis of one
+/// unit — the same hardening scoring this project's own service file is
+/// judged by. `--json=short` is a stable machine format; passed through.
+pub fn unit_security(name: &str) -> Result<Value, BackendError> {
+    validate_unit_name(name)?;
+    let analysis = run_json(
+        "systemd-analyze",
+        &["security", "--json=short", "--no-pager", "--", name],
+    )?;
+    Ok(json!({ "unit": name, "analysis": analysis }))
+}
+
 /// `unit_properties`: the full property set of one unit.
 ///
 /// `systemctl show` emits `Key=Value` lines rather than JSON; we convert them
@@ -229,18 +329,27 @@ pub fn unit_properties(name: &str) -> Result<Value, BackendError> {
 /// journalctl emits one JSON object per line; we keep the fields a human
 /// would read and drop the dozens of internal ones, because handing a model
 /// 40 metadata fields per line is how context windows die.
-pub fn unit_logs(name: &str, lines: u64) -> Result<Value, BackendError> {
+pub fn unit_logs(name: &str, lines: u64, priority: Option<u64>) -> Result<Value, BackendError> {
     validate_unit_name(name)?;
     let lines = lines.clamp(1, 1000);
     let n = lines.to_string();
-    // `--unit=` keeps the pairing of flag and value in one argv element;
-    // a bare `-u` followed by other flags is how option parsing accidents
-    // happen. The name is validated above and can never start with '-'.
+    // `--unit=`/`--priority=` keep flag and value paired in one argv
+    // element; a bare `-u` followed by other flags is how option parsing
+    // accidents happen. The name is validated above and can never start
+    // with '-'.
     let unit_arg = format!("--unit={name}");
-    let stdout = run(
-        "journalctl",
-        &["--output=json", "--no-pager", "-n", &n, &unit_arg],
-    )?;
+    let mut args = vec!["--output=json", "--no-pager", "-n", &n, &unit_arg];
+    let priority_arg;
+    if let Some(p) = priority {
+        if p > 7 {
+            return Err(BackendError(format!(
+                "priority {p} out of range (0=emerg .. 7=debug)"
+            )));
+        }
+        priority_arg = format!("--priority={p}");
+        args.push(&priority_arg);
+    }
+    let stdout = run("journalctl", &args)?;
 
     let text = String::from_utf8_lossy(&stdout);
     let entries: Vec<Value> = text
@@ -301,10 +410,17 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 /// `boot_times`: how long the last boot took, split by phase.
 ///
-/// This reads the same manager timestamps `systemd-analyze time` reads,
-/// through the stable `Key=Value` output of `systemctl show` — structured
-/// data at the source instead of parsing systemd-analyze's prose summary.
+/// The same manager timestamps `systemd-analyze time` reads, preferably
+/// over varlink (`io.systemd.Manager.Describe`, systemd ≥ 257), else via
+/// the stable `Key=Value` output of `systemctl show` — structured data at
+/// the source either way, never systemd-analyze's prose summary.
 pub fn boot_times() -> Result<Value, BackendError> {
+    let [firmware, loader, initrd, userspace, finish] =
+        crate::varlink::boot_timestamps().or_else(|_| cli_boot_timestamps())?;
+    compute_boot_times(firmware, loader, initrd, userspace, finish)
+}
+
+fn cli_boot_timestamps() -> Result<[u64; 5], BackendError> {
     // Spelled once: the same array asks systemctl for the properties and
     // reads them back, so a typo can't silently read as "phase absent".
     const PROPS: [&str; 5] = [
@@ -316,14 +432,13 @@ pub fn boot_times() -> Result<Value, BackendError> {
     ];
     let prop_arg = format!("--property={}", PROPS.join(","));
     let props = run_key_values("systemctl", &["show", "--no-pager", &prop_arg])?;
-    let [firmware, loader, initrd, userspace, finish] = PROPS.map(|key| {
+    Ok(PROPS.map(|key| {
         props
             .get(key)
             .and_then(Value::as_str)
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0)
-    });
-    compute_boot_times(firmware, loader, initrd, userspace, finish)
+    }))
 }
 
 /// The phase arithmetic, mirroring systemd-analyze: `firmware` and `loader`
@@ -437,6 +552,45 @@ fn parse_critical_chain(text: &str) -> Vec<Value> {
     chain
 }
 
+/// `boot_blame`: units ordered by how long their own startup took —
+/// `systemd-analyze blame`.
+///
+/// Like `critical_chain`, this has no machine-readable source anywhere in
+/// systemd, so its prose is parsed by a pure, tested function that gets
+/// deleted the day systemd grows a structured equivalent. Timespans stay
+/// verbatim strings; we don't reinterpret systemd's formatting.
+pub fn boot_blame() -> Result<Value, BackendError> {
+    let stdout = run("systemd-analyze", &["blame", "--no-pager"])?;
+    let text = String::from_utf8_lossy(&stdout);
+    let blame = parse_blame(&text);
+    if blame.is_empty() {
+        return Err(BackendError(format!(
+            "could not parse systemd-analyze blame output: {}",
+            text.trim()
+        )));
+    }
+    Ok(json!({ "blame": blame }))
+}
+
+/// Each blame line is a timespan and a unit name. The timespan can be
+/// several tokens ("1min 30.5s"); the unit name is always the last token
+/// and cannot contain spaces, so parse from the right. A timespan starts
+/// with a digit and a unit name carries a type suffix — anything else is
+/// prose and parses to nothing rather than into fake entries.
+fn parse_blame(text: &str) -> Vec<Value> {
+    text.lines()
+        .filter_map(|line| {
+            let (time, unit) = line.trim().rsplit_once(' ')?;
+            let time = time.trim();
+            let plausible = time.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && unit.contains('.')
+                && !unit.ends_with('.')
+                && validate_unit_name(unit).is_ok();
+            plausible.then(|| json!({ "unit": unit, "time": time }))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +694,25 @@ graphical.target @1min 30.5s
         // not mangled into fake entries.
         let chain = parse_critical_chain("Bootup is not yet finished.\nno-dot-here @3s\n");
         assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn blame_parsing() {
+        let text = "\
+1min 30.5s NetworkManager-wait-online.service
+    6.544s snapd.service
+     122ms user@1000.service
+";
+        let blame = parse_blame(text);
+        assert_eq!(blame.len(), 3);
+        assert_eq!(blame[0]["time"], json!("1min 30.5s"));
+        assert_eq!(
+            blame[0]["unit"],
+            json!("NetworkManager-wait-online.service")
+        );
+        assert_eq!(blame[2]["time"], json!("122ms"));
+        assert_eq!(blame[2]["unit"], json!("user@1000.service"));
+        // Prose (no trailing unit-name shape) parses to nothing.
+        assert!(parse_blame("Bootup is not yet finished. Please try again later.\n").is_empty());
     }
 }

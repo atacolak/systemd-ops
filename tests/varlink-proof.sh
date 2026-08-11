@@ -16,10 +16,12 @@ SOCKET=/run/systemd/io.systemd.Manager
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-list_units() {
-  printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_units","arguments":{}}}\n' |
-    $MCPD --grant units:read | jq -r '.result.content[0].text'
+call_tool() { # call_tool <scopes> <tool> <args-json> -> inner result text
+  printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"%s","arguments":%s}}\n' "$2" "$3" |
+    $MCPD --grant "$1" | jq -r '.result.content[0].text'
 }
+
+list_units() { call_tool units:read list_units '{}'; }
 
 # A long-lived canary both runs must see.
 $HOST systemd-run --unit=mcpd-diff-canary.service /bin/sleep 300 >/dev/null 2>&1
@@ -29,11 +31,27 @@ $HOST mv "$SOCKET" "$SOCKET.hidden"
 list_units >/tmp/mcpd-cli.json
 $HOST mv "$SOCKET.hidden" "$SOCKET"
 
+# 1b. A live varlink failure that isn't a missing socket: a plain file
+#     at the socket path fails connect() with ENOTSOCK for every caller
+#     (chmod tricks wouldn't work — root bypasses file permissions).
+#     The fallback must still answer.
+$HOST mv "$SOCKET" "$SOCKET.hidden"
+$HOST touch "$SOCKET"
+list_units | jq -e 'type == "array" and length > 0' >/dev/null ||
+  fail "list_units did not fall back on a dead varlink socket path"
+$HOST rm "$SOCKET"
+$HOST mv "$SOCKET.hidden" "$SOCKET"
+
 # 2. Force the varlink backend: remove systemctl entirely. If
 #    list_units still answers, only the socket could have answered.
 $HOST mv /usr/bin/systemctl /usr/bin/systemctl.hidden
 list_units >/tmp/mcpd-varlink.json
-# ...and the systemctl-backed tool must now fail, proving the server
+# boot_times must also answer — its own varlink path (Manager.Describe)
+# is the only possible source without systemctl...
+call_tool boot:read boot_times '{}' |
+  jq -e '.total_usec > 0' >/dev/null ||
+  fail "boot_times did not answer over varlink Describe"
+# ...and a systemctl-backed tool must now fail, proving the server
 # cannot shell out behind our back.
 printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"unit_properties","arguments":{"unit":"systemd-journald.service"}}}\n' |
   $MCPD --grant units:read | jq -e '.result.isError' >/dev/null ||
