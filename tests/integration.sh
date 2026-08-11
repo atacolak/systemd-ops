@@ -84,11 +84,21 @@ done
 [ -n "$found" ] || fail "canary log line never appeared in unit_logs"
 
 echo "== boot_times / critical_chain"
-tool boot:read boot_times '{}' |
-  jq -e '.total_usec > 0 and .userspace_usec > 0' >/dev/null ||
-  fail "boot_times implausible"
-tool boot:read critical_chain '{}' |
-  jq -e '.chain | length > 0 and all(.[]; has("unit") and has("depth"))' >/dev/null ||
-  fail "critical_chain empty or malformed"
+# Some hosts never finish startup — GitHub's runner VMs keep a unit
+# activating forever — and systemd is honest about it, so we are too.
+# Test whichever truth the host tells: real timings where bootup
+# finished, the clean error where it didn't.
+if $HOST systemd-analyze time >/dev/null 2>&1; then
+  tool boot:read boot_times '{}' |
+    jq -e '.total_usec > 0 and .userspace_usec > 0' >/dev/null ||
+    fail "boot_times implausible"
+  tool boot:read critical_chain '{}' |
+    jq -e '.chain | length > 0 and all(.[]; has("unit") and has("depth"))' >/dev/null ||
+    fail "critical_chain empty or malformed"
+else
+  echo "   (bootup unfinished on this host - asserting the clean-error path)"
+  expect_error boot:read boot_times '{}' "not yet finished"
+  expect_error boot:read critical_chain '{}' "not yet finished"
+fi
 
 echo "PASS: all live integration tests"
