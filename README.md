@@ -108,6 +108,20 @@ $ cargo build --release
 
 Dependencies: `serde`, `serde_json`. That's the list.
 
+## Testing
+
+`cargo test` covers the protocol and the parsers. CI goes further: every
+push drives the real binary against two live systemds —
+
+- **the GitHub runner itself** (systemd 255, a real VM with PID 1): all
+  six tools end to end, including a transient canary unit whose log line
+  must round-trip through `unit_logs`, plus `systemd-analyze verify` on
+  the shipped unit file;
+- **a Fedora container booted with systemd ≥ 258 as PID 1**: the varlink
+  backend, proven the honest way — `systemctl` is deleted from the host,
+  so if `list_units` still answers, only the socket could have answered —
+  followed by a differential check that both backends emit the same shape.
+
 ## Deployment
 
 `systemd-mcpd.service` ships with the full hardening buffet

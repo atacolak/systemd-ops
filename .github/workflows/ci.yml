@@ -1,6 +1,6 @@
-# CI: format, lint, test, build. No third-party actions beyond checkout —
-# the supply chain of a security-posture project should be short enough
-# to read aloud.
+# CI: format, lint, test, build — then drive the real binary against two
+# live systemds. No third-party actions beyond checkout — the supply chain
+# of a security-posture project should be short enough to read aloud.
 name: CI
 
 # Push covers every branch (a branch with no PR still gets its gates);
@@ -24,3 +24,62 @@ jobs:
         run: cargo test
       - name: Release build
         run: cargo build --release
+
+  # The runner itself is a real systemd host: a full VM with PID 1
+  # systemd (255 on ubuntu-24.04) and a live journal. That exercises the
+  # CLI backend of every tool end to end — including the fallback path,
+  # since 255 has no varlink socket.
+  integration:
+    name: live systemd (CLI backend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup update stable && rustup default stable
+      - name: Build
+        run: cargo build --release
+      - name: Verify unit file
+        run: |
+          sudo cp target/release/systemd-mcpd /usr/local/bin/
+          systemd-analyze verify ./systemd-mcpd.service
+      - name: Live integration tests
+        # Root, so the transient canary unit and the system journal are
+        # reachable without group gymnastics.
+        run: sudo -E bash tests/integration.sh
+
+  # The varlink backend needs systemd >= 258, so boot one: Fedora with
+  # systemd as PID 1 in a privileged container. The binary is musl-static
+  # so the same artifact drops into any distro. The proof step deletes
+  # systemctl inside the container — if list_units still answers, only
+  # the varlink socket could have answered.
+  varlink:
+    name: live systemd >= 258 (varlink backend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup update stable && rustup default stable
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build (musl static)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Boot Fedora with systemd as PID 1
+        run: |
+          docker run -d --name sysd --privileged --cgroupns=host \
+            --tmpfs /run --tmpfs /tmp \
+            -v "$PWD/target/x86_64-unknown-linux-musl/release/systemd-mcpd:/usr/local/bin/systemd-mcpd:ro" \
+            fedora:latest /sbin/init
+          for _ in $(seq 60); do
+            state=$(docker exec sysd systemctl is-system-running 2>/dev/null || true)
+            case "$state" in running|degraded) break ;; esac
+            sleep 2
+          done
+          docker exec sysd systemctl --version | head -1
+      - name: Live integration tests (varlink host)
+        run: |
+          MCPD="docker exec -i sysd /usr/local/bin/systemd-mcpd" \
+          HOST="docker exec sysd" bash tests/integration.sh
+      - name: Backend proof and differential
+        run: |
+          MCPD="docker exec -i sysd /usr/local/bin/systemd-mcpd" \
+          HOST="docker exec sysd" bash tests/varlink-proof.sh
