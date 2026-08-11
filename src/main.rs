@@ -26,6 +26,7 @@ Usage:
 Scopes:
   units:read      list units, failed units, unit properties
   journal:read    read journal entries per unit
+  boot:read       boot phase timings and the boot-time critical chain
 
 The server speaks MCP over stdio. Tools outside the granted scopes are
 neither advertised nor callable. There are no write scopes; there is

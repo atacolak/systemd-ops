@@ -13,7 +13,10 @@ use serde_json::{json, Value};
 
 use crate::systemd::{self, Grants, Scope};
 
-const PROTOCOL_VERSION: &str = "2025-06-18";
+/// Protocol revisions we know, newest first. Per spec: echo the client's
+/// requested version if we support it, otherwise answer with our newest and
+/// let the client decide whether to proceed.
+const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// One tool: its wire description and the scope that gates it.
 struct Tool {
@@ -87,6 +90,33 @@ const TOOLS: &[Tool] = &[
             })
         },
     },
+    Tool {
+        name: "boot_times",
+        scope: Scope::BootRead,
+        description: "How long the last boot took, split into firmware, loader, kernel, initrd \
+                      and userspace phases. Microsecond values, read from the same manager \
+                      timestamps systemd-analyze uses. Phases that did not occur are omitted.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+    },
+    Tool {
+        name: "critical_chain",
+        scope: Scope::BootRead,
+        description: "The chain of units that gated reaching the default target (or one given \
+                      unit) during boot. 'activated' is when the unit became active relative to \
+                      boot start; 'duration' is how long its own startup took. The slowest link \
+                      is usually the entry with the largest duration.",
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "unit": {
+                        "type": "string",
+                        "description": "Analyze the chain to this unit instead of the default target."
+                    }
+                }
+            })
+        },
+    },
 ];
 
 /// Serve MCP on the given streams until EOF. Returns on clean shutdown.
@@ -120,7 +150,7 @@ pub fn serve(input: impl BufRead, mut output: impl Write, grants: &Grants) -> st
         let params = request.get("params").cloned().unwrap_or(Value::Null);
 
         let reply = match method {
-            "initialize" => result_reply(id, initialize_result()),
+            "initialize" => result_reply(id, initialize_result(&params)),
             "ping" => result_reply(id, json!({})),
             "tools/list" => result_reply(id, tools_list(grants)),
             "tools/call" => tools_call(id, &params, grants),
@@ -132,9 +162,14 @@ pub fn serve(input: impl BufRead, mut output: impl Write, grants: &Grants) -> st
     Ok(())
 }
 
-fn initialize_result() -> Value {
+fn initialize_result(params: &Value) -> Value {
+    let version = params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .filter(|v| PROTOCOL_VERSIONS.contains(v))
+        .unwrap_or(PROTOCOL_VERSIONS[0]);
     json!({
-        "protocolVersion": PROTOCOL_VERSION,
+        "protocolVersion": version,
         "capabilities": { "tools": {} },
         "serverInfo": {
             "name": "systemd-mcpd",
@@ -178,7 +213,10 @@ fn tools_call(id: Value, params: &Value, grants: &Grants) -> String {
         return error_reply(
             id,
             -32602,
-            &format!("tool '{}' requires scope '{}' which was not granted", name, tool.scope),
+            &format!(
+                "tool '{}' requires scope '{}' which was not granted",
+                name, tool.scope
+            ),
         );
     }
 
@@ -196,6 +234,8 @@ fn tools_call(id: Value, params: &Value, grants: &Grants) -> String {
             }
             None => return error_reply(id, -32602, "missing required argument: unit"),
         },
+        "boot_times" => systemd::boot_times(),
+        "critical_chain" => systemd::critical_chain(args.get("unit").and_then(Value::as_str)),
         _ => unreachable!("tool in registry but not dispatched: {name}"),
     };
 
@@ -247,7 +287,7 @@ mod tests {
         let grants = Grants::from_args("units:read").unwrap();
         let replies = exchange(
             &grants,
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"ping"}
 "#,
@@ -257,6 +297,22 @@ mod tests {
         assert_eq!(
             replies[0]["result"]["serverInfo"]["name"],
             json!("systemd-mcpd")
+        );
+        // A supported requested version is echoed back, per spec.
+        assert_eq!(replies[0]["result"]["protocolVersion"], json!("2025-03-26"));
+    }
+
+    #[test]
+    fn version_negotiation_falls_back_to_newest() {
+        let grants = Grants::from_args("units:read").unwrap();
+        let replies = exchange(
+            &grants,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1999-12-31"}}
+"#,
+        );
+        assert_eq!(
+            replies[0]["result"]["protocolVersion"],
+            json!(PROTOCOL_VERSIONS[0])
         );
     }
 
@@ -275,11 +331,31 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        // journal-scoped tool is invisible without journal:read...
+        // journal- and boot-scoped tools are invisible without their scopes...
         assert_eq!(names, ["list_units", "failed_units", "unit_properties"]);
-        // ...and calling it anyway is refused, not routed.
+        // ...and calling one anyway is refused, not routed.
         let msg = replies[1]["error"]["message"].as_str().unwrap();
         assert!(msg.contains("journal:read"), "got: {msg}");
+    }
+
+    #[test]
+    fn boot_scope_gates_boot_tools() {
+        let grants = Grants::from_args("boot:read").unwrap();
+        let replies = exchange(
+            &grants,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_units"}}
+"#,
+        );
+        let names: Vec<&str> = replies[0]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["boot_times", "critical_chain"]);
+        let msg = replies[1]["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("units:read"), "got: {msg}");
     }
 
     #[test]

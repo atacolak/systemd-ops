@@ -9,7 +9,7 @@ Description=Model Context Protocol server for systemd (read-only)
 Documentation=https://modelcontextprotocol.io
 
 [Service]
-ExecStart=/usr/local/bin/systemd-mcpd --grant units:read,journal:read
+ExecStart=/usr/local/bin/systemd-mcpd --grant units:read,journal:read,boot:read
 DynamicUser=yes
 SupplementaryGroups=systemd-journal
 

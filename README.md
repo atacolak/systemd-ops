@@ -1,7 +1,7 @@
 # systemd-mcpd
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server for systemd.
-Read-only. Capability-scoped. Two dependencies. 555 KB.
+Read-only. Capability-scoped. Two dependencies. 525 KB.
 
 PID 1 as a tool call — but only the tools you explicitly handed over.
 
@@ -58,6 +58,8 @@ data instead of scraping `systemctl status` prose.
 | `failed_units`    | `units:read`   | Units currently failed                      |
 | `unit_properties` | `units:read`   | Full property set of one unit               |
 | `unit_logs`       | `journal:read` | Recent journal entries for one unit         |
+| `boot_times`      | `boot:read`    | Boot duration split by phase, in µs         |
+| `critical_chain`  | `boot:read`    | Units that gated reaching a target at boot  |
 
 ## Design notes
 
@@ -73,7 +75,15 @@ data instead of scraping `systemctl status` prose.
   shell-injectable (it isn't), but because a model deserves a precise error
   over a confusing one, and defense in depth is free here.
 - **Journal entries are pruned** to timestamp/priority/message/pid. Handing
-  a model forty metadata fields per line is how context windows die.
+  a model forty metadata fields per line is how context windows die. What
+  survives is typed: RFC 3339 timestamps, integer priority and pid.
+- **One prose parser, fenced.** `critical_chain` is the single tool with no
+  machine-readable source anywhere in systemd — not D-Bus, not
+  `--output=json`. Its output is parsed by a pure function with tests over
+  captured output, and that function gets deleted the day systemd grows a
+  structured equivalent. `boot_times` needs no such apology: it reads the
+  same manager timestamps `systemd-analyze time` reads, via `systemctl
+  show`'s stable `Key=Value` output.
 
 ## Building
 
@@ -92,7 +102,6 @@ irony, it's layering.
 
 ## Roadmap
 
-- `boot:read` — `systemd-analyze` timings and critical chain
 - varlink backends where systemd grows them (`io.systemd.*`), replacing
   process invocation with socket calls
 - the hard one: a write path with plan/apply semantics, structured diffs,
