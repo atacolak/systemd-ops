@@ -74,12 +74,14 @@ run as a member of the `systemd-journal` group to read the full journal
   `journalctl -o json`. No libsystemd linkage, no D-Bus library: every call
   the server makes is a plain, auditable process invocation, and the binary
   survives systemd version skew the way the CLIs do.
-- **Native varlink where systemd serves it.** On systemd ≥ 257 unit listing
-  talks straight to PID 1's varlink socket (`io.systemd.Manager`) — spoken
-  by ~90 lines of stdlib `UnixStream`, no varlink crate. The probe is the
-  `connect()` itself: any surprise — no socket, old systemd, unfamiliar
-  reply shape — falls back to `systemctl` silently, with the same JSON
-  shape either way, so the caller never learns which backend answered.
+- **Native varlink where systemd serves it.** On systemd ≥ 258 unit listing
+  talks straight to PID 1's varlink socket (`io.systemd.Unit.List` on
+  `/run/systemd/io.systemd.Manager`, verified against the v261.2 interface
+  definitions) — spoken by ~90 lines of stdlib `UnixStream`, no varlink
+  crate. The probe is the `connect()` itself: any surprise — no socket, old
+  systemd, unfamiliar reply shape — falls back to `systemctl` silently,
+  with the same JSON shape either way, so the caller never learns which
+  backend answered.
 - **No async runtime.** MCP's stdio transport is line-delimited JSON-RPC on
   a pipe. A blocking read loop is the honest shape of that; tokio would be
   most of the binary for none of the benefit.
