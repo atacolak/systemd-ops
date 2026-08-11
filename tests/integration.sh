@@ -137,7 +137,18 @@ else
   expect_error boot:read boot_times '{}' "not yet finished"
   expect_error boot:read critical_chain '{}' "not yet finished"
   expect_error boot:read critical_chain '{"unit":"systemd-journald.service"}' "not yet finished"
-  expect_error boot:read boot_blame '{}' "not yet finished"
+  # blame, unlike time and critical-chain, can answer on an unfinished
+  # boot (it lists whatever already started) — state-dependent, seen
+  # both ways on real runners. Accept either honest answer.
+  reply=$(rpc boot:read "$(call boot_blame '{}')")
+  if [ "$(jq -r '.result.isError' <<<"$reply")" = false ]; then
+    jq -r '.result.content[0].text' <<<"$reply" |
+      jq -e '.blame | length > 0 and all(.[]; has("unit") and has("time"))' >/dev/null ||
+      fail "boot_blame table malformed on unfinished-boot host"
+  else
+    jq -r '.result.content[0].text' <<<"$reply" | grep -qF "not yet finished" ||
+      fail "boot_blame errored with something other than not-yet-finished"
+  fi
 fi
 
 echo "PASS: all live integration tests"
