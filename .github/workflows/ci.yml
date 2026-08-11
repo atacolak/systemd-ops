@@ -3,9 +3,10 @@
 # to read aloud.
 name: CI
 
+# Push covers every branch (a branch with no PR still gets its gates);
+# pull_request stays for forks, whose pushes land outside this repo.
 on:
   push:
-    branches: [main]
   pull_request:
 
 jobs:
