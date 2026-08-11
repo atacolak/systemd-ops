@@ -190,8 +190,14 @@ pub fn unit_logs(name: &str, lines: u64) -> Result<Value, BackendError> {
     validate_unit_name(name)?;
     let lines = lines.clamp(1, 1000);
     let n = lines.to_string();
+    // `--unit=` binds flag and value in one argv element. The previous
+    // `-u -- <name>` made getopt consume `--` as -u's argument and pass the
+    // real unit name as a raw journal match, failing every call with
+    // "Failed to add match". The name is validated above and can never
+    // start with '-'.
+    let unit_arg = format!("--unit={name}");
     let output = Command::new("journalctl")
-        .args(["--output=json", "--no-pager", "-n", &n, "-u", "--", name])
+        .args(["--output=json", "--no-pager", "-n", &n, &unit_arg])
         .output()
         .map_err(|e| BackendError(format!("failed to run journalctl: {e}")))?;
 
