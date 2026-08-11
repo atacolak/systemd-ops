@@ -1,0 +1,38 @@
+# systemd-mcpd: systemd confining the thing that talks to systemd.
+#
+# Sample unit for socket-activated or supervised use. When run as an MCP
+# stdio child by a client (the usual case), you don't need this file —
+# but the hardening below is the recommended posture if you wrap it.
+
+[Unit]
+Description=Model Context Protocol server for systemd (read-only)
+Documentation=https://modelcontextprotocol.io
+
+[Service]
+ExecStart=/usr/local/bin/systemd-mcpd --grant units:read,journal:read
+DynamicUser=yes
+SupplementaryGroups=systemd-journal
+
+# The full paranoia buffet. Read-only server; nothing here should hurt.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

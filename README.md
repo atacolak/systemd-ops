@@ -1,0 +1,104 @@
+# systemd-mcpd
+
+A [Model Context Protocol](https://modelcontextprotocol.io) server for systemd.
+Read-only. Capability-scoped. Two dependencies. 555 KB.
+
+PID 1 as a tool call — but only the tools you explicitly handed over.
+
+## Why
+
+Agents are starting to operate Linux machines. Today they do it by running
+shell commands and parsing human-oriented output, which means every agent
+session is a root shell with vibes. This server is an experiment in the
+alternative: a **typed, scoped, auditable** interface between a model and
+the init system.
+
+Three positions, enforced in code:
+
+1. **Nothing is granted by default.** The server refuses to start without
+   `--grant`. Authority handed to a model should be a deliberate act that
+   appears in your process table, not a default someone forgot to narrow.
+2. **Scopes gate both visibility and execution.** Ungranted tools are not
+   advertised in `tools/list` *and* are refused in `tools/call`. Hiding a
+   tool is UX; refusing the call is security.
+3. **Read-only is structural, not configurable.** There are no write scopes
+   in v0.1. Not because writes are out of scope forever, but because a safe
+   write path needs plan/apply/rollback semantics — and shipping mutation
+   without them would be exactly the thing this project exists to argue
+   against.
+
+## Usage
+
+```console
+$ systemd-mcpd --grant units:read,journal:read
+```
+
+Claude Desktop / any MCP client:
+
+```json
+{
+  "mcpServers": {
+    "systemd": {
+      "command": "/usr/local/bin/systemd-mcpd",
+      "args": ["--grant", "units:read,journal:read"]
+    }
+  }
+}
+```
+
+Then ask your model: *"which units failed since boot, and why?"* — it will
+find `failed_units`, pull `unit_logs` for each, and answer from structured
+data instead of scraping `systemctl status` prose.
+
+## Tools
+
+| Tool              | Scope          | Does                                        |
+|-------------------|----------------|---------------------------------------------|
+| `list_units`      | `units:read`   | All loaded units, optional state filter     |
+| `failed_units`    | `units:read`   | Units currently failed                      |
+| `unit_properties` | `units:read`   | Full property set of one unit               |
+| `unit_logs`       | `journal:read` | Recent journal entries for one unit         |
+
+## Design notes
+
+- **Backend:** the stable JSON interfaces of `systemctl --output=json` and
+  `journalctl -o json`. No libsystemd linkage, no D-Bus library: every call
+  the server makes is a plain, auditable process invocation, and the binary
+  survives systemd version skew the way the CLIs do.
+- **No async runtime.** MCP's stdio transport is line-delimited JSON-RPC on
+  a pipe. A blocking read loop is the honest shape of that; tokio would be
+  most of the binary for none of the benefit.
+- **Input validation before argv.** Unit names are checked against the unit
+  name grammar before touching an argument list — not because `Command` is
+  shell-injectable (it isn't), but because a model deserves a precise error
+  over a confusing one, and defense in depth is free here.
+- **Journal entries are pruned** to timestamp/priority/message/pid. Handing
+  a model forty metadata fields per line is how context windows die.
+
+## Building
+
+```console
+$ cargo build --release
+```
+
+Dependencies: `serde`, `serde_json`. That's the list.
+
+## Deployment
+
+`systemd-mcpd.service` ships with the full hardening buffet
+(`DynamicUser`, `ProtectSystem=strict`, syscall filtering, empty capability
+bounding set). systemd confining the thing that talks to systemd is not
+irony, it's layering.
+
+## Roadmap
+
+- `boot:read` — `systemd-analyze` timings and critical chain
+- varlink backends where systemd grows them (`io.systemd.*`), replacing
+  process invocation with socket calls
+- the hard one: a write path with plan/apply semantics, structured diffs,
+  and generation rollback. If that sentence sounds like a config management
+  manifesto, yes. That's the point.
+
+## License
+
+MIT
