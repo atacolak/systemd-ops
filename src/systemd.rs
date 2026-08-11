@@ -151,9 +151,11 @@ fn run_key_values(program: &str, args: &[&str]) -> Result<Vec<(String, String)>,
 }
 
 /// `list_units`: all currently loaded units, optionally filtered by state.
+///
+/// Prefers PID 1's native varlink socket (systemd ≥ 257) and falls back to
+/// systemctl on any surprise — same JSON shape either way, so the caller
+/// never learns which backend answered. That's the contract.
 pub fn list_units(state: Option<&str>) -> Result<Value, BackendError> {
-    let mut args = vec!["list-units", "--all", "--output=json", "--no-pager"];
-    let state_arg;
     if let Some(state) = state {
         // Vetted filter values; systemctl would reject others anyway, but an
         // allowlist keeps the contract obvious.
@@ -164,6 +166,19 @@ pub fn list_units(state: Option<&str>) -> Result<Value, BackendError> {
                 STATES.join(", ")
             )));
         }
+    }
+
+    if let Ok(units) = crate::varlink::list_units() {
+        let filtered: Vec<Value> = units
+            .into_iter()
+            .filter(|u| state.is_none_or(|s| u["active"] == s))
+            .collect();
+        return Ok(Value::Array(filtered));
+    }
+
+    let mut args = vec!["list-units", "--all", "--output=json", "--no-pager"];
+    let state_arg;
+    if let Some(state) = state {
         state_arg = format!("--state={state}");
         args.push(&state_arg);
     }
@@ -172,15 +187,7 @@ pub fn list_units(state: Option<&str>) -> Result<Value, BackendError> {
 
 /// `failed_units`: shorthand for the question every session starts with.
 pub fn failed_units() -> Result<Value, BackendError> {
-    run_json(
-        "systemctl",
-        &[
-            "list-units",
-            "--state=failed",
-            "--output=json",
-            "--no-pager",
-        ],
-    )
+    list_units(Some("failed"))
 }
 
 /// `unit_properties`: the full property set of one unit.

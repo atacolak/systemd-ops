@@ -10,6 +10,7 @@
 
 mod mcp;
 mod systemd;
+mod varlink;
 
 use std::io::{stdin, stdout, BufReader};
 use std::process::ExitCode;

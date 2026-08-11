@@ -1,7 +1,7 @@
 # systemd-mcpd
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server for systemd.
-Read-only. Capability-scoped. Two dependencies. 525 KB.
+Read-only. Capability-scoped. Two dependencies. 543 KB.
 
 PID 1 as a tool call — but only the tools you explicitly handed over.
 
@@ -74,6 +74,12 @@ run as a member of the `systemd-journal` group to read the full journal
   `journalctl -o json`. No libsystemd linkage, no D-Bus library: every call
   the server makes is a plain, auditable process invocation, and the binary
   survives systemd version skew the way the CLIs do.
+- **Native varlink where systemd serves it.** On systemd ≥ 257 unit listing
+  talks straight to PID 1's varlink socket (`io.systemd.Manager`) — spoken
+  by ~90 lines of stdlib `UnixStream`, no varlink crate. The probe is the
+  `connect()` itself: any surprise — no socket, old systemd, unfamiliar
+  reply shape — falls back to `systemctl` silently, with the same JSON
+  shape either way, so the caller never learns which backend answered.
 - **No async runtime.** MCP's stdio transport is line-delimited JSON-RPC on
   a pipe. A blocking read loop is the honest shape of that; tokio would be
   most of the binary for none of the benefit.
@@ -109,8 +115,9 @@ irony, it's layering.
 
 ## Roadmap
 
-- varlink backends where systemd grows them (`io.systemd.*`), replacing
-  process invocation with socket calls
+- more varlink as systemd grows it: unit listing is native today; journal
+  reads and boot analysis still fork the CLIs because systemd serves them
+  no other way yet
 - the hard one: a write path with plan/apply semantics, structured diffs,
   and generation rollback. If that sentence sounds like a config management
   manifesto, yes. That's the point.
