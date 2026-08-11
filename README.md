@@ -143,9 +143,11 @@ irony, it's layering.
 
 ## Roadmap
 
-- more varlink as systemd grows it: unit listing is native today; journal
-  reads and boot analysis still fork the CLIs because systemd serves them
-  no other way yet
+- more varlink as systemd grows it: unit listing and boot timestamps are
+  native today; journal reads and the analyze verbs still fork the CLIs
+  because systemd serves them no other way (`io.systemd.JournalAccess`
+  exists since systemd 260, but it is exec-served by journalctl, not a
+  socket)
 - the hard one: a write path with plan/apply semantics, structured diffs,
   and generation rollback. If that sentence sounds like a config management
   manifesto, yes. That's the point.
