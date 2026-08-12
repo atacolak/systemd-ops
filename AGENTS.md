@@ -74,12 +74,9 @@ Root is required: the suites create transient units, write a unit file
 under `/etc/systemd/system`, and read the system journal.
 `varlink-proof.sh` also needs systemd >= 258 for the socket.
 
-Three tiers, in cost order. `cargo test` needs nothing. GitHub CI runs
-the fast gates plus both suites against two live systemds on every
-push. `tests/release-check.sh` is manual and boots QEMU guests; run it
-before tagging, since it covers what the first two cannot: the initrd
-boot phase, enablement surviving a reboot, and three systemd versions
-that straddle the varlink boundary (Debian 257, Fedora 258, Arch 261).
+The tiers, what CI covers, the QEMU release check and the conformance
+suite are documented in [docs/TESTING.md](docs/TESTING.md); what
+follows is only what is easy to get wrong.
 
 Two notes on the guests. Writing tests that run in one means no shell
 syntax may cross ssh: ssh rebuilds the remote command through a shell,
