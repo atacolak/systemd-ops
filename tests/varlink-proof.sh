@@ -2,12 +2,12 @@
 # Prove which backend answered list_units, then hold both backends'
 # output shapes against each other.
 #
-# The fallback is deliberately invisible, so a passing test on a
-# systemd >= 258 host doesn't show varlink worked — it might have
-# silently fallen back to systemctl. So we make each backend the only
-# one possible: rename the varlink socket to force the CLI, then remove
-# systemctl so only the socket could answer. Needs root on the target
-# systemd, reached via $HOST.
+# The fallback is not observable from the output, so a passing test on
+# a systemd >= 258 host does not show that varlink answered — the reply
+# could have come from the systemctl fallback. Each backend is made the
+# only one possible: the varlink socket is renamed to force the CLI,
+# then systemctl is removed so only the socket can answer. Needs root
+# on the target systemd, reached via $HOST.
 set -euo pipefail
 
 MCPD=${MCPD:?set MCPD to the server command}

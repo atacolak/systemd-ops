@@ -6,10 +6,10 @@
 //! dependency-free, version-tolerant, and every call auditable as a plain
 //! process invocation.
 //!
-//! Every invocation here is read-only, with one deliberate exception:
-//! `apply_verb`, the single mutating call in the program, reachable only
-//! through the plan/apply path in `crate::write`. Argument lists are built
-//! from vetted values only.
+//! Every invocation here is read-only, with one exception: `apply_verb`,
+//! the single mutating call in the program, reachable only through the
+//! plan/apply path in `crate::write`. Argument lists are built from
+//! vetted values only.
 
 use std::fmt;
 use std::process::Command;
@@ -17,8 +17,8 @@ use std::process::Command;
 use serde_json::{json, Value};
 
 /// Capability scopes. A tool is only advertised and callable if its scope
-/// was granted on the command line. This is the entire point of the program:
-/// authority handed to an agent should be explicit, minimal, and enforced.
+/// was granted on the command line: authority handed to an agent is
+/// explicit, minimal, and checked on every call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     UnitsRead,
@@ -87,8 +87,8 @@ impl Grants {
     }
 }
 
-/// A failure while talking to systemd, reported to the model as a normal
-/// tool error so it can react (retry, ask, give up) instead of crashing us.
+/// A failure while talking to systemd, reported as a tool-level error so
+/// the client can retry or report it; the server keeps running.
 #[derive(Debug)]
 pub struct BackendError(pub String);
 
@@ -98,12 +98,12 @@ impl fmt::Display for BackendError {
     }
 }
 
-/// Validates a unit name before it goes anywhere near an argument list.
+/// Validates a unit name before it reaches an argument list.
 ///
-/// systemd unit names are a known, small alphabet. Anything else is refused —
-/// not because `Command` is exploitable (it never passes through a shell),
-/// but because refusing malformed input early gives the model a precise error
-/// instead of a confusing one from systemctl.
+/// systemd unit names use a known, small alphabet; anything else is
+/// refused early. `Command` never passes through a shell, so this is not
+/// an injection defense — it exists to return a precise error instead of
+/// whatever systemctl prints for a malformed name.
 pub(crate) fn validate_unit_name(name: &str) -> Result<(), BackendError> {
     let ok = !name.is_empty()
         && name.len() <= 256
@@ -202,10 +202,10 @@ pub const STATES: &[&str] = &["active", "inactive", "failed", "activating", "dea
 /// `list_units`: all currently loaded units, optionally filtered by state.
 ///
 /// Prefers PID 1's native varlink socket (systemd ≥ 258) and falls back to
-/// systemctl on any surprise — same JSON shape either way, so the caller
-/// never learns which backend answered. That's the contract, which is also
-/// why the state filter is applied here, once, after either backend: filter
-/// semantics defined per backend is how the backends drift apart.
+/// systemctl on any failure — same JSON shape either way, so the caller
+/// cannot tell which backend answered. The state filter is applied here,
+/// once, after either backend, so its semantics cannot differ between
+/// backends.
 pub fn list_units(state: Option<&str>) -> Result<Value, BackendError> {
     if let Some(state) = state {
         if !STATES.contains(&state) {
@@ -360,17 +360,15 @@ pub fn unit_properties(name: &str) -> Result<Value, BackendError> {
 
 /// `unit_logs`: the last `lines` journal entries for one unit.
 ///
-/// journalctl emits one JSON object per line; we keep the fields a human
-/// would read and drop the dozens of internal ones, because handing a model
-/// 40 metadata fields per line is how context windows die.
+/// journalctl emits one JSON object per line with dozens of metadata
+/// fields; four are kept, to bound output size.
 pub fn unit_logs(name: &str, lines: u64, priority: Option<u64>) -> Result<Value, BackendError> {
     validate_unit_name(name)?;
     let lines = lines.clamp(1, 1000);
     let n = lines.to_string();
     // `--unit=`/`--priority=` keep flag and value paired in one argv
-    // element; a bare `-u` followed by other flags is how option parsing
-    // accidents happen. The name is validated above and can never start
-    // with '-'.
+    // element, leaving no option-parsing ambiguity. The name is validated
+    // above and can never start with '-'.
     let unit_arg = format!("--unit={name}");
     let mut args = vec!["--output=json", "--no-pager", "-n", &n, &unit_arg];
     let priority_arg;
@@ -410,9 +408,9 @@ pub fn unit_logs(name: &str, lines: u64, priority: Option<u64>) -> Result<Value,
 
 /// Formats a realtime microsecond timestamp as RFC 3339 UTC.
 ///
-/// Twenty lines of calendar arithmetic beat a chrono dependency for one
-/// format in one direction. The days-to-civil conversion is the standard
-/// Gregorian-cycle algorithm (146097 days per 400 years).
+/// Implemented locally: one output format in one direction does not
+/// justify a chrono dependency. The days-to-civil conversion is the
+/// standard Gregorian-cycle algorithm (146097 days per 400 years).
 fn usec_to_rfc3339(usec: u64) -> String {
     let secs = (usec / 1_000_000) as i64;
     let micros = usec % 1_000_000;
@@ -519,9 +517,9 @@ fn compute_boot_times(
 ///
 /// This is the one backend with no machine-readable interface: neither
 /// D-Bus nor `--output=json` expose the dependency-chain analysis, only
-/// `systemd-analyze critical-chain` prose. So we parse it — in a pure
-/// function, with tests over captured output, ready to be deleted the day
-/// systemd grows a structured equivalent.
+/// `systemd-analyze critical-chain` prose. It is parsed by a pure
+/// function with tests over captured output, to be removed when systemd
+/// provides a structured equivalent.
 pub fn critical_chain(unit: Option<&str>) -> Result<Value, BackendError> {
     let mut args = vec!["critical-chain", "--no-pager"];
     if let Some(unit) = unit {
@@ -544,8 +542,8 @@ pub fn critical_chain(unit: Option<&str>) -> Result<Value, BackendError> {
 /// Parses critical-chain output into `{unit, depth, activated, duration}`
 /// entries. `activated` is the `@` time (when the unit became active,
 /// relative to boot start), `duration` the `+` time (how long it took to
-/// start); both stay verbatim strings ("1min 30.5s") — we structure the
-/// tree, we don't reinterpret systemd's timespans.
+/// start); both stay verbatim strings ("1min 30.5s"). The tree structure
+/// is parsed; the timespans are not reinterpreted.
 fn parse_critical_chain(text: &str) -> Vec<Value> {
     let mut chain = Vec::new();
     for line in text.lines() {
@@ -590,9 +588,9 @@ fn parse_critical_chain(text: &str) -> Vec<Value> {
 /// `systemd-analyze blame`.
 ///
 /// Like `critical_chain`, this has no machine-readable source anywhere in
-/// systemd, so its prose is parsed by a pure, tested function that gets
-/// deleted the day systemd grows a structured equivalent. Timespans stay
-/// verbatim strings; we don't reinterpret systemd's formatting.
+/// systemd, so its prose is parsed by a pure, tested function, to be
+/// removed when systemd provides a structured equivalent. Timespans stay
+/// verbatim strings; the formatting is not reinterpreted.
 pub fn boot_blame() -> Result<Value, BackendError> {
     let stdout = run("systemd-analyze", &["blame", "--no-pager"])?;
     let text = String::from_utf8_lossy(&stdout);
@@ -647,7 +645,7 @@ mod tests {
         assert!(g.allows(Scope::UnitsRead));
         assert!(g.allows(Scope::JournalRead));
         assert!(g.allows(Scope::BootRead));
-        // The write scope exists now — and granting it grants nothing else.
+        // Granting the write scope grants no read scope.
         let w = Grants::from_args("units:write").unwrap();
         assert!(w.allows(Scope::UnitsWrite));
         assert!(!w.allows(Scope::UnitsRead));

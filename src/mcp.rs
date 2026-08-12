@@ -1,11 +1,11 @@
-//! The Model Context Protocol, by hand.
+//! The Model Context Protocol layer.
 //!
-//! MCP's stdio transport is line-delimited JSON-RPC 2.0. A server needs to
-//! answer exactly four things — `initialize`, `tools/list`, `tools/call`,
-//! `ping` — and stay quiet about notifications. That is small enough that an
-//! SDK (and the async runtime it drags in) would be most of the binary for
-//! none of the benefit. A blocking read loop is the honest shape of a stdio
-//! protocol.
+//! MCP's stdio transport is line-delimited JSON-RPC 2.0. The server
+//! implements the four required methods — `initialize`, `tools/list`,
+//! `tools/call`, `ping` — and sends no reply to notifications. At this
+//! size an SDK and its async runtime would account for most of the
+//! binary, so the protocol is implemented directly as a blocking read
+//! loop.
 
 use std::io::{BufRead, Write};
 
@@ -48,8 +48,8 @@ struct Tool {
     run: fn(&Value) -> Result<Value, CallError>,
 }
 
-/// The registry. Adding a tool is one entry — schema, scope, and handler
-/// together; there is no second dispatch site to forget.
+/// The registry. Adding a tool is one entry: schema, scope, and handler
+/// are declared together, and there is no separate dispatch table.
 const TOOLS: &[Tool] = &[
     Tool {
         name: "list_units",
@@ -77,8 +77,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "failed_units",
         scope: Scope::UnitsRead,
-        description: "List units that are currently in the failed state. \
-                      The usual first question on an unhealthy machine.",
+        description: "List units that are currently in the failed state.",
         input_schema: || json!({ "type": "object", "properties": {} }),
         run: |_| Ok(systemd::failed_units()?),
     },
@@ -368,7 +367,8 @@ fn initialize_result(params: &Value) -> Value {
     })
 }
 
-/// Only granted tools are advertised. A model cannot want what it cannot see.
+/// Only granted tools are advertised; ungranted tools are additionally
+/// refused in `tools/call`.
 fn tools_list(grants: &Grants) -> Value {
     let tools: Vec<Value> = TOOLS
         .iter()
@@ -395,8 +395,8 @@ fn tools_call(id: Value, params: &Value, grants: &Grants) -> String {
         return error_reply(id, -32602, &format!("unknown tool: {name}"));
     };
 
-    // Enforced here as well as in `tools/list`: hiding a tool is UX,
-    // refusing the call is security.
+    // Enforced here as well as in `tools/list`: an unadvertised tool
+    // must also fail when called directly.
     if !grants.allows(tool.scope) {
         return error_reply(
             id,
@@ -409,7 +409,7 @@ fn tools_call(id: Value, params: &Value, grants: &Grants) -> String {
     }
 
     // Backend failures are tool-level errors (isError: true), not protocol
-    // errors: the conversation goes on, the model just learns what happened.
+    // errors: the session continues and the client receives the message.
     let (text, is_error) = match (tool.run)(&args) {
         Ok(value) => (value.to_string(), false),
         Err(CallError::Args(msg)) => return error_reply(id, -32602, msg),
@@ -558,8 +558,8 @@ mod tests {
         // ...unknown actions and missing plan ids are protocol errors...
         assert_eq!(replies[1]["error"]["code"], json!(-32602));
         assert_eq!(replies[2]["error"]["code"], json!(-32602));
-        // ...an unknown plan is a tool-level error telling the model to
-        // re-plan...
+        // ...an unknown plan is a tool-level error directing the client
+        // to re-plan...
         assert_eq!(replies[3]["result"]["isError"], json!(true));
         let msg = replies[3]["result"]["content"][0]["text"].as_str().unwrap();
         assert!(msg.contains("unknown plan"), "got: {msg}");

@@ -9,9 +9,9 @@ Description=Model Context Protocol server for systemd (read-only grants)
 Documentation=https://modelcontextprotocol.io
 
 [Service]
-# Read scopes only. units:write exists but is deliberately not granted
-# here; grant it explicitly when this instance is supposed to operate
-# the machine rather than inspect it.
+# Read scopes only. units:write is not granted here; add it only when
+# this instance is expected to operate the machine rather than inspect
+# it.
 ExecStart=/usr/local/bin/systemd-mcpd --grant units:read,journal:read,boot:read
 DynamicUser=yes
 SupplementaryGroups=systemd-journal

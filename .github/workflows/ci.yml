@@ -44,7 +44,7 @@ jobs:
           systemd-analyze verify ./systemd-mcpd.service
       - name: Live integration tests
         # Root, so the transient canary unit and the system journal are
-        # reachable without group gymnastics.
+        # reachable without group membership setup.
         run: sudo -E bash tests/integration.sh
 
   # The varlink backend needs systemd >= 258, so boot one: Fedora with
@@ -66,9 +66,9 @@ jobs:
       - name: Boot Fedora with systemd as PID 1
         # The official fedora image ships no systemd; install it on first
         # boot and exec into it, rather than trusting a third-party
-        # systemd image. dnf is retried (mirror flakes are real), and a
-        # container that never comes up fails this step loudly with its
-        # log — handing a dead container to the tests helps nobody.
+        # systemd image. dnf is retried because mirror failures happen;
+        # a container that never comes up fails this step with its log,
+        # rather than passing a dead container to the tests.
         run: |
           docker run -d --name sysd --privileged --cgroupns=host \
             --tmpfs /run --tmpfs /tmp -e container=docker \

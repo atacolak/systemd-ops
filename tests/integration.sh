@@ -21,7 +21,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 rpc() { # rpc <scopes> <request-lines...> -> raw replies, one per line
   local scopes=$1
   shift
-  # $MCPD is deliberately unquoted: it may carry a command prefix.
+  # $MCPD is left unquoted: it may carry a command prefix.
   printf '%s\n' "$@" | $MCPD --grant "$scopes"
 }
 
@@ -115,10 +115,10 @@ tool journal:read unit_logs '{"unit":"mcpd-canary.service","priority":7}' |
   fail "priority=7 lost the canary"
 
 echo "== boot_times / critical_chain / boot_blame"
-# Some hosts never finish startup — GitHub's runner VMs keep a unit
-# activating forever — and systemd is honest about it, so we are too.
-# Test whichever truth the host tells: real timings where bootup
-# finished, the clean error where it didn't.
+# Some hosts never finish startup (GitHub's runner VMs keep a unit
+# activating indefinitely), and systemd reports that as an error.
+# Assert whichever behavior the host exhibits: real timings where
+# bootup finished, the error where it did not.
 if $HOST systemd-analyze time >/dev/null 2>&1; then
   tool boot:read boot_times '{}' |
     jq -e '.total_usec > 0 and .userspace_usec > 0' >/dev/null ||
@@ -138,8 +138,8 @@ else
   expect_error boot:read critical_chain '{}' "not yet finished"
   expect_error boot:read critical_chain '{"unit":"systemd-journald.service"}' "not yet finished"
   # blame, unlike time and critical-chain, can answer on an unfinished
-  # boot (it lists whatever already started) — state-dependent, seen
-  # both ways on real runners. Accept either honest answer.
+  # boot (it lists whatever already started). Both behaviors were
+  # observed on real runners; accept either.
   reply=$(rpc boot:read "$(call boot_blame '{}')")
   if [ "$(jq -r '.result.isError' <<<"$reply")" = false ]; then
     jq -r '.result.content[0].text' <<<"$reply" |

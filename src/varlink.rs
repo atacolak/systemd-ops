@@ -1,17 +1,17 @@
-//! A varlink client in the fewest lines that are correct.
+//! A minimal varlink client.
 //!
-//! Varlink is NUL-terminated JSON over a Unix socket — `UnixStream` plus the
-//! serde_json we already ship covers it; a varlink crate would be a third
-//! dependency for a protocol this file fits in.
+//! Varlink is NUL-terminated JSON over a Unix socket; `UnixStream` plus
+//! the serde_json already in the tree covers it, so no varlink crate is
+//! used.
 //!
 //! systemd ≥ 258 serves PID 1's API at `/run/systemd/io.systemd.Manager`
 //! (one socket, several interfaces; unit listing is `io.systemd.Unit.List`,
 //! verified against the v261.2 interface definitions in
-//! `src/shared/varlink-io.systemd.Unit.c`). We speak to it when it's there
-//! and say nothing when it isn't: any surprise at all — no socket, old
-//! systemd, unfamiliar reply shape — is an `Err`, and the caller falls back
-//! to the CLI. The probe is the `connect()` itself; a failed connect to a
-//! missing path costs nothing worth caching.
+//! `src/shared/varlink-io.systemd.Unit.c`). Any failure — no socket,
+//! older systemd, an error reply, an unfamiliar reply shape — is an
+//! `Err`, and the caller falls back to the CLI. The probe is the
+//! `connect()` itself; a failed connect to a missing path is cheap
+//! enough that the result is not cached.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -25,8 +25,8 @@ const MANAGER_SOCKET: &str = "/run/systemd/io.systemd.Manager";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Units via `io.systemd.Unit.List`, normalized to the exact shape
-/// `systemctl list-units --output=json` emits — callers cannot tell the
-/// backends apart, which is the point.
+/// `systemctl list-units --output=json` emits, so callers cannot tell
+/// the backends apart.
 pub fn list_units() -> Result<Vec<Value>, BackendError> {
     call(MANAGER_SOCKET, "io.systemd.Unit.List", true)?
         .iter()
@@ -109,8 +109,8 @@ fn call(socket_path: &str, method: &str, more: bool) -> Result<Vec<Value>, Backe
             .get("continues")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        // Move the per-unit payload out rather than deep-cloning it — this
-        // is the hot path that exists to be the cheap backend.
+        // Move the per-unit payload out rather than deep-cloning it;
+        // this path runs once per unit on every list call.
         replies.push(
             reply
                 .get_mut("parameters")

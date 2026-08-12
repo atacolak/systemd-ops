@@ -6,7 +6,7 @@
 //! state, refuses if it no longer matches what the plan was made
 //! against, executes, and returns a before/after diff. Plans are
 //! single-use and live only as long as the server process; a stale or
-//! unknown plan is an error that says to re-plan, never a guess.
+//! unknown plan produces an error directing the client to re-plan.
 //!
 //! The one mutating process invocation in the program is here, at the
 //! end of `apply`, reachable through no other path.
@@ -48,8 +48,7 @@ impl Action {
     }
 
     /// The action that undoes this one. Restart and reload have no
-    /// inverse — there is no "un-restart" — and the reply says so with
-    /// null rather than pretending.
+    /// inverse; the reply reports null for them.
     fn inverse(self) -> Option<Action> {
         match self {
             Action::Start => Some(Action::Stop),
@@ -75,9 +74,9 @@ struct Plan {
     sub: String,
 }
 
-/// The stdio loop is single-threaded; the Mutex is for the compiler,
-/// not for contention. The cap bounds memory against a client that
-/// plans forever and applies nothing — oldest plans fall off first.
+/// The stdio loop is single-threaded, so the Mutex is uncontended; it
+/// exists to make the static Sync. The cap bounds memory against a
+/// client that plans without applying; oldest plans are evicted first.
 static PLANS: Mutex<Vec<Plan>> = Mutex::new(Vec::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_PLANS: usize = 32;

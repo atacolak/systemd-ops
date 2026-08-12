@@ -74,9 +74,9 @@ fn main() -> ExitCode {
         }
     }
 
-    // No grants, no server. Requiring the operator to say what they are
-    // handing over is the feature; an empty default would silently become
-    // the permission model of every lazy deployment.
+    // Without grants the server refuses to start. The operator must state
+    // what is being handed over; an empty default would become the de
+    // facto permission model of unconfigured deployments.
     let Some(grants) = grants.filter(|g| !g.is_empty()) else {
         eprintln!("error: no scopes granted; pass --grant (see --help)");
         return ExitCode::FAILURE;
