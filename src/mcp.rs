@@ -1,8 +1,8 @@
 //! The Model Context Protocol layer.
 //!
 //! MCP's stdio transport is line-delimited JSON-RPC 2.0. The server
-//! implements the four required methods — `initialize`, `tools/list`,
-//! `tools/call`, `ping` — and sends no reply to notifications. At this
+//! implements the four required methods (`initialize`, `tools/list`,
+//! `tools/call`, `ping`) and sends no reply to notifications. At this
 //! size an SDK and its async runtime would account for most of the
 //! binary, so the protocol is implemented directly as a blocking read
 //! loop.
@@ -115,7 +115,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "list_unit_files",
         scope: Scope::UnitsRead,
-        description: "List installed unit files and their enablement state — the on-disk \
+        description: "List installed unit files and their enablement state, the on-disk \
                       view, where list_units shows what is loaded. Optionally filter by \
                       state (enabled, disabled, static, masked, generated, ...).",
         input_schema: || {
@@ -370,7 +370,7 @@ const TOOLS: &[Tool] = &[
         name: "apply_plan",
         scope: Scope::UnitsWrite,
         description: "Execute a plan created by plan_change. Re-checks the state the \
-                      plan was made against and refuses stale plans — if the unit \
+                      plan was made against and refuses stale plans. If the unit \
                       changed in between, re-plan. Returns a before/after diff, the \
                       filesystem changes systemd reported (symlink creations and \
                       removals for enablement actions), and the rollback action.",

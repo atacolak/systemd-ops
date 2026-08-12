@@ -1,5 +1,5 @@
-# CI: format, lint, test, build — then drive the real binary against two
-# live systemds. No third-party actions beyond checkout — the supply chain
+# CI: format, lint, test, build, then drive the real binary against two
+# live systemds. No third-party actions beyond checkout: the supply chain
 # of a security-posture project should be short enough to read aloud.
 name: CI
 
@@ -27,7 +27,7 @@ jobs:
 
   # The runner itself is a real systemd host: a full VM with PID 1
   # systemd (255 on ubuntu-24.04) and a live journal. That exercises the
-  # CLI backend of every tool end to end — including the fallback path,
+  # CLI backend of every tool end to end, including the fallback path,
   # since 255 has no varlink socket.
   integration:
     name: live systemd (CLI backend)
@@ -50,7 +50,7 @@ jobs:
   # The varlink backend needs systemd >= 258, so boot one: Fedora with
   # systemd as PID 1 in a privileged container. The binary is musl-static
   # so the same artifact drops into any distro. The proof step deletes
-  # systemctl inside the container — if list_units still answers, only
+  # systemctl inside the container. If list_units still answers, only
   # the varlink socket could have answered.
   varlink:
     name: live systemd >= 258 (varlink backend)

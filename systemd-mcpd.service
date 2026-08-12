@@ -1,7 +1,7 @@
-# systemd-mcpd: systemd confining the thing that talks to systemd.
+# systemd-mcpd: a hardened unit for the MCP server.
 #
 # Sample unit for socket-activated or supervised use. When run as an MCP
-# stdio child by a client (the usual case), you don't need this file —
+# stdio child by a client (the usual case), you don't need this file,
 # but the hardening below is the recommended posture if you wrap it.
 
 [Unit]
@@ -18,7 +18,7 @@ SupplementaryGroups=systemd-journal
 
 # Full hardening. This instance grants read scopes only, so nothing
 # here should hurt; if you grant units:write above, the hardening still
-# applies — systemctl talks to PID 1 over D-Bus, not the filesystem.
+# applies, since systemctl talks to PID 1 over D-Bus, not the filesystem.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

@@ -110,12 +110,33 @@ else
 fi
 
 echo "== unit_logs (canary through a transient unit)"
-$HOST systemd-run --unit=mcpd-canary.service --collect \
-  /bin/sh -c 'echo mcpd-canary-marker' >/dev/null 2>&1
+# Unit name and marker are unique per run. A fixed marker lets a journal
+# entry from an earlier run satisfy the unfiltered assertion below while
+# failing the time-windowed one, which reads as a filter bug that isn't.
+CANARY_ID="$$-${RANDOM}"
+CANARY_UNIT="mcpd-canary-${CANARY_ID}.service"
+CANARY_MARKER="mcpd-canary-marker-${CANARY_ID}"
+WRITE_UNIT=/etc/systemd/system/mcpd-write-test.service
+
+# Drop the units and the unit file however this script exits; the
+# assertions below abort on failure, and a leaked unit file would make
+# the next run start from a different state.
+cleanup() {
+  $HOST systemctl stop "$CANARY_UNIT" >/dev/null 2>&1 || true
+  $HOST systemctl stop mcpd-write-test.service >/dev/null 2>&1 || true
+  $HOST systemctl unmask mcpd-write-test.service >/dev/null 2>&1 || true
+  $HOST systemctl disable mcpd-write-test.service >/dev/null 2>&1 || true
+  $HOST rm -f "$WRITE_UNIT"
+  $HOST systemctl daemon-reload >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+$HOST systemd-run --unit="$CANARY_UNIT" --collect \
+  /bin/sh -c "echo $CANARY_MARKER" >/dev/null 2>/tmp/mcpd-canary.err ||
+  fail "could not start canary unit: $(cat /tmp/mcpd-canary.err)"
 found=
 for _ in $(seq 15); do
-  if tool journal:read unit_logs '{"unit":"mcpd-canary.service"}' |
-    jq -e '.entries | map(.message) | index("mcpd-canary-marker")' >/dev/null; then
+  if tool journal:read unit_logs "{\"unit\":\"$CANARY_UNIT\"}" |
+    jq -e --arg m "$CANARY_MARKER" '.entries | map(.message) | index($m)' >/dev/null; then
     found=1
     break
   fi
@@ -123,31 +144,32 @@ for _ in $(seq 15); do
 done
 [ -n "$found" ] || fail "canary log line never appeared in unit_logs"
 # The lines cap holds...
-tool journal:read unit_logs '{"unit":"mcpd-canary.service","lines":3}' |
+tool journal:read unit_logs "{\"unit\":\"$CANARY_UNIT\",\"lines\":3}" |
   jq -e '.entries | length <= 3' >/dev/null || fail "lines cap not applied"
 # ...the query filters reach journalctl: a recent time window, the
 # current boot, and a message pattern must all still find the canary,
 # and a future window must not...
-tool journal:read unit_logs '{"unit":"mcpd-canary.service","since":"-2min","boot":0,"grep":"canary-marker"}' |
-  jq -e '.entries | map(.message) | index("mcpd-canary-marker")' >/dev/null ||
+tool journal:read unit_logs \
+  "{\"unit\":\"$CANARY_UNIT\",\"since\":\"-2min\",\"boot\":0,\"grep\":\"$CANARY_MARKER\"}" |
+  jq -e --arg m "$CANARY_MARKER" '.entries | map(.message) | index($m)' >/dev/null ||
   fail "since/boot/grep filters lost the canary"
-tool journal:read unit_logs '{"unit":"mcpd-canary.service","since":"+1min"}' |
+tool journal:read unit_logs "{\"unit\":\"$CANARY_UNIT\",\"since\":\"+1min\"}" |
   jq -e '.entries | length == 0' >/dev/null || fail "future since window returned entries"
 # A filter that matches nothing is an empty result, not an error:
 # journalctl exits 1 for "no entries matched", which must not surface
 # as a tool failure. `tool` fails the run if isError is true.
-tool journal:read unit_logs '{"unit":"mcpd-canary.service","grep":"zzz-no-such-string-zzz"}' |
+tool journal:read unit_logs "{\"unit\":\"$CANARY_UNIT\",\"grep\":\"zzz-no-such-string-zzz\"}" |
   jq -e '.entries | length == 0' >/dev/null || fail "no-match grep was not an empty result"
 # ...while a genuine journalctl failure still reports isError.
-expect_error journal:read unit_logs '{"unit":"mcpd-canary.service","boot":999}' "journalctl"
+expect_error journal:read unit_logs "{\"unit\":\"$CANARY_UNIT\",\"boot\":999}" "journalctl"
 tool journal:read list_boots '{}' |
   jq -e 'type == "array" and length >= 1' >/dev/null || fail "list_boots empty"
 # ...and the priority filter reaches journalctl: the canary logged at
 # info, so emerg-only must be empty and debug-and-above must include it.
-tool journal:read unit_logs '{"unit":"mcpd-canary.service","priority":0}' |
+tool journal:read unit_logs "{\"unit\":\"$CANARY_UNIT\",\"priority\":0}" |
   jq -e '.entries | length == 0' >/dev/null || fail "priority=0 returned entries"
-tool journal:read unit_logs '{"unit":"mcpd-canary.service","priority":7}' |
-  jq -e '.entries | map(.message) | index("mcpd-canary-marker")' >/dev/null ||
+tool journal:read unit_logs "{\"unit\":\"$CANARY_UNIT\",\"priority\":7}" |
+  jq -e --arg m "$CANARY_MARKER" '.entries | map(.message) | index($m)' >/dev/null ||
   fail "priority=7 lost the canary"
 
 echo "== boot_times / critical_chain / boot_blame"
@@ -247,7 +269,7 @@ rpc units:write \
 # Stale enablement plan: plan mask (recording unit_file_state
 # "disabled"), enable the unit out-of-band, apply must refuse. The
 # out-of-band change is enable rather than mask because mask fails for
-# units whose fragment lives in /etc/systemd/system — masking wants to
+# units whose fragment lives in /etc/systemd/system, because masking wants to
 # place its /dev/null symlink at that exact path.
 coproc SRV2 { $MCPD --grant units:write; }
 printf '%s\n' "$(call plan_change '{"action":"mask","unit":"mcpd-write-test.service"}')" >&"${SRV2[1]}"

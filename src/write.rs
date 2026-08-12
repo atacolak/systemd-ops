@@ -2,7 +2,7 @@
 //!
 //! A change is made in two steps. `plan` reads the unit's current state
 //! and returns it with the predicted state, the rollback action, and a
-//! plan id — executing nothing. `apply` takes the id, re-reads the
+//! plan id, executing nothing. `apply` takes the id, re-reads the
 //! state, refuses if it no longer matches what the plan was made
 //! against, executes, and returns a before/after diff. Plans are
 //! single-use and live only as long as the server process; a stale or
@@ -82,7 +82,7 @@ impl Action {
         }
     }
 
-    /// The systemctl verb — the names are systemd's own.
+    /// The systemctl verb. The names are systemd's own.
     fn verb(self) -> &'static str {
         match self {
             Action::Start => "start",

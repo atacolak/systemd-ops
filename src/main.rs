@@ -1,4 +1,4 @@
-//! systemd-mcpd — a Model Context Protocol server for systemd.
+//! systemd-mcpd: a Model Context Protocol server for systemd.
 //!
 //! Capability-scoped. Nothing is granted by default; reads are direct,
 //! writes exist only behind units:write and only through plan/apply.

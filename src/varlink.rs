@@ -7,8 +7,8 @@
 //! systemd ≥ 258 serves PID 1's API at `/run/systemd/io.systemd.Manager`
 //! (one socket, several interfaces; unit listing is `io.systemd.Unit.List`,
 //! verified against the v261.2 interface definitions in
-//! `src/shared/varlink-io.systemd.Unit.c`). Any failure — no socket,
-//! older systemd, an error reply, an unfamiliar reply shape — is an
+//! `src/shared/varlink-io.systemd.Unit.c`). Any failure (no socket,
+//! older systemd, an error reply, an unfamiliar reply shape) is an
 //! `Err`, and the caller falls back to the CLI. The probe is the
 //! `connect()` itself; a failed connect to a missing path is cheap
 //! enough that the result is not cached.
@@ -126,7 +126,7 @@ fn call(socket_path: &str, method: &str, more: bool) -> Result<Vec<Value>, Backe
 /// `io.systemd.Unit.List` streams one `{context, runtime}` pair per unit,
 /// PascalCase fields; systemctl's JSON speaks short names (`active`). One
 /// shape goes out either way. A missing required field means the interface
-/// isn't what we expect — refuse and let the CLI answer, rather than emit
+/// isn't what we expect, so refuse and let the CLI answer rather than emit
 /// half a unit.
 fn normalize_unit(entry: &Value) -> Result<Value, BackendError> {
     let field = |section: &str, key: &str| {
@@ -228,7 +228,7 @@ mod tests {
         let (path, _server) = serve(&[r#"{"error":"org.varlink.service.MethodNotFound"}"#]);
         let err = call(path.to_str().unwrap(), "io.systemd.Unit.List", true).unwrap_err();
         assert!(err.0.contains("MethodNotFound"), "got: {err}");
-        // No socket at all — the everyday case on systemd < 258.
+        // No socket at all, the everyday case on systemd < 258.
         assert!(call("/no/such/socket", "x", true).is_err());
     }
 

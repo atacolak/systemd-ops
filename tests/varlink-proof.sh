@@ -3,7 +3,7 @@
 # output shapes against each other.
 #
 # The fallback is not observable from the output, so a passing test on
-# a systemd >= 258 host does not show that varlink answered — the reply
+# a systemd >= 258 host does not show that varlink answered: the reply
 # could have come from the systemctl fallback. Each backend is made the
 # only one possible:
 #
@@ -43,8 +43,26 @@ call_tool_no_path() { # call_tool_no_path <scopes> <tool> <args-json> -> raw rep
 
 list_units() { call_tool units:read list_units '{}'; }
 
-# A long-lived canary both runs must see.
-$HOST systemd-run --unit=mcpd-diff-canary.service /bin/sleep 300 >/dev/null 2>&1
+# A long-lived canary both runs must see. The name is unique per run:
+# a leftover unit from an earlier run would let this one satisfy the
+# assertions below even if starting it failed.
+CANARY_UNIT="mcpd-diff-canary-$$-${RANDOM}.service"
+
+# Restore the socket and drop the canary however this script exits. The
+# assertions below abort on failure, and the window where the socket is
+# renamed must not outlive the run.
+cleanup() {
+  if [ -e "$SOCKET.hidden" ]; then
+    $HOST rm -f "$SOCKET"
+    $HOST mv "$SOCKET.hidden" "$SOCKET"
+  fi
+  $HOST systemctl stop "$CANARY_UNIT" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+$HOST systemd-run --unit="$CANARY_UNIT" --collect /bin/sleep 300 \
+  >/dev/null 2>/tmp/mcpd-diff-canary.err ||
+  fail "could not start canary unit: $(cat /tmp/mcpd-diff-canary.err)"
 
 # 1. Force the CLI backend: hide the varlink socket.
 $HOST mv "$SOCKET" "$SOCKET.hidden"
@@ -53,7 +71,7 @@ $HOST mv "$SOCKET.hidden" "$SOCKET"
 
 # 1b. A live varlink failure that isn't a missing socket: a plain file
 #     at the socket path fails connect() with ENOTSOCK for every caller
-#     (chmod tricks wouldn't work — root bypasses file permissions).
+#     (chmod tricks wouldn't work, since root bypasses file permissions).
 #     The fallback must still answer.
 $HOST mv "$SOCKET" "$SOCKET.hidden"
 $HOST touch "$SOCKET"
@@ -69,7 +87,7 @@ call_tool_no_path units:read list_units '{}' |
   jq -r '.result.content[0].text' >/tmp/mcpd-varlink.json
 jq -e 'type == "array" and length > 0' /tmp/mcpd-varlink.json >/dev/null ||
   fail "list_units did not answer over varlink with systemctl unreachable"
-# boot_times must also answer — Manager.Describe is its only possible
+# boot_times must also answer; Manager.Describe is its only possible
 # source here...
 call_tool_no_path boot:read boot_times '{}' |
   jq -e '.result.content[0].text | fromjson | .total_usec > 0' >/dev/null ||
@@ -81,15 +99,13 @@ call_tool_no_path units:read unit_properties '{"unit":"systemd-journald.service"
   fail "unit_properties succeeded with systemctl unreachable"
 
 for f in /tmp/mcpd-cli.json /tmp/mcpd-varlink.json; do
-  jq -e 'map(.unit) | index("mcpd-diff-canary.service")' "$f" >/dev/null ||
+  jq -e --arg u "$CANARY_UNIT" 'map(.unit) | index($u)' "$f" >/dev/null ||
     fail "canary unit missing from $f"
 done
 
-# Same shape from either backend — the module's stated contract.
+# Same shape from either backend, the module's stated contract.
 diff <(jq -S 'map(keys) | unique' /tmp/mcpd-cli.json) \
   <(jq -S 'map(keys) | unique' /tmp/mcpd-varlink.json) ||
   fail "backends disagree on row shape"
-
-$HOST systemctl stop mcpd-diff-canary.service >/dev/null 2>&1 || true
 
 echo "PASS: varlink proof and differential"

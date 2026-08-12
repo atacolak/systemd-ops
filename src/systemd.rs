@@ -37,7 +37,7 @@ impl Scope {
         Scope::UnitsWrite,
     ];
 
-    /// The wire name. The one place a scope spells itself — the compiler
+    /// The wire name. The one place a scope spells itself; the compiler
     /// forces a new variant to add its arm, and everything else derives.
     fn name(self) -> &'static str {
         match self {
@@ -102,7 +102,7 @@ impl fmt::Display for BackendError {
 ///
 /// systemd unit names use a known, small alphabet; anything else is
 /// refused early. `Command` never passes through a shell, so this is not
-/// an injection defense — it exists to return a precise error instead of
+/// an injection defense. It exists to return a precise error instead of
 /// whatever systemctl prints for a malformed name.
 pub(crate) fn validate_unit_name(name: &str) -> Result<(), BackendError> {
     let ok = !name.is_empty()
@@ -120,7 +120,7 @@ pub(crate) fn validate_unit_name(name: &str) -> Result<(), BackendError> {
 
 /// Spawns a command and returns its output whatever the exit status.
 /// Every process this server spawns goes through here: one place to
-/// audit, one place that pins the environment (no pager, no color — we
+/// audit, one place that pins the environment (no pager, no color, since we
 /// are parsing this output, not reading it).
 fn spawn(program: &str, args: &[&str]) -> Result<std::process::Output, BackendError> {
     Command::new(program)
@@ -219,7 +219,7 @@ pub(crate) fn unit_state(name: &str) -> Result<(String, String), BackendError> {
     Ok((get("ActiveState"), get("SubState")))
 }
 
-/// `list_boots`: the boots recorded in the journal, oldest first —
+/// `list_boots`: the boots recorded in the journal, oldest first;
 /// `journalctl --list-boots --output=json` passed through.
 pub fn list_boots() -> Result<Value, BackendError> {
     run_json(
@@ -263,7 +263,7 @@ pub(crate) fn unit_file_state(name: &str) -> Result<String, BackendError> {
 /// single mutating invocation in the program; the only caller is
 /// `crate::write::apply`, which reaches here exclusively through an
 /// applied plan. `value` carries the positional argument log-control
-/// verbs take. Returns the non-empty output lines — systemctl reports
+/// verbs take. Returns the non-empty output lines; systemctl reports
 /// enablement symlink creations and removals on stderr.
 pub(crate) fn apply_verb(
     verb: &str,
@@ -289,14 +289,14 @@ pub(crate) fn apply_verb(
 }
 
 /// Unit states accepted by the `list_units` filter. Also the schema enum
-/// advertised in `tools/list` — one list, so the contract can't drift from
+/// advertised in `tools/list`. One list, so the contract cannot drift from
 /// the check.
 pub const STATES: &[&str] = &["active", "inactive", "failed", "activating", "deactivating"];
 
 /// `list_units`: all currently loaded units, optionally filtered by state.
 ///
 /// Prefers PID 1's native varlink socket (systemd ≥ 258) and falls back to
-/// systemctl on any failure — same JSON shape either way, so the caller
+/// systemctl on any failure. Same JSON shape either way, so the caller
 /// cannot tell which backend answered. The state filter is applied here,
 /// once, after either backend, so its semantics cannot differ between
 /// backends.
@@ -329,8 +329,26 @@ pub fn list_units(state: Option<&str>) -> Result<Value, BackendError> {
         units
             .into_iter()
             .filter(|u| state.is_none_or(|s| u["active"] == s))
+            .map(|u| unit_row(&u))
             .collect(),
     ))
+}
+
+/// The row shape `list_units` emits, defined once for both backends.
+///
+/// systemctl adds a `job` key to units with a queued job, which the
+/// varlink reply never carries; passing its JSON through unchanged
+/// would let the row shape depend on which backend answered and on
+/// whether a job happened to be in flight.
+fn unit_row(unit: &Value) -> Value {
+    let field = |key: &str| unit.get(key).and_then(Value::as_str).unwrap_or("");
+    json!({
+        "unit": field("unit"),
+        "load": field("load"),
+        "active": field("active"),
+        "sub": field("sub"),
+        "description": field("description"),
+    })
 }
 
 /// `failed_units`: shorthand for the question every session starts with.
@@ -339,7 +357,7 @@ pub fn failed_units() -> Result<Value, BackendError> {
 }
 
 /// `list_timers`: timer units with their schedules, next elapse, and what
-/// they activate — `systemctl list-timers --output=json` passed through.
+/// they activate; `systemctl list-timers --output=json` passed through.
 pub fn list_timers() -> Result<Value, BackendError> {
     run_json(
         "systemctl",
@@ -348,7 +366,7 @@ pub fn list_timers() -> Result<Value, BackendError> {
 }
 
 /// `list_sockets`: socket units, what they listen on and what they
-/// activate — `systemctl list-sockets --output=json` passed through.
+/// activate; `systemctl list-sockets --output=json` passed through.
 pub fn list_sockets() -> Result<Value, BackendError> {
     run_json(
         "systemctl",
@@ -356,13 +374,13 @@ pub fn list_sockets() -> Result<Value, BackendError> {
     )
 }
 
-/// `list_unit_files`: installed unit files and their enablement state —
+/// `list_unit_files`: installed unit files and their enablement state,
 /// the on-disk view, where `list_units` shows the loaded one.
 ///
 /// The optional state filter is a plain equality match applied here, not
 /// an allowlist: unit-file states are version-dependent (enabled, static,
 /// masked, generated, transient, ...) and the value never reaches argv,
-/// so there is nothing to vet it against — an unknown state just matches
+/// so there is nothing to vet it against; an unknown state just matches
 /// nothing.
 pub fn list_unit_files(state: Option<&str>) -> Result<Value, BackendError> {
     let files = run_json(
@@ -427,7 +445,7 @@ pub fn unit_dependencies(name: &str) -> Result<Value, BackendError> {
 }
 
 /// `unit_security`: systemd-analyze's sandboxing exposure analysis of one
-/// unit — the same hardening scoring this project's own service file is
+/// unit, the same hardening scoring this project's own service file is
 /// judged by. `--json=short` is a stable machine format; passed through.
 pub fn unit_security(name: &str) -> Result<Value, BackendError> {
     validate_unit_name(name)?;
@@ -539,7 +557,7 @@ pub fn unit_logs(name: &str, filter: &LogFilter) -> Result<Value, BackendError> 
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .map(|entry| {
             // journald hands us strings for everything; give the model real
-            // types where the field has one. `MESSAGE` stays verbatim — it
+            // types where the field has one. `MESSAGE` stays unchanged, since it
             // can legitimately be a byte array for non-UTF-8 payloads.
             let str_field = |key: &str| entry.get(key).and_then(Value::as_str);
             json!({
@@ -594,7 +612,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 ///
 /// The same manager timestamps `systemd-analyze time` reads, preferably
 /// over varlink (`io.systemd.Manager.Describe`, systemd ≥ 257), else via
-/// the stable `Key=Value` output of `systemctl show` — structured data at
+/// the stable `Key=Value` output of `systemctl show`. Structured data at
 /// the source either way, never systemd-analyze's prose summary.
 pub fn boot_times() -> Result<Value, BackendError> {
     let [firmware, loader, initrd, userspace, finish] =
@@ -734,7 +752,7 @@ fn parse_critical_chain(text: &str) -> Vec<Value> {
     chain
 }
 
-/// `boot_blame`: units ordered by how long their own startup took —
+/// `boot_blame`: units ordered by how long their own startup took,
 /// `systemd-analyze blame`.
 ///
 /// Like `critical_chain`, this has no machine-readable source anywhere in
@@ -757,7 +775,7 @@ pub fn boot_blame() -> Result<Value, BackendError> {
 /// Each blame line is a timespan and a unit name. The timespan can be
 /// several tokens ("1min 30.5s"); the unit name is always the last token
 /// and cannot contain spaces, so parse from the right. A timespan starts
-/// with a digit and a unit name carries a type suffix — anything else is
+/// with a digit and a unit name carries a type suffix. Anything else is
 /// prose and parses to nothing rather than into fake entries.
 fn parse_blame(text: &str) -> Vec<Value> {
     text.lines()

@@ -27,8 +27,8 @@ systemd-mcpd --help | --version
 ```
 
 The server speaks MCP (line-delimited JSON-RPC 2.0) on stdin/stdout,
-reads requests until EOF, and exits 0. Startup errors — no grant, an
-unknown scope, an unknown flag — go to stderr with exit status 1. An
+reads requests until EOF, and exits 0. Startup errors (no grant, an
+unknown scope, an unknown flag) go to stderr with exit status 1. An
 unknown scope is an error, not a warning.
 
 | Scope          | Grants                                                   |
@@ -85,9 +85,9 @@ Arguments and behavior:
   systemd's LogControl1 interface over D-Bus; the service must declare
   `BusName=` and implement the interface (systemd-logind and
   systemd-resolved do, journald serves its log control over varlink
-  instead and is not reachable this way). Unit names are validated against the unit-name character set
-  before they reach an argument list; malformed names are refused with
-  an error naming the input.
+  instead and is not reachable this way). Unit names are validated
+  against the unit-name character set before they reach an argument
+  list; malformed names are refused with an error naming the input.
 - `list_unit_files`: optional `state`, an enablement state (`enabled`,
   `static`, `masked`, `generated`, ...). Compared by equality; unit-file
   states are version-dependent, so an unknown value matches nothing
@@ -98,8 +98,8 @@ Arguments and behavior:
   "-5min", "yesterday"), `boot` (offset: 0 current, -1 previous; see
   `list_boots`), and `grep` (regular expression over the message).
   Entries carry `timestamp` (RFC 3339 UTC), `priority` and `pid` as
-  integers, and `message` verbatim — it can legitimately be a byte
-  array for non-UTF-8 payloads.
+  integers, and `message` unchanged, since it can legitimately be a
+  byte array for non-UTF-8 payloads.
 - `list_boots`: no arguments.
 - `critical_chain`: optional `unit`, analyzing the chain to that unit
   instead of the default target. Timespans are returned verbatim
@@ -132,9 +132,10 @@ changes.
   (log-level, log-target) operate on the service's LogControl1 value.
   Each plan records, and each apply re-checks, the state dimension its
   action changes.
-- Log-control actions carry a `value` and predict it as the outcome;
-  their rollback is the same action with the previously observed value,
-  which the plan records — the one action class with an exact undo.
+- Log-control actions carry a `value` and predict it as the outcome.
+  Their rollback is the same action with the previously observed value,
+  which the plan records, so these are the one action class with an
+  exact undo.
 - Nothing executes at plan time. `plan_change` performs reads only.
 - `apply_plan` compares the current state against the state recorded at
   plan time. On mismatch the plan is discarded with an error directing
@@ -162,14 +163,19 @@ changes.
 
 ## Errors
 
-Failures travel on two channels, and the distinction is deliberate:
+Failures travel on two channels:
 
-- Invalid arguments — missing `unit`, out-of-range `priority`, unknown
-  `state` — are JSON-RPC protocol errors, code -32602.
-- Backend failures — a systemctl exit status, an unreachable manager,
-  bootup not finished — are tool results with `isError: true` carrying
-  the backend's message. The session continues; the model reads the
-  error and reacts.
+- Invalid arguments (missing `unit`, out-of-range `priority`, unknown
+  `state`) are JSON-RPC protocol errors, code -32602.
+- Backend failures (a systemctl exit status, an unreachable manager,
+  bootup not finished) are tool results with `isError: true` carrying
+  the backend's message. The session continues and the client receives
+  the message.
+
+A query that matches nothing is not a failure. journalctl exits 1 when
+`--grep` or a time window selects no entries; `unit_logs` returns an
+empty entry list for that case and reserves `isError` for a journalctl
+failure, which is distinguishable by its message on stderr.
 
 ## Permissions
 
@@ -192,10 +198,10 @@ binary tolerates systemd version skew the way the CLIs do.
 On systemd >= 258, unit listing and boot timestamps use PID 1's varlink
 socket directly (`io.systemd.Unit.List` and `io.systemd.Manager.Describe`
 on `/run/systemd/io.systemd.Manager`, verified against the v261.2
-interface definitions). The client is ~150 lines over stdlib
+interface definitions). The client is written directly over stdlib
 `UnixStream`; no varlink crate. The probe is the `connect()` itself:
-any failure — no socket, older systemd, an error reply, an unfamiliar
-reply shape — falls back to the CLI silently. Both backends are
+any failure (no socket, older systemd, an error reply, an unfamiliar
+reply shape) falls back to the CLI silently. Both backends are
 normalized to the same output shape and the caller cannot tell which
 one answered; the state filter is applied after either backend so the
 filter semantics cannot diverge.
@@ -205,7 +211,7 @@ Journal reads stay on journalctl. The varlink journal API
 journalctl, not by a bound socket, so calling it would spawn the same
 process for a less capable interface.
 
-Two tools have no machine-readable source anywhere in systemd — not
+Two tools have no machine-readable source anywhere in systemd, not
 D-Bus, not varlink, not `--output=json`: `critical_chain` and
 `boot_blame`. Their prose output is parsed by pure functions with tests
 over captured output; those parsers are to be deleted when systemd
@@ -225,7 +231,7 @@ cargo build --release
 
 ## Testing
 
-`cargo test` covers the protocol layer and the parsers. CI additionally
+`cargo test` covers the protocol layer and the parsers. CI also
 runs the binary against two live systemds on every push:
 
 - the GitHub runner itself (systemd 255, PID 1, live journal): every
@@ -233,10 +239,25 @@ runs the binary against two live systemds on every push:
   unit whose log line must round-trip through `unit_logs`, and
   `systemd-analyze verify` of the shipped unit file;
 - a Fedora container booted with systemd >= 258 as PID 1: the varlink
-  backend. The proof deletes systemctl inside the container — if
-  `list_units` and `boot_times` still answer, only the socket could
-  have — and a differential check asserts both backends emit identical
-  row shapes.
+  backend. Each backend is made the only one available: the socket is
+  renamed to force the CLI, and the server is run with an empty `PATH`
+  so it cannot execute systemctl. A differential check then asserts
+  both backends emit identical row shapes.
+
+Both suites take `MCPD` (how to run the server) and `HOST` (how to
+reach the target systemd, empty for this machine). They need root to
+create transient units, write a unit file, and read the system
+journal:
+
+```
+MCPD=$PWD/target/release/systemd-mcpd HOST= sudo -E bash tests/integration.sh
+MCPD=$PWD/target/release/systemd-mcpd HOST= sudo -E bash tests/varlink-proof.sh
+```
+
+`varlink-proof.sh` also needs a systemd new enough to serve the
+socket, and renames it for the duration of the CLI half; `/run` is a
+tmpfs, so an interrupted run costs the socket until reboot and nothing
+on disk.
 
 ## Deployment
 
@@ -263,4 +284,4 @@ more than a precondition check).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
