@@ -50,15 +50,19 @@ jobs:
           below=$(echo "$version" | awk -F. '{print $1 "." $2 - 1}')
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "below=$below" >> "$GITHUB_OUTPUT"
-      - name: Build at the floor
+      # `check` rather than `build`: an MSRV failure is a compile error
+      # about an API or syntax the toolchain does not have, which check
+      # reports, and the release profile is already built by the check
+      # job on stable.
+      - name: Compiles at the floor
         run: |
           rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
-          cargo +${{ steps.msrv.outputs.version }} build --release --locked
+          cargo +${{ steps.msrv.outputs.version }} check --locked
       - name: The version below must fail
         run: |
           rustup toolchain install ${{ steps.msrv.outputs.below }} --profile minimal
-          if cargo +${{ steps.msrv.outputs.below }} build --release --locked; then
-            echo "::error::builds on ${{ steps.msrv.outputs.below }}; lower rust-version"
+          if cargo +${{ steps.msrv.outputs.below }} check --locked; then
+            echo "::error::compiles on ${{ steps.msrv.outputs.below }}; lower rust-version"
             exit 1
           fi
 

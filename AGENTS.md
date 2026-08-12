@@ -43,10 +43,11 @@ directions, so raising it is a deliberate act, not a side effect.
   form so option parsing cannot misread them.
 - **One registry entry per tool**, in `src/mcp.rs`: name, scope,
   description, schema, handler. There is no second dispatch site.
-- **One dispatch for both protocol eras:** the modern (2026-07-28) and
-  legacy (`initialize`) paths differ only in the envelope around a
-  result. `call_tool` and `tools_list` are shared, so a tool cannot be
-  reachable in one era and gated in the other.
+- **One dispatch for both protocol eras:** `dispatch` matches the
+  method once, for both eras, which differ only in the envelope around
+  a result. Everything that decides the era, and whether a request is
+  well formed, happens in `serve` before it. Two dispatches would let a
+  method exist in one era and not the other.
 - **Two error channels, split by who can fix it:** bad arguments and
   backend failures are tool errors (`isError`), because a corrected
   call resolves them and clients are not required to show protocol

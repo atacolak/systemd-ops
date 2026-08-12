@@ -541,35 +541,43 @@ pub fn serve(input: impl BufRead, mut output: impl Write, grants: &Grants) -> st
         // The era is a property of the request, not of the connection.
         // A declared protocol version means the modern era; its absence
         // means a client that opened, or will open, with `initialize`.
+        // A discovery probe counts as modern whether or not it declared
+        // one: telling a client what this server speaks is the whole
+        // purpose of the method, and refusing it teaches the client
+        // nothing.
         let meta = params.get("_meta");
-        let declared = meta
-            .and_then(|meta| meta.get(META_VERSION))
-            .and_then(Value::as_str);
-        // Client capabilities are a modern field, so a request carrying
-        // them without a version is a broken modern request rather than
-        // a legacy one. Serving it under the older semantics would hide
-        // the client's mistake behind an answer that looks fine.
-        let modern_but_versionless =
-            declared.is_none() && meta.is_some_and(|m| m.get(META_CLIENT_CAPABILITIES).is_some());
+        let field = |key: &str| meta.and_then(|meta| meta.get(key));
+        let declared = field(META_VERSION).and_then(Value::as_str);
+        let modern = declared.is_some() || method == "server/discover";
 
-        let reply = match declared {
-            _ if modern_but_versionless => error_reply(
+        // Everything that decides which era a request belongs to, and
+        // whether it is well formed, happens here. Past this point the
+        // two eras differ only in the envelope around a result.
+        let reply = if declared.is_none() && field(META_CLIENT_CAPABILITIES).is_some() {
+            // Client capabilities are a modern field, so a request
+            // carrying them without a version is a broken modern
+            // request rather than a legacy one. Serving it under the
+            // older semantics would hide the client's mistake behind an
+            // answer that looks fine.
+            error_reply(
                 id,
                 -32602,
                 &format!("missing required _meta field: {META_VERSION}"),
-            ),
-            Some(version) if !MODERN_VERSIONS.contains(&version) => {
-                unsupported_version_reply(id, version)
-            }
-            Some(_) => modern_reply(id, method, &params, grants),
-            // A discovery probe from a client that has not chosen a
-            // version yet is answered rather than refused: reporting
-            // what this server speaks is the whole purpose of the
-            // method, and refusing it would tell the client nothing.
-            None if method == "server/discover" => {
-                result_reply(id, complete(cacheable(discover_result())))
-            }
-            None => legacy_reply(id, method, &params, grants),
+            )
+        } else if let Some(version) = declared.filter(|v| !MODERN_VERSIONS.contains(v)) {
+            unsupported_version_reply(id, version)
+        } else if declared.is_some() && field(META_CLIENT_CAPABILITIES).is_none() {
+            // Required on every modern request, and a request missing a
+            // required `_meta` field is invalid params. Only requests
+            // that declared a version reach here, so this cannot reject
+            // a legacy client, and a probe never carries `_meta` at all.
+            error_reply(
+                id,
+                -32602,
+                &format!("missing required _meta field: {META_CLIENT_CAPABILITIES}"),
+            )
+        } else {
+            dispatch(id, method, &params, grants, modern)
         };
         writeln!(output, "{reply}")?;
         output.flush()?;
@@ -626,47 +634,24 @@ fn unsupported_version_reply(id: Value, requested: &str) -> String {
     .to_string()
 }
 
-/// A request in the modern era: 2026-07-28 and later.
-fn modern_reply(id: Value, method: &str, params: &Value, grants: &Grants) -> String {
-    // Client capabilities are required on every request, and a request
-    // missing a required `_meta` field is invalid params. Only requests
-    // that already declared a modern version reach here, so this
-    // cannot reject a legacy client.
-    if params
-        .get("_meta")
-        .and_then(|meta| meta.get(META_CLIENT_CAPABILITIES))
-        .is_none()
-    {
-        return error_reply(
-            id,
-            -32602,
-            &format!("missing required _meta field: {META_CLIENT_CAPABILITIES}"),
-        );
-    }
-
+/// The methods, for both eras. One dispatch, so a method cannot be
+/// reachable in one era and missing from the other, and a tool cannot
+/// be gated in one and open in the other.
+///
+/// The eras differ only in what wraps a result: `envelope` adds the
+/// modern discriminator and server identity, `hints` the caching fields
+/// that are mandatory on the two cacheable methods. Both are the
+/// identity function for a legacy client, which must see neither.
+fn dispatch(id: Value, method: &str, params: &Value, grants: &Grants, modern: bool) -> String {
+    let envelope = |result| if modern { complete(result) } else { result };
+    let hints = |result| if modern { cacheable(result) } else { result };
     match method {
-        "server/discover" => result_reply(id, complete(cacheable(discover_result()))),
-        "ping" => result_reply(id, complete(json!({}))),
-        "tools/list" => result_reply(id, complete(cacheable(tools_list(grants)))),
-        // One dispatch for both eras, so a tool cannot be reachable in
-        // one and gated in the other.
-        "tools/call" => match call_tool(params, grants, true) {
-            Ok(result) => result_reply(id, complete(result)),
-            Err((code, message)) => error_reply(id, code, &message),
-        },
-        other => error_reply(id, -32601, &format!("method not found: {other}")),
-    }
-}
-
-/// A request in the legacy era: the `initialize` handshake, 2025-11-25
-/// and earlier.
-fn legacy_reply(id: Value, method: &str, params: &Value, grants: &Grants) -> String {
-    match method {
-        "initialize" => result_reply(id, initialize_result(params)),
-        "ping" => result_reply(id, json!({})),
-        "tools/list" => result_reply(id, tools_list(grants)),
-        "tools/call" => match call_tool(params, grants, false) {
-            Ok(result) => result_reply(id, result),
+        "server/discover" if modern => result_reply(id, envelope(hints(discover_result()))),
+        "initialize" if !modern => result_reply(id, initialize_result(params)),
+        "ping" => result_reply(id, envelope(json!({}))),
+        "tools/list" => result_reply(id, envelope(hints(tools_list(grants)))),
+        "tools/call" => match call_tool(params, grants, modern) {
+            Ok(result) => result_reply(id, envelope(result)),
             Err((code, message)) => error_reply(id, code, &message),
         },
         other => error_reply(id, -32601, &format!("method not found: {other}")),

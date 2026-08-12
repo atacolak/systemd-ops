@@ -415,27 +415,17 @@ pub fn failed_units() -> Result<Value, BackendError> {
     list_units(Some("failed"), None)
 }
 
-/// Runs a `systemctl list-*` subcommand and filters its rows by a glob
-/// on the unit name.
-fn list_filtered(
-    verb: &str,
-    key: &str,
-    pattern: Option<&str>,
-    row: impl Fn(&Value) -> Value,
-) -> Result<Value, BackendError> {
-    let matches_name = name_filter(key, pattern)?;
+/// Runs a `systemctl list-*` subcommand and returns the rows whose
+/// unit name matches the glob.
+fn list_filtered(verb: &str, pattern: Option<&str>) -> Result<Vec<Value>, BackendError> {
+    let matches_name = name_filter("unit", pattern)?;
     let rows = run_json("systemctl", &[verb, "--all", "--output=json", "--no-pager"])?;
     let Value::Array(rows) = rows else {
         return Err(BackendError(format!(
             "systemctl {verb} did not produce a JSON array"
         )));
     };
-    Ok(Value::Array(
-        rows.into_iter()
-            .filter(&matches_name)
-            .map(|r| row(&r))
-            .collect(),
-    ))
+    Ok(rows.into_iter().filter(&matches_name).collect())
 }
 
 /// `list_timers`: timer units, what each activates, and when it next and
@@ -449,7 +439,8 @@ fn list_filtered(
 /// act on; the two derived fields are dropped rather than reported
 /// wrong.
 pub fn list_timers(pattern: Option<&str>) -> Result<Value, BackendError> {
-    list_filtered("list-timers", "unit", pattern, timer_row)
+    let timers = list_filtered("list-timers", pattern)?;
+    Ok(Value::Array(timers.iter().map(timer_row).collect()))
 }
 
 fn timer_row(timer: &Value) -> Value {
@@ -471,7 +462,7 @@ fn timer_row(timer: &Value) -> Value {
 /// `list_sockets`: socket units, what they listen on and what they
 /// activate; `systemctl list-sockets --output=json` passed through.
 pub fn list_sockets(pattern: Option<&str>) -> Result<Value, BackendError> {
-    list_filtered("list-sockets", "unit", pattern, Clone::clone)
+    Ok(Value::Array(list_filtered("list-sockets", pattern)?))
 }
 
 /// `list_unit_files`: installed unit files and their enablement state,
