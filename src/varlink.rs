@@ -155,15 +155,33 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
+    /// The socket directory, removed when the test that made it ends,
+    /// including when it ends by panicking. Without this every `cargo
+    /// test` left three directories in /tmp forever; 173 of them had
+    /// accumulated before anyone looked.
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A one-shot fake varlink server: accepts one connection, reads the
     /// request, plays back canned replies. Lives in /tmp because AF_UNIX
     /// paths are capped at ~108 bytes.
     fn serve(
         replies: &'static [&'static str],
-    ) -> (std::path::PathBuf, std::thread::JoinHandle<Value>) {
-        let dir =
-            std::env::temp_dir().join(format!("mcpd-vl-{}-{:p}", std::process::id(), replies));
+    ) -> (std::path::PathBuf, std::thread::JoinHandle<Value>, TempDir) {
+        // A counter, not the address of `replies`: `{:p}` on a slice
+        // reference formats the whole fat pointer, which put
+        // `Pointer { addr: 0x..., metadata: 1 }`, spaces and braces
+        // included, into the path.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("mcpd-vl-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let guard = TempDir(dir.clone());
         let path = dir.join("sock");
         let listener = UnixListener::bind(&path).unwrap();
         let handle = std::thread::spawn(move || {
@@ -179,12 +197,12 @@ mod tests {
             }
             request
         });
-        (path, handle)
+        (path, handle, guard)
     }
 
     #[test]
     fn streams_until_continues_stops() {
-        let (path, server) = serve(&[
+        let (path, server, _dir) = serve(&[
             r#"{"parameters":{"context":{"ID":"a.service"}},"continues":true}"#,
             r#"{"parameters":{"context":{"ID":"b.service"}}}"#,
         ]);
@@ -199,7 +217,7 @@ mod tests {
 
     #[test]
     fn plain_methods_omit_more() {
-        let (path, server) = serve(&[r#"{"parameters":{"runtime":{}}}"#]);
+        let (path, server, _dir) = serve(&[r#"{"parameters":{"runtime":{}}}"#]);
         let replies = call(path.to_str().unwrap(), "io.systemd.Manager.Describe", false).unwrap();
         assert_eq!(replies.len(), 1);
         // Describe is a plain method: the request must not ask to stream.
@@ -230,7 +248,7 @@ mod tests {
 
     #[test]
     fn error_replies_and_dead_sockets_are_errors() {
-        let (path, _server) = serve(&[r#"{"error":"org.varlink.service.MethodNotFound"}"#]);
+        let (path, _server, _dir) = serve(&[r#"{"error":"org.varlink.service.MethodNotFound"}"#]);
         let err = call(path.to_str().unwrap(), "io.systemd.Unit.List", true).unwrap_err();
         assert!(err.0.contains("MethodNotFound"), "got: {err}");
         // No socket at all, the everyday case on systemd < 258.
