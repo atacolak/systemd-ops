@@ -20,6 +20,12 @@ that survives review.
 | `src/varlink.rs` | varlink client for PID 1's socket                        |
 | `src/write.rs`   | plan/apply state machine                                 |
 
+Actions are pinned by major tag and kept current by
+`.github/dependabot.yml`, not pinned by commit SHA. A SHA pin is
+stronger only while somebody bumps it; unattended it is a frozen old
+version. Do not convert them without also deciding who does the
+bumping.
+
 Packaging surface, kept in step with the code: `Makefile` (install
 targets), `systemd-mcpd.1` (man page), `systemd-mcpd.service` (sample
 unit), `CHANGELOG.md`, and `docs/PACKAGING.md`. A new flag or scope

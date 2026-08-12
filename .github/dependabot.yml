@@ -1,0 +1,31 @@
+# Keep the action versions and the two crates current.
+#
+# This repository pins actions by major tag rather than by commit SHA.
+# A SHA pin is the stronger supply-chain position, but only while
+# somebody keeps bumping it; an unattended SHA pin is a frozen old
+# version wearing a security hat. Tag plus this file means the version
+# in the tree is the one upstream is maintaining. `actions/checkout`
+# reached v7 while this file did not exist, which is the argument.
+#
+# Dependabot is GitHub's own, not a third-party action: nothing new runs
+# in the workflows.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci:"
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps:"
+    # serde and serde_json only, and both move often. One pull request
+    # for the pair rather than two.
+    groups:
+      serde:
+        patterns: ["serde", "serde_json"]

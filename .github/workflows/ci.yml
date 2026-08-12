@@ -19,7 +19,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Toolchain
         run: rustup update stable && rustup default stable
       - name: Format
@@ -47,7 +47,7 @@ jobs:
     name: MSRV (rust-version in Cargo.toml)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Read the declared floor
         id: msrv
         run: |
@@ -88,7 +88,7 @@ jobs:
     name: live systemd (CLI backend)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Toolchain
         run: rustup update stable && rustup default stable
       - name: Build
@@ -111,7 +111,7 @@ jobs:
     name: live systemd >= 258 (varlink backend)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Toolchain
         run: |
           rustup update stable && rustup default stable

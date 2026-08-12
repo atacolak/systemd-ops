@@ -20,7 +20,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # A tag that disagrees with Cargo.toml means the version bump was
       # forgotten. Better to fail here than to ship a tarball whose
