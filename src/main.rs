@@ -1,8 +1,9 @@
 //! systemd-mcpd — a Model Context Protocol server for systemd.
 //!
-//! Read-only. Capability-scoped. Nothing is granted by default.
+//! Capability-scoped. Nothing is granted by default; reads are direct,
+//! writes exist only behind units:write and only through plan/apply.
 //!
-//!     systemd-mcpd --grant units:read,journal:read
+//!     systemd-mcpd --grant units:read,journal:read,boot:read
 //!
 //! The design position, in one sentence: authority handed to a language
 //! model should be explicit at startup, enforced at every call, and
@@ -19,7 +20,7 @@ use std::process::ExitCode;
 use systemd::Grants;
 
 const USAGE: &str = "\
-systemd-mcpd: MCP server exposing a read-only, capability-scoped view of systemd
+systemd-mcpd: MCP server exposing a capability-scoped view of systemd
 
 Usage:
   systemd-mcpd --grant <scope>[,<scope>...]

@@ -5,7 +5,7 @@
 # but the hardening below is the recommended posture if you wrap it.
 
 [Unit]
-Description=Model Context Protocol server for systemd (read-only)
+Description=Model Context Protocol server for systemd (read-only grants)
 Documentation=https://modelcontextprotocol.io
 
 [Service]
@@ -16,7 +16,9 @@ ExecStart=/usr/local/bin/systemd-mcpd --grant units:read,journal:read,boot:read
 DynamicUser=yes
 SupplementaryGroups=systemd-journal
 
-# The full paranoia buffet. Read-only server; nothing here should hurt.
+# Full hardening. This instance grants read scopes only, so nothing
+# here should hurt; if you grant units:write above, the hardening still
+# applies — systemctl talks to PID 1 over D-Bus, not the filesystem.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

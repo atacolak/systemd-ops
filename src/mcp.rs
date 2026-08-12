@@ -360,8 +360,11 @@ fn initialize_result(params: &Value) -> Value {
             "name": "systemd-mcpd",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "Read-only view of systemd on this host. \
-                         Tools appear only if their capability scope was granted at startup."
+        "instructions": "Capability-scoped view of systemd on this host. Tools appear \
+                         only if their scope was granted at startup. Reads are direct; \
+                         state changes (if units:write was granted) go through \
+                         plan_change/apply_plan and are refused when the planned state \
+                         has drifted."
     })
 }
 
