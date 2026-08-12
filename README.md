@@ -259,6 +259,17 @@ socket, and renames it for the duration of the CLI half; `/run` is a
 tmpfs, so an interrupted run costs the socket until reboot and nothing
 on disk.
 
+`tests/release-check.sh` is the heavy tier, run by hand before tagging.
+It runs the fast gates and both suites on the host, then boots
+disposable QEMU guests and runs them again inside each one, which is
+the only way to reach three properties: a non-zero initrd boot phase,
+enablement surviving a reboot, and the systemd version boundary where
+the varlink socket appears. Firmware and loader timestamps stay zero
+even there, because those come from EFI variables that systemd-boot
+sets and stock cloud images boot via GRUB. It needs `qemu-system-x86`,
+`qemu-utils`, `ovmf`, `genisoimage`, `curl`, `jq`, and `/dev/kvm`, and
+takes `--tag vX.Y.Z` to tag on success.
+
 ## Deployment
 
 `systemd-mcpd.service` runs the server under `DynamicUser` with

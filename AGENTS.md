@@ -59,6 +59,13 @@ Root is required: the suites create transient units, write a unit file
 under `/etc/systemd/system`, and read the system journal.
 `varlink-proof.sh` also needs systemd >= 258 for the socket.
 
+Three tiers, in cost order. `cargo test` needs nothing. GitHub CI runs
+the fast gates plus both suites against two live systemds on every
+push. `tests/release-check.sh` is manual and boots QEMU guests; run it
+before tagging, since it covers what the first two cannot: a non-zero
+initrd phase, enablement surviving a reboot, and the version boundary
+at systemd 258.
+
 ## Things that cost time to learn
 
 - **Empty filter results.** journalctl exits 1 when a filter matches
