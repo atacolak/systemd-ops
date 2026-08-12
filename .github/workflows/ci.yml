@@ -13,7 +13,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Toolchain
         run: rustup update stable && rustup default stable
       - name: Format
@@ -33,7 +33,7 @@ jobs:
     name: live systemd (CLI backend)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Toolchain
         run: rustup update stable && rustup default stable
       - name: Build
@@ -56,7 +56,7 @@ jobs:
     name: live systemd >= 258 (varlink backend)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Toolchain
         run: |
           rustup update stable && rustup default stable
