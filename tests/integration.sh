@@ -260,6 +260,64 @@ tool journal:read unit_logs "{\"unit\":\"$CANARY_UNIT\",\"priority\":7}" |
   jq -e --arg m "$CANARY_MARKER" '.entries | map(.message) | index($m)' >/dev/null ||
   fail "priority=7 lost the canary"
 
+echo "== shipped units answer over their socket"
+# The units are the one artifact with no runtime test, which is how a
+# service that read EOF and exited 0 having done nothing survived every
+# review and a green `systemd-analyze verify`. verify reads the file;
+# this starts it and talks to it.
+#
+# The binary path is the last word of MCPD, which holds for a bare path
+# and for a command prefix ending in one ("docker exec -i sysd /path").
+SOCKET_UNIT=/run/systemd/system/mcpd-socket-test.socket
+SERVICE_UNIT=/run/systemd/system/mcpd-socket-test@.service
+SOCKET_PATH=/run/mcpd-socket-test.sock
+# The template sets ProtectHome=yes, so it cannot execute a binary under
+# /home, which is where a development build lives. Copy it to the path
+# a package would install into rather than weakening the unit for the
+# test: the hardening is the thing under test.
+SOCKET_BIN=/usr/local/bin/mcpd-socket-test
+socket_cleanup() {
+  $HOST systemctl stop mcpd-socket-test.socket >/dev/null 2>&1 || true
+  $HOST rm -f "$SOCKET_UNIT" "$SERVICE_UNIT" "$SOCKET_BIN"
+  $HOST systemctl daemon-reload >/dev/null 2>&1 || true
+}
+if ! $HOST python3 -c '' 2>/dev/null; then
+  echo "   (no python3 on the target: skipping the socket check)"
+else
+  # The shipped files, with only the two things `make install` and a
+  # test would legitimately change: where the binary is, and where the
+  # socket lives.
+  sed -e "s|ListenStream=.*|ListenStream=$SOCKET_PATH|" \
+      -e 's|^Documentation=.*||' tests/../systemd-mcpd.socket |
+    $HOST tee "$SOCKET_UNIT" >/dev/null
+  $HOST cp "${MCPD##* }" "$SOCKET_BIN"
+  sed -e "s|^ExecStart=.*|ExecStart=$SOCKET_BIN --grant units:read|" \
+      -e 's|^Documentation=.*||' tests/../systemd-mcpd@.service |
+    $HOST tee "$SERVICE_UNIT" >/dev/null
+  $HOST test -s "$SOCKET_UNIT" || fail "socket unit is empty: does HOST forward stdin?"
+  $HOST systemctl daemon-reload
+  trap 'cleanup; socket_cleanup' EXIT
+  $HOST systemctl start mcpd-socket-test.socket ||
+    fail "the shipped socket unit did not start"
+  # Mode 0600: anything that can open this gets the granted scopes.
+  mode=$($HOST stat -c '%a' "$SOCKET_PATH")
+  [ "$mode" = "600" ] || fail "socket mode is $mode, expected 600"
+  # A real request over the socket. If the service form is wrong, this
+  # is where it shows: the instance exits before answering.
+  reply=$($HOST python3 -c "
+import socket, json, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(20)
+s.connect('$SOCKET_PATH')
+s.sendall(b'{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n')
+sys.stdout.write(s.makefile().readline())
+") || fail "no reply over the socket: the unit started but answered nothing"
+  jq -e '.result.tools | length > 0' <<<"$reply" >/dev/null ||
+    fail "socket reply is not a tools/list result: $reply"
+  socket_cleanup
+  trap cleanup EXIT
+fi
+
 echo "== boot_times / critical_chain / boot_blame"
 # Some hosts never finish startup (GitHub's runner VMs keep a unit
 # activating indefinitely), and systemd reports that as an error.
