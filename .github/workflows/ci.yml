@@ -66,18 +66,26 @@ jobs:
       - name: Boot Fedora with systemd as PID 1
         # The official fedora image ships no systemd; install it on first
         # boot and exec into it, rather than trusting a third-party
-        # systemd image.
+        # systemd image. dnf is retried (mirror flakes are real), and a
+        # container that never comes up fails this step loudly with its
+        # log — handing a dead container to the tests helps nobody.
         run: |
           docker run -d --name sysd --privileged --cgroupns=host \
             --tmpfs /run --tmpfs /tmp -e container=docker \
             -v "$PWD/target/x86_64-unknown-linux-musl/release/systemd-mcpd:/usr/local/bin/systemd-mcpd:ro" \
             fedora:latest \
-            bash -c 'dnf -y install systemd && exec /usr/lib/systemd/systemd'
-          for _ in $(seq 90); do
+            bash -c 'dnf -y install systemd || dnf -y install systemd || dnf -y install systemd; exec /usr/lib/systemd/systemd'
+          ready=
+          for _ in $(seq 120); do
             state=$(docker exec sysd systemctl is-system-running 2>/dev/null || true)
-            case "$state" in running|degraded) break ;; esac
+            case "$state" in running|degraded) ready=1; break ;; esac
             sleep 2
           done
+          if [ -z "$ready" ]; then
+            echo "::error::container never reached running/degraded; container log follows"
+            docker logs sysd 2>&1 | tail -40
+            exit 1
+          fi
           docker exec sysd systemctl --version | head -1
       - name: Live integration tests (varlink host)
         run: |
