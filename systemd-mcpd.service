@@ -37,7 +37,23 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
 CapabilityBoundingSet=
+
+# The server talks to PID 1 over a Unix socket and runs systemctl,
+# which talks D-Bus over another one. It opens no network socket, so
+# deny IP traffic outright. RestrictAddressFamilies= is deliberately
+# not set: AF_UNIX alone would be right for this process, and wrong for
+# the NSS lookups DynamicUser= performs on its behalf, which is not
+# something this file can verify.
+IPAddressDeny=any
+
+# It reads the journal and PID 1's state, never another process.
+ProtectProc=invisible
+ProcSubset=pid
+
+# It creates no files. If a future version does, they are its own.
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

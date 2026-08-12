@@ -9,6 +9,12 @@ on:
   push:
   pull_request:
 
+# Nothing here writes to the repository. The default token grant is
+# wider than that on older repositories, and these jobs execute code
+# from the tree they check out.
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -54,15 +60,23 @@ jobs:
       # about an API or syntax the toolchain does not have, which check
       # reports, and the release profile is already built by the check
       # job on stable.
+      #
+      # The versions arrive through `env`, not `${{ }}`. They are read
+      # out of Cargo.toml, and a `${{ }}` substitution would paste that
+      # text into the shell before it runs.
       - name: Compiles at the floor
+        env:
+          VERSION: ${{ steps.msrv.outputs.version }}
         run: |
-          rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
-          cargo +${{ steps.msrv.outputs.version }} check --locked
+          rustup toolchain install "$VERSION" --profile minimal
+          cargo "+$VERSION" check --locked
       - name: The version below must fail
+        env:
+          BELOW: ${{ steps.msrv.outputs.below }}
         run: |
-          rustup toolchain install ${{ steps.msrv.outputs.below }} --profile minimal
-          if cargo +${{ steps.msrv.outputs.below }} check --locked; then
-            echo "::error::compiles on ${{ steps.msrv.outputs.below }}; lower rust-version"
+          rustup toolchain install "$BELOW" --profile minimal
+          if cargo "+$BELOW" check --locked; then
+            echo "::error::compiles on $BELOW; lower rust-version"
             exit 1
           fi
 

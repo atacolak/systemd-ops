@@ -16,6 +16,13 @@ under test: the HTTP status codes, the session and streaming behavior,
 and the header validation the transport scenarios check. Those scenarios
 belong in an expected-failures baseline, not in a pass count.
 
+While this runs, anything that can reach the port drives the server: it
+listens on the loopback address and asks for no credential. A page open
+in a browser on the same machine can post to a loopback port, so the
+Origin and Host checks below are what keeps this from being a way for a
+web page to operate systemd. Run it with read scopes, stop it when the
+suite finishes, and do not leave it running with units:write.
+
     python3 tests/http-shim.py --port 3000 -- ./systemd-mcpd --grant units:read
 """
 
@@ -53,15 +60,35 @@ class Handler(BaseHTTPRequestHandler):
         if body:
             self.wfile.write(body)
 
+    def _is_local_client(self):
+        # A browser can post to a loopback port from any page, and it
+        # sends an Origin when it does. Refuse anything that carries
+        # one, and refuse a Host that is not the loopback address, which
+        # is what a DNS-rebinding attack has to send.
+        if self.headers.get("Origin") is not None:
+            return False
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        return host in ("127.0.0.1", "localhost", "::1", "")
+
     def do_POST(self):
+        if not self._is_local_client():
+            self._send(403, b'{"error":"cross-origin request refused"}')
+            return
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         try:
             message = json.loads(body)
         except ValueError:
             self._send(400, b'{"error":"invalid json"}')
             return
+        # One line in, one line out. A body carrying a newline would
+        # write two frames and read one reply, leaving every later
+        # request paired with the wrong response.
+        text = body.decode("utf-8", "replace").strip()
+        if "\n" in text or "\r" in text:
+            self._send(400, b'{"error":"embedded newline in request"}')
+            return
 
-        server.stdin.write(body.decode("utf-8", "replace").strip() + "\n")
+        server.stdin.write(text + "\n")
         server.stdin.flush()
 
         # A notification draws no reply, so reading one would deadlock.
