@@ -118,6 +118,61 @@ pub(crate) fn validate_unit_name(name: &str) -> Result<(), BackendError> {
     }
 }
 
+/// Matches a name against a shell-style glob supporting `*` and `?`,
+/// the wildcards systemctl's own unit patterns use. Bracket expressions
+/// are not supported; a `[` matches itself.
+///
+/// Linear scan with one backtrack point: on a mismatch the match
+/// restarts one character further into the name, with the last `*`
+/// absorbing the difference.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let (p, n) = (pattern.as_bytes(), name.as_bytes());
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<usize> = None;
+    let mut resume = 0;
+    while ni < n.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            resume = ni;
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == b'?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if let Some(s) = star {
+            resume += 1;
+            ni = resume;
+            pi = s + 1;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == b'*')
+}
+
+/// The name-glob predicate shared by the list tools, matching against
+/// the unit name each one holds in `key`. `None` matches every row. The
+/// pattern is validated once, here, rather than at four call sites; it
+/// never reaches an argument list, so only its length is checked.
+fn name_filter<'a>(
+    key: &'a str,
+    pattern: Option<&'a str>,
+) -> Result<impl Fn(&Value) -> bool + 'a, BackendError> {
+    if let Some(p) = pattern {
+        if p.is_empty() || p.len() > 256 {
+            return Err(BackendError(
+                "pattern must be 1..256 characters, e.g. 'nginx*' or '*.timer'".into(),
+            ));
+        }
+    }
+    Ok(move |row: &Value| match pattern {
+        None => true,
+        Some(p) => row
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|name| glob_match(p, name)),
+    })
+}
+
 /// Spawns a command and returns its output whatever the exit status.
 /// Every process this server spawns goes through here: one place to
 /// audit, one place that pins the environment (no pager, no color, since we
@@ -293,14 +348,17 @@ pub(crate) fn apply_verb(
 /// the check.
 pub const STATES: &[&str] = &["active", "inactive", "failed", "activating", "deactivating"];
 
-/// `list_units`: all currently loaded units, optionally filtered by state.
+/// `list_units`: all currently loaded units, optionally filtered by
+/// state and by a glob on the unit name.
 ///
 /// Prefers PID 1's native varlink socket (systemd ≥ 258) and falls back to
 /// systemctl on any failure. Same JSON shape either way, so the caller
-/// cannot tell which backend answered. The state filter is applied here,
-/// once, after either backend, so its semantics cannot differ between
-/// backends.
-pub fn list_units(state: Option<&str>) -> Result<Value, BackendError> {
+/// cannot tell which backend answered. Both filters are applied here,
+/// once, after either backend, so their semantics cannot differ between
+/// backends. Filtering matters: an ordinary host has several hundred
+/// loaded units, and the unfiltered reply is the largest this server
+/// produces.
+pub fn list_units(state: Option<&str>, pattern: Option<&str>) -> Result<Value, BackendError> {
     if let Some(state) = state {
         if !STATES.contains(&state) {
             return Err(BackendError(format!(
@@ -309,6 +367,7 @@ pub fn list_units(state: Option<&str>) -> Result<Value, BackendError> {
             )));
         }
     }
+    let matches_name = name_filter("unit", pattern)?;
 
     let units = match crate::varlink::list_units() {
         Ok(units) => units,
@@ -328,7 +387,7 @@ pub fn list_units(state: Option<&str>) -> Result<Value, BackendError> {
     Ok(Value::Array(
         units
             .into_iter()
-            .filter(|u| state.is_none_or(|s| u["active"] == s))
+            .filter(|u| state.is_none_or(|s| u["active"] == s) && matches_name(u))
             .map(|u| unit_row(&u))
             .collect(),
     ))
@@ -353,25 +412,66 @@ fn unit_row(unit: &Value) -> Value {
 
 /// `failed_units`: shorthand for the question every session starts with.
 pub fn failed_units() -> Result<Value, BackendError> {
-    list_units(Some("failed"))
+    list_units(Some("failed"), None)
 }
 
-/// `list_timers`: timer units with their schedules, next elapse, and what
-/// they activate; `systemctl list-timers --output=json` passed through.
-pub fn list_timers() -> Result<Value, BackendError> {
-    run_json(
-        "systemctl",
-        &["list-timers", "--all", "--output=json", "--no-pager"],
-    )
+/// Runs a `systemctl list-*` subcommand and filters its rows by a glob
+/// on the unit name.
+fn list_filtered(
+    verb: &str,
+    key: &str,
+    pattern: Option<&str>,
+    row: impl Fn(&Value) -> Value,
+) -> Result<Value, BackendError> {
+    let matches_name = name_filter(key, pattern)?;
+    let rows = run_json("systemctl", &[verb, "--all", "--output=json", "--no-pager"])?;
+    let Value::Array(rows) = rows else {
+        return Err(BackendError(format!(
+            "systemctl {verb} did not produce a JSON array"
+        )));
+    };
+    Ok(Value::Array(
+        rows.into_iter()
+            .filter(&matches_name)
+            .map(|r| row(&r))
+            .collect(),
+    ))
+}
+
+/// `list_timers`: timer units, what each activates, and when it next and
+/// last elapsed.
+///
+/// The row is projected rather than passed through. systemctl's JSON
+/// carries the timestamps as raw microseconds, and its `left` and
+/// `passed` fields are filled in only on some paths (`left` repeats the
+/// absolute `next` value, `passed` is zero for timers that have run).
+/// What holds is `next` and `last`, converted to timestamps a reader can
+/// act on; the two derived fields are dropped rather than reported
+/// wrong.
+pub fn list_timers(pattern: Option<&str>) -> Result<Value, BackendError> {
+    list_filtered("list-timers", "unit", pattern, timer_row)
+}
+
+fn timer_row(timer: &Value) -> Value {
+    // 0 means "never", and USEC_INFINITY means "not scheduled"; both
+    // report as null rather than as a date in 1970 or in the year
+    // 586524.
+    let time = |key: &str| match timer.get(key).and_then(Value::as_u64) {
+        Some(usec) if usec > 0 && usec != u64::MAX => json!(usec_to_rfc3339(usec)),
+        _ => Value::Null,
+    };
+    json!({
+        "unit": timer.get("unit").and_then(Value::as_str).unwrap_or(""),
+        "activates": timer.get("activates").cloned().unwrap_or(Value::Null),
+        "next": time("next"),
+        "last": time("last"),
+    })
 }
 
 /// `list_sockets`: socket units, what they listen on and what they
 /// activate; `systemctl list-sockets --output=json` passed through.
-pub fn list_sockets() -> Result<Value, BackendError> {
-    run_json(
-        "systemctl",
-        &["list-sockets", "--all", "--output=json", "--no-pager"],
-    )
+pub fn list_sockets(pattern: Option<&str>) -> Result<Value, BackendError> {
+    list_filtered("list-sockets", "unit", pattern, Clone::clone)
 }
 
 /// `list_unit_files`: installed unit files and their enablement state,
@@ -381,8 +481,9 @@ pub fn list_sockets() -> Result<Value, BackendError> {
 /// an allowlist: unit-file states are version-dependent (enabled, static,
 /// masked, generated, transient, ...) and the value never reaches argv,
 /// so there is nothing to vet it against; an unknown state just matches
-/// nothing.
-pub fn list_unit_files(state: Option<&str>) -> Result<Value, BackendError> {
+/// nothing. The name glob matches the unit file name.
+pub fn list_unit_files(state: Option<&str>, pattern: Option<&str>) -> Result<Value, BackendError> {
+    let matches_name = name_filter("unit_file", pattern)?;
     let files = run_json(
         "systemctl",
         &["list-unit-files", "--output=json", "--no-pager"],
@@ -395,7 +496,7 @@ pub fn list_unit_files(state: Option<&str>) -> Result<Value, BackendError> {
     Ok(Value::Array(
         files
             .into_iter()
-            .filter(|f| state.is_none_or(|s| f["state"] == s))
+            .filter(|f| state.is_none_or(|s| f["state"] == s) && matches_name(f))
             .collect(),
     ))
 }
@@ -456,18 +557,40 @@ pub fn unit_security(name: &str) -> Result<Value, BackendError> {
     Ok(json!({ "unit": name, "analysis": analysis }))
 }
 
-/// `unit_properties`: the full property set of one unit.
+/// `unit_properties`: the property set of one unit, all of it or the
+/// named subset.
 ///
 /// `systemctl show` emits `Key=Value` lines rather than JSON; we convert them
-/// into an object so the model gets structure, not a wall of text.
-pub fn unit_properties(name: &str) -> Result<Value, BackendError> {
+/// into an object so the model gets structure, not a wall of text. The
+/// full set runs to some 200 properties and 10 KB for one service, which
+/// is why a caller that wants three of them can say so.
+///
+/// The subset is selected here rather than with `systemctl
+/// --property=`: systemctl prints nothing for a unit that does not exist
+/// and nothing for a property that does not exist, so letting it select
+/// would collapse those two cases into one empty reply.
+pub fn unit_properties(name: &str, select: &[String]) -> Result<Value, BackendError> {
     validate_unit_name(name)?;
     let props = run_key_values("systemctl", &["show", "--no-pager", "--", name])?;
 
     if props.is_empty() {
         return Err(BackendError(format!("no such unit: {name}")));
     }
-    Ok(json!({ "unit": name, "properties": props }))
+    if select.is_empty() {
+        return Ok(json!({ "unit": name, "properties": props }));
+    }
+
+    let selected: serde_json::Map<String, Value> = select
+        .iter()
+        .filter_map(|key| Some((key.clone(), props.get(key)?.clone())))
+        .collect();
+    if selected.is_empty() {
+        return Err(BackendError(format!(
+            "{name} has none of the requested properties: {}",
+            select.join(", ")
+        )));
+    }
+    Ok(json!({ "unit": name, "properties": selected }))
 }
 
 /// `unit_logs`: the last `lines` journal entries for one unit.
@@ -759,17 +882,24 @@ fn parse_critical_chain(text: &str) -> Vec<Value> {
 /// systemd, so its prose is parsed by a pure, tested function, to be
 /// removed when systemd provides a structured equivalent. Timespans stay
 /// verbatim strings; the formatting is not reinterpreted.
-pub fn boot_blame() -> Result<Value, BackendError> {
+///
+/// The list is already ordered slowest first, so `limit` answers the
+/// question this tool is asked without carrying the couple of hundred
+/// units nobody is waiting on. The reply reports the total, so a
+/// truncated answer says so.
+pub fn boot_blame(limit: usize) -> Result<Value, BackendError> {
     let stdout = run("systemd-analyze", &["blame", "--no-pager"])?;
     let text = String::from_utf8_lossy(&stdout);
-    let blame = parse_blame(&text);
+    let mut blame = parse_blame(&text);
     if blame.is_empty() {
         return Err(BackendError(format!(
             "could not parse systemd-analyze blame output: {}",
             text.trim()
         )));
     }
-    Ok(json!({ "blame": blame }))
+    let total = blame.len();
+    blame.truncate(limit.clamp(1, 1000));
+    Ok(json!({ "blame": blame, "returned": blame.len(), "total": total }))
 }
 
 /// Each blame line is a timespan and a unit name. The timespan can be
@@ -805,6 +935,68 @@ mod tests {
         assert!(validate_unit_name("a b").is_err());
         assert!(validate_unit_name("x;reboot").is_err());
         assert!(validate_unit_name(&"x".repeat(300)).is_err());
+    }
+
+    #[test]
+    fn globs() {
+        assert!(glob_match("nginx*", "nginx.service"));
+        assert!(glob_match("*.timer", "logrotate.timer"));
+        assert!(glob_match("systemd-*.service", "systemd-journald.service"));
+        assert!(glob_match("user@????.service", "user@1000.service"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("ssh.service", "ssh.service"));
+        // A trailing star matches the empty rest, a leading one the
+        // empty start.
+        assert!(glob_match("ssh.service*", "ssh.service"));
+        assert!(glob_match("*ssh.service", "ssh.service"));
+        // Backtracking: the first candidate for '*.service' inside the
+        // name is not the one that matches.
+        assert!(glob_match("*.service", "a.service.d.service"));
+        assert!(!glob_match("nginx*", "not-nginx.service"));
+        assert!(!glob_match("*.timer", "logrotate.timer.d"));
+        assert!(!glob_match("user@????.service", "user@10.service"));
+        assert!(!glob_match("ssh.service", "ssh.service.d"));
+        assert!(!glob_match("", "ssh.service"));
+        // Bracket expressions are not implemented: '[' is literal.
+        assert!(glob_match("a[bc.service", "a[bc.service"));
+        assert!(!glob_match("a[bc].service", "ab.service"));
+    }
+
+    #[test]
+    fn name_filtering() {
+        let rows = [
+            json!({ "unit": "ssh.service" }),
+            json!({ "unit": "a.timer" }),
+        ];
+        let f = name_filter("unit", Some("*.timer")).unwrap();
+        assert_eq!(rows.iter().filter(|r| f(r)).count(), 1);
+        // No pattern keeps every row, including one missing the key.
+        let f = name_filter("unit", None).unwrap();
+        assert!(f(&json!({})));
+        assert!(name_filter("unit", Some("")).is_err());
+        assert!(name_filter("unit", Some(&"*".repeat(300))).is_err());
+    }
+
+    #[test]
+    fn timer_rows() {
+        let row = timer_row(&json!({
+            "unit": "logrotate.timer",
+            "activates": "logrotate.service",
+            "next": 1_582_934_400_123_456_u64,
+            "last": 0,
+            "left": 1_582_934_400_123_456_u64,
+            "passed": 0,
+        }));
+        assert_eq!(row["unit"], json!("logrotate.timer"));
+        assert_eq!(row["next"], json!("2020-02-29T00:00:00.123456Z"));
+        // Never run reports null, not the epoch...
+        assert_eq!(row["last"], json!(null));
+        // ...and the fields systemctl fills in inconsistently are gone.
+        assert!(row.get("left").is_none() && row.get("passed").is_none());
+        // Not scheduled (USEC_INFINITY) is null too.
+        let row = timer_row(&json!({ "unit": "x.timer", "next": u64::MAX }));
+        assert_eq!(row["next"], json!(null));
+        assert_eq!(row["activates"], json!(null));
     }
 
     #[test]

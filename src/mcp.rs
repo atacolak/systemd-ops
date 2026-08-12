@@ -39,6 +39,22 @@ fn required_unit(args: &Value) -> Result<&str, CallError> {
         .ok_or(CallError::Args("missing required argument: unit"))
 }
 
+/// The name-glob argument the list tools share, spelled once so the four
+/// schemas cannot describe it differently.
+fn pattern_schema(what: &str) -> Value {
+    json!({
+        "type": "string",
+        "description": format!(
+            "Only return {what} whose name matches this glob \
+             ('nginx*', 'systemd-*.service', '*.timer'). Supports * and ?."
+        )
+    })
+}
+
+fn pattern_arg(args: &Value) -> Option<&str> {
+    args.get("pattern").and_then(Value::as_str)
+}
+
 /// One tool: its wire description, the scope that gates it, and its handler.
 struct Tool {
     name: &'static str,
@@ -54,8 +70,11 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "list_units",
         scope: Scope::UnitsRead,
-        description: "List all loaded systemd units with their load, active and sub states. \
-                      Optionally filter by state.",
+        description: "List loaded systemd units with their load, active and sub states. \
+                      Filter by state, by a glob on the unit name, or both. A typical \
+                      host has several hundred loaded units, so filter unless the whole \
+                      inventory is the point: 'nginx*' for one service and its instances, \
+                      '*.timer' for a unit type.",
         input_schema: || {
             json!({
                 "type": "object",
@@ -64,13 +83,15 @@ const TOOLS: &[Tool] = &[
                         "type": "string",
                         "enum": systemd::STATES,
                         "description": "Only return units in this state."
-                    }
+                    },
+                    "pattern": pattern_schema("units")
                 }
             })
         },
         run: |args| {
             Ok(systemd::list_units(
                 args.get("state").and_then(Value::as_str),
+                pattern_arg(args),
             )?)
         },
     },
@@ -84,40 +105,73 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "unit_properties",
         scope: Scope::UnitsRead,
-        description: "Show the full property set of one unit \
-                      (ExecStart, restart policy, resource limits, state timestamps, ...).",
+        description: "Show the properties of one unit (ExecStart, restart policy, resource \
+                      limits, state timestamps, ...). The full set is about 200 properties; \
+                      name the ones you need to get those alone. Common: ActiveState, \
+                      SubState, Result, ExecMainStatus, ExecMainPID, FragmentPath, \
+                      UnitFileState, Restart, NRestarts, MemoryCurrent.",
         input_schema: || {
             json!({
                 "type": "object",
                 "properties": {
-                    "unit": { "type": "string", "description": "Unit name, e.g. ssh.service" }
+                    "unit": { "type": "string", "description": "Unit name, e.g. ssh.service" },
+                    "properties": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Return only these properties, by exact name. \
+                                        Omit for all of them."
+                    }
                 },
                 "required": ["unit"]
             })
         },
-        run: |args| Ok(systemd::unit_properties(required_unit(args)?)?),
+        run: |args| {
+            let select: Vec<String> = args
+                .get("properties")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(systemd::unit_properties(required_unit(args)?, &select)?)
+        },
     },
     Tool {
         name: "list_timers",
         scope: Scope::UnitsRead,
-        description: "List timer units: schedule, next elapse, last trigger, and the unit \
-                      each one activates.",
-        input_schema: || json!({ "type": "object", "properties": {} }),
-        run: |_| Ok(systemd::list_timers()?),
+        description: "List timer units: the unit each one activates, when it next elapses, \
+                      and when it last did. Both times are UTC timestamps, null for a timer \
+                      that has never run or is not scheduled.",
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": { "pattern": pattern_schema("timers") }
+            })
+        },
+        run: |args| Ok(systemd::list_timers(pattern_arg(args))?),
     },
     Tool {
         name: "list_sockets",
         scope: Scope::UnitsRead,
         description: "List socket units: what they listen on and the unit each one activates.",
-        input_schema: || json!({ "type": "object", "properties": {} }),
-        run: |_| Ok(systemd::list_sockets()?),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": { "pattern": pattern_schema("sockets") }
+            })
+        },
+        run: |args| Ok(systemd::list_sockets(pattern_arg(args))?),
     },
     Tool {
         name: "list_unit_files",
         scope: Scope::UnitsRead,
         description: "List installed unit files and their enablement state, the on-disk \
-                      view, where list_units shows what is loaded. Optionally filter by \
-                      state (enabled, disabled, static, masked, generated, ...).",
+                      view, where list_units shows what is loaded. Filter by state \
+                      (enabled, disabled, static, masked, generated, ...), by a glob on \
+                      the file name, or both. A host carries hundreds of unit files.",
         input_schema: || {
             json!({
                 "type": "object",
@@ -125,13 +179,15 @@ const TOOLS: &[Tool] = &[
                     "state": {
                         "type": "string",
                         "description": "Only return unit files in this enablement state."
-                    }
+                    },
+                    "pattern": pattern_schema("unit files")
                 }
             })
         },
         run: |args| {
             Ok(systemd::list_unit_files(
                 args.get("state").and_then(Value::as_str),
+                pattern_arg(args),
             )?)
         },
     },
@@ -293,9 +349,26 @@ const TOOLS: &[Tool] = &[
         scope: Scope::BootRead,
         description: "Units ordered by how long their own startup took, slowest first. \
                       Unlike critical_chain this includes units that did not gate the \
-                      boot; a slow entry here may still have run in parallel.",
-        input_schema: || json!({ "type": "object", "properties": {} }),
-        run: |_| Ok(systemd::boot_blame()?),
+                      boot; a slow entry here may still have run in parallel. Returns the \
+                      slowest 'limit' units and the total number measured.",
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000,
+                        "default": 25,
+                        "description": "How many of the slowest units to return."
+                    }
+                }
+            })
+        },
+        run: |args| {
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(25);
+            Ok(systemd::boot_blame(limit as usize)?)
+        },
     },
     Tool {
         name: "plan_change",

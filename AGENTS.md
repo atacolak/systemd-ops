@@ -51,9 +51,15 @@ for this machine):
 
 ```
 cargo build --release
-MCPD=$PWD/target/release/systemd-mcpd HOST= sudo -E bash tests/integration.sh
-MCPD=$PWD/target/release/systemd-mcpd HOST= sudo -E bash tests/varlink-proof.sh
+MCPD=$PWD/target/release/systemd-mcpd HOST= sudo bash tests/integration.sh
+MCPD=$PWD/target/release/systemd-mcpd HOST= sudo bash tests/varlink-proof.sh
 ```
+
+A sudoers rule that grants these two scripts without a password matches
+the command by absolute path and carries the variables through
+`env_keep`, so under one the invocation is
+`sudo /usr/bin/bash /path/to/tests/integration.sh` with no `-E`: a
+relative path does not match the rule, and `-E` is refused outright.
 
 Root is required: the suites create transient units, write a unit file
 under `/etc/systemd/system`, and read the system journal.

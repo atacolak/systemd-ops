@@ -31,8 +31,9 @@ Scopes:
                   dependencies, security analysis
   journal:read    read journal entries per unit
   boot:read       boot phase timings, critical chain, blame
-  units:write     plan and apply unit state changes
-                  (start/stop/restart/reload)
+  units:write     plan and apply changes: lifecycle
+                  (start/stop/restart/reload), enablement
+                  (enable/disable/mask/unmask), log level and log target
 
 The server speaks MCP over stdio. Tools outside the granted scopes are
 neither advertised nor callable. Writes exist only behind units:write

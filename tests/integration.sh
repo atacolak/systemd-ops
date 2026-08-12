@@ -65,24 +65,64 @@ jq -e 'map(.unit) | index("systemd-journald.service")' <<<"$units" >/dev/null ||
   fail "systemd-journald.service not in list_units"
 tool units:read failed_units '{}' | jq -e 'type == "array"' >/dev/null ||
   fail "failed_units not an array"
+# The name glob narrows the reply and keeps what it should. It runs
+# after whichever backend answered, so this covers both.
+matched=$(tool units:read list_units '{"pattern":"systemd-*.service"}')
+jq -e --argjson all "$(jq length <<<"$units")" \
+  'length > 0 and length < $all and all(.[]; (.unit | startswith("systemd-")) and (.unit | endswith(".service")))' \
+  <<<"$matched" >/dev/null || fail "list_units pattern filter wrong: $(jq -c 'map(.unit)' <<<"$matched")"
+jq -e 'map(.unit) | index("systemd-journald.service")' <<<"$matched" >/dev/null ||
+  fail "journald lost by the systemd-*.service pattern"
+# Both filters at once, and a pattern matching nothing is an empty
+# answer rather than an error.
+tool units:read list_units '{"pattern":"*.socket","state":"active"}' |
+  jq -e 'all(.[]; (.unit | endswith(".socket")) and .active == "active")' >/dev/null ||
+  fail "list_units state+pattern filters leaked rows"
+tool units:read list_units '{"pattern":"zzz-no-such-unit-zzz*"}' |
+  jq -e 'length == 0' >/dev/null || fail "no-match pattern did not return an empty array"
+expect_error units:read list_units '{"pattern":""}' "pattern must be"
 
 echo "== unit_properties"
 tool units:read unit_properties '{"unit":"systemd-journald.service"}' |
   jq -e '.properties.ExecStart | length > 0' >/dev/null ||
   fail "journald properties have no ExecStart"
+# A selection returns those properties and nothing else; the full set
+# runs to some 200 keys.
+tool units:read unit_properties \
+  '{"unit":"systemd-journald.service","properties":["ActiveState","FragmentPath"]}' |
+  jq -e '.properties | keys == ["ActiveState","FragmentPath"]' >/dev/null ||
+  fail "unit_properties selection returned other keys"
+expect_error units:read unit_properties \
+  '{"unit":"systemd-journald.service","properties":["NoSuchProperty"]}' \
+  "none of the requested properties"
 
 echo "== list_timers / list_sockets / list_unit_files"
-tool units:read list_timers '{}' | jq -e 'type == "array"' >/dev/null ||
-  fail "list_timers not an array"
+timers=$(tool units:read list_timers '{}')
+jq -e 'type == "array"' <<<"$timers" >/dev/null || fail "list_timers not an array"
+# Timestamps are RFC 3339, not raw microseconds, and the fields
+# systemctl fills in inconsistently (left, passed) are gone.
+jq -e 'all(.[]; has("unit") and has("activates") and has("next") and has("last")
+             and (has("left") | not) and (has("passed") | not)
+             and (.next == null or (.next | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*Z$"))))' \
+  <<<"$timers" >/dev/null || fail "list_timers rows malformed: $(jq -c '.[0]' <<<"$timers")"
+tool units:read list_timers '{"pattern":"zzz-no-such-timer-zzz*"}' |
+  jq -e 'length == 0' >/dev/null || fail "list_timers pattern not applied"
 tool units:read list_sockets '{}' |
   jq -e 'type == "array" and length > 0' >/dev/null ||
   fail "list_sockets empty (journald sockets should always exist)"
+tool units:read list_sockets '{"pattern":"*journald*"}' |
+  jq -e 'length > 0 and all(.[]; .unit | contains("journald"))' >/dev/null ||
+  fail "list_sockets pattern filter wrong"
 files=$(tool units:read list_unit_files '{}')
 jq -e 'map(.unit_file) | index("systemd-journald.service")' <<<"$files" >/dev/null ||
   fail "journald missing from list_unit_files"
 tool units:read list_unit_files '{"state":"static"}' |
   jq -e 'length > 0 and all(.[]; .state == "static")' >/dev/null ||
   fail "list_unit_files state filter leaked non-static rows"
+# The glob matches the unit file name, which is the key this reply uses.
+tool units:read list_unit_files '{"pattern":"systemd-journald.*"}' |
+  jq -e 'length > 0 and all(.[]; .unit_file | startswith("systemd-journald."))' >/dev/null ||
+  fail "list_unit_files pattern filter wrong"
 
 echo "== unit_dependencies / unit_security / unit_log_control"
 tool units:read unit_dependencies '{"unit":"multi-user.target"}' |
@@ -199,6 +239,11 @@ if $HOST systemd-analyze time >/dev/null 2>&1; then
   tool boot:read boot_blame '{}' |
     jq -e '.blame | length > 0 and all(.[]; has("unit") and has("time"))' >/dev/null ||
     fail "boot_blame empty or malformed"
+  # A truncated answer says so: the limit caps the list, the total
+  # reports how many units were measured.
+  tool boot:read boot_blame '{"limit":1}' |
+    jq -e '.returned == 1 and (.blame | length) == 1 and .total >= 1' >/dev/null ||
+    fail "boot_blame limit not applied or total missing"
 else
   echo "   (bootup unfinished on this host - asserting the clean-error path)"
   expect_error boot:read boot_times '{}' "not yet finished"

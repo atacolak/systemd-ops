@@ -60,8 +60,8 @@ MCP client configuration (any MCP client; Claude Desktop shown):
 |---------------------|----------------|---------------------------------------------|
 | `list_units`        | `units:read`   | Loaded units with load/active/sub state     |
 | `failed_units`      | `units:read`   | Units currently in the failed state         |
-| `unit_properties`   | `units:read`   | Full property set of one unit               |
-| `list_timers`       | `units:read`   | Timer units: schedules and activated units  |
+| `unit_properties`   | `units:read`   | Properties of one unit, all or a named subset |
+| `list_timers`       | `units:read`   | Timer units: next and last elapse, activated unit |
 | `list_sockets`      | `units:read`   | Socket units: listeners and activated units |
 | `list_unit_files`   | `units:read`   | Installed unit files and enablement state   |
 | `unit_dependencies` | `units:read`   | One unit's dependency edges, by relation    |
@@ -77,9 +77,24 @@ MCP client configuration (any MCP client; Claude Desktop shown):
 
 Arguments and behavior:
 
+- `list_units`, `list_timers`, `list_sockets`, `list_unit_files`:
+  optional `pattern`, a glob over the unit name supporting `*` and `?`
+  (`nginx*`, `systemd-*.service`, `*.timer`). Bracket expressions are
+  not implemented; `[` matches itself. A pattern that matches nothing
+  returns an empty array rather than an error. Filtering is worth
+  reaching for: an ordinary host has several hundred loaded units and
+  as many unit files, and the unfiltered `list_units` reply is the
+  largest this server produces.
 - `list_units`: optional `state`, one of `active`, `inactive`, `failed`,
-  `activating`, `deactivating`. Matches the unit's active state. The
-  filter is applied by the server, identically over both backends.
+  `activating`, `deactivating`. Matches the unit's active state. Both
+  filters are applied by the server after either backend, so their
+  semantics are identical over both.
+- `list_timers`: `next` and `last` are RFC 3339 UTC timestamps, null for
+  a timer that has never run or has no scheduled elapse. systemctl's
+  `left` and `passed` fields are not reported: it fills them in only on
+  some paths (`left` repeating the absolute `next` value, `passed`
+  reading zero for timers that have run), and a wrong number is worse
+  than an absent one.
 - `unit_properties`, `unit_dependencies`, `unit_security`,
   `unit_log_control`: required `unit`. `unit_log_control` reads through
   systemd's LogControl1 interface over D-Bus; the service must declare
@@ -88,10 +103,17 @@ Arguments and behavior:
   instead and is not reachable this way). Unit names are validated
   against the unit-name character set before they reach an argument
   list; malformed names are refused with an error naming the input.
+- `unit_properties`: optional `properties`, an array of exact property
+  names. The full set runs to some 200 properties and 10 KB for one
+  service; naming three returns three. A name that does not exist is
+  omitted, and a selection where none exist is an error naming them.
+  The subset is selected by the server, not by `systemctl --property=`,
+  which prints nothing both for a unit that does not exist and for a
+  property that does not exist and would collapse the two cases.
 - `list_unit_files`: optional `state`, an enablement state (`enabled`,
   `static`, `masked`, `generated`, ...). Compared by equality; unit-file
   states are version-dependent, so an unknown value matches nothing
-  rather than erroring.
+  rather than erroring. The `pattern` glob matches the unit file name.
 - `unit_logs`: required `unit`; optional `lines` (1..1000, default 50),
   `priority` (0..7; entries at that syslog priority or more severe),
   `since`/`until` (journalctl time syntax: "2026-08-12 06:00:00",
@@ -106,8 +128,11 @@ Arguments and behavior:
   ("1min 30.5s"); the server does not reinterpret systemd's formatting.
 - `boot_times`: no arguments. Phases that did not occur (no EFI, no
   initrd) are omitted rather than reported as zero.
-- `failed_units`, `list_timers`, `list_sockets`, `boot_blame`: no
-  arguments.
+- `boot_blame`: optional `limit` (1..1000, default 25). The list is
+  ordered slowest first, so the limit answers the question the tool is
+  asked; the reply carries `returned` and `total`, so a truncated
+  answer says it is one.
+- `failed_units`: no arguments.
 - `plan_change`: required `action` (`start`, `stop`, `restart`,
   `reload`, `enable`, `disable`, `mask`, `unmask`, `log-level`,
   `log-target`) and `unit`. The log-control actions require `value`
