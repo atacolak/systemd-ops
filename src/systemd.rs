@@ -559,6 +559,9 @@ const DEPENDENCY_PROPS: &[&str] = &[
 /// relation is present in the reply, empty ones as empty arrays.
 pub fn unit_dependencies(name: &str) -> Result<Value, BackendError> {
     validate_unit_name(name)?;
+    // Without this, a typo reads back as the authoritative claim that
+    // the unit has no dependencies at all.
+    ensure_unit_known(name)?;
     let prop_arg = format!("--property={}", DEPENDENCY_PROPS.join(","));
     let props = run_key_values("systemctl", &["show", "--no-pager", &prop_arg, "--", name])?;
     let deps: serde_json::Map<String, Value> = DEPENDENCY_PROPS
@@ -729,7 +732,21 @@ pub fn unit_logs(name: &str, filter: &LogFilter) -> Result<Value, BackendError> 
         })
         .collect();
 
-    Ok(json!({ "unit": name, "entries": entries }))
+    // journalctl answers for any name, so a typo reads as "this unit is
+    // quiet", which is the wrong conclusion during an incident. It
+    // cannot be an error, though: the journal outlives the unit, and
+    // reading the logs of a transient unit that has already been
+    // collected, or of one removed since, or of a previous boot, is
+    // the point of the tool. So say it, only when there is nothing to
+    // show and the manager has never heard of the name.
+    let mut reply = json!({ "unit": name, "entries": entries });
+    if reply["entries"].as_array().is_some_and(Vec::is_empty) && ensure_unit_known(name).is_err() {
+        reply["note"] = json!(
+            "no entries, and no unit by this name is currently loaded: \
+             check the name, or the boot offset if it is from an earlier boot"
+        );
+    }
+    Ok(reply)
 }
 
 /// Formats a realtime microsecond timestamp as RFC 3339 UTC.
@@ -775,7 +792,20 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 pub fn boot_times() -> Result<Value, BackendError> {
     let [firmware, loader, initrd, userspace, finish] =
         crate::varlink::boot_timestamps().or_else(|_| cli_boot_timestamps())?;
-    compute_boot_times(firmware, loader, initrd, userspace, finish)
+    compute_boot_times(firmware, loader, initrd, userspace, finish, in_container())
+}
+
+/// Whether this manager runs a container, which systemd-analyze checks
+/// before reporting any pre-userspace phase.
+///
+/// It matters more than it looks. In a container the userspace
+/// timestamp is the host's monotonic clock at container start, not a
+/// duration this system spent booting, so treating it as the kernel
+/// phase reports a boot of hours for a startup of seconds.
+fn in_container() -> bool {
+    spawn("systemd-detect-virt", &["--container", "--quiet"])
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn cli_boot_timestamps() -> Result<[u64; 5], BackendError> {
@@ -810,6 +840,7 @@ fn compute_boot_times(
     initrd: u64,
     userspace: u64,
     finish: u64,
+    container: bool,
 ) -> Result<Value, BackendError> {
     if finish == 0 {
         return Err(BackendError(
@@ -821,6 +852,16 @@ fn compute_boot_times(
     let mut insert = |key: &str, usec: u64| {
         phases.insert(key.to_string(), json!(usec));
     };
+
+    // A container did not boot: no firmware, no loader, no kernel, and
+    // the timestamps for them belong to the host. Report the one phase
+    // that happened here, which is what systemd-analyze does.
+    if container {
+        insert("userspace_usec", finish.saturating_sub(userspace));
+        insert("total_usec", finish.saturating_sub(userspace));
+        insert("container", 1);
+        return Ok(Value::Object(phases));
+    }
     if firmware > loader {
         insert("firmware_usec", firmware - loader);
     }
@@ -865,6 +906,29 @@ pub fn critical_chain(unit: Option<&str>) -> Result<Value, BackendError> {
     Ok(json!({ "chain": chain }))
 }
 
+/// Strips the tree drawing from the front of a critical-chain line,
+/// leaving the unit name.
+///
+/// systemd-analyze draws the tree with box-drawing characters under a
+/// UTF-8 locale and with ``` `- ``` and `|-` under LC_ALL=C, which
+/// `spawn` pins. Both forms have to be handled, and the connectors are
+/// matched whole rather than as a character set: a unit name can begin
+/// with `-`, so stripping `-` as a set member would eat the first
+/// character of `-.mount`.
+fn strip_tree_prefix(line: &str) -> &str {
+    let mut rest = line;
+    loop {
+        let trimmed = rest.trim_start_matches(' ');
+        let stripped = ["└─", "├─", "│", "`-", "|-", "|"]
+            .iter()
+            .find_map(|connector| trimmed.strip_prefix(connector));
+        match stripped {
+            Some(next) => rest = next,
+            None => return trimmed,
+        }
+    }
+}
+
 /// Parses critical-chain output into `{unit, depth, activated, duration}`
 /// entries. `activated` is the `@` time (when the unit became active,
 /// relative to boot start), `duration` the `+` time (how long it took to
@@ -873,8 +937,7 @@ pub fn critical_chain(unit: Option<&str>) -> Result<Value, BackendError> {
 fn parse_critical_chain(text: &str) -> Vec<Value> {
     let mut chain = Vec::new();
     for line in text.lines() {
-        // Strip the tree drawing; what's left starts with the unit name.
-        let rest = line.trim_start_matches([' ', '└', '├', '│', '─']);
+        let rest = strip_tree_prefix(line);
         let depth = (line.chars().count() - rest.chars().count()) / 2;
         let mut tokens = rest.split_whitespace();
         let Some(name) = tokens.next() else { continue };
@@ -1131,7 +1194,10 @@ mod tests {
         // EFI boot with initrd: every phase present, arithmetic per
         // systemd-analyze (firmware/loader are pre-kernel durations,
         // the rest are timestamps since kernel start).
-        let v = compute_boot_times(5_000_000, 2_000_000, 3_000_000, 4_000_000, 10_000_000).unwrap();
+        let v = compute_boot_times(
+            5_000_000, 2_000_000, 3_000_000, 4_000_000, 10_000_000, false,
+        )
+        .unwrap();
         assert_eq!(v["firmware_usec"], json!(3_000_000));
         assert_eq!(v["loader_usec"], json!(2_000_000));
         assert_eq!(v["kernel_usec"], json!(3_000_000));
@@ -1140,7 +1206,7 @@ mod tests {
         assert_eq!(v["total_usec"], json!(15_000_000));
 
         // BIOS boot, no initrd: absent phases are absent, not zero.
-        let v = compute_boot_times(0, 0, 0, 4_000_000, 10_000_000).unwrap();
+        let v = compute_boot_times(0, 0, 0, 4_000_000, 10_000_000, false).unwrap();
         assert!(v.get("firmware_usec").is_none());
         assert!(v.get("loader_usec").is_none());
         assert!(v.get("initrd_usec").is_none());
@@ -1148,7 +1214,15 @@ mod tests {
         assert_eq!(v["total_usec"], json!(10_000_000));
 
         // Still booting: an error the model can act on, not garbage math.
-        assert!(compute_boot_times(0, 0, 0, 4_000_000, 0).is_err());
+        assert!(compute_boot_times(0, 0, 0, 4_000_000, 0, false).is_err());
+
+        // In a container the userspace timestamp is the host's uptime,
+        // so reporting it as a kernel phase claimed a 7.5 hour boot for
+        // a 34 second startup. Only the phase that happened is shown.
+        let v = compute_boot_times(0, 0, 0, 27_007_369_578, 27_041_763_522, true).unwrap();
+        assert_eq!(v["userspace_usec"], json!(34_393_944));
+        assert_eq!(v["total_usec"], json!(34_393_944));
+        assert!(v.get("kernel_usec").is_none());
     }
 
     #[test]
@@ -1181,6 +1255,29 @@ graphical.target @1min 30.5s
             json!("NetworkManager-wait-online.service")
         );
         assert_eq!(chain[4]["duration"], json!("45.8s"));
+    }
+
+    #[test]
+    fn critical_chain_parses_the_ascii_tree() {
+        // LC_ALL=C, which `spawn` pins, makes systemd-analyze draw the
+        // tree with `- and |- instead of box characters. Parsing only
+        // the box form silently reduced every chain to its root.
+        let text = "\
+graphical.target @1min 30.5s
+`-multi-user.target @1min 30.5s
+  `-nginx.service @58.2s +2.1s
+    |-network-online.target @58.1s
+    `--.mount @1.2s
+";
+        let chain = parse_critical_chain(text);
+        assert_eq!(chain.len(), 5, "got: {chain:?}");
+        assert_eq!(chain[1]["unit"], json!("multi-user.target"));
+        assert_eq!(chain[2]["unit"], json!("nginx.service"));
+        assert_eq!(chain[2]["duration"], json!("2.1s"));
+        assert_eq!(chain[3]["unit"], json!("network-online.target"));
+        // A unit name may itself begin with '-', so the connectors are
+        // stripped whole rather than as a set of characters.
+        assert_eq!(chain[4]["unit"], json!("-.mount"));
     }
 
     #[test]

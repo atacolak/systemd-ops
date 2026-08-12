@@ -259,6 +259,12 @@ tool journal:read unit_logs "{\"unit\":\"$CANARY_UNIT\",\"grep\":\"zzz-no-such-s
   jq -e '.entries | length == 0' >/dev/null || fail "no-match grep was not an empty result"
 # ...while a failure that writes to stderr still reports isError.
 expect_error journal:read unit_logs "{\"unit\":\"$CANARY_UNIT\",\"boot\":999}" "journalctl"
+# A name the manager does not know is not an error (the journal
+# outlives units, and a collected transient unit still has logs) but it
+# must say so rather than reading as "this unit is quiet".
+tool journal:read unit_logs '{"unit":"zzz-no-such-unit-zzz.service"}' |
+  jq -e '.entries == [] and (.note | test("no unit by this name"))' >/dev/null ||
+  fail "unknown unit in unit_logs neither errored nor carried a note"
 tool journal:read list_boots '{}' |
   jq -e 'type == "array" and length >= 1' >/dev/null || fail "list_boots empty"
 # ...and the priority filter reaches journalctl: the canary logged at
@@ -336,9 +342,13 @@ if $HOST systemd-analyze time >/dev/null 2>&1; then
   tool boot:read boot_times '{}' |
     jq -e '.total_usec > 0 and .userspace_usec > 0' >/dev/null ||
     fail "boot_times implausible"
+  # A chain of one is what a broken tree parser returns: the root
+  # survives and every indented line is dropped. Require depth, which
+  # is the part that only appears if the tree was actually parsed.
   tool boot:read critical_chain '{}' |
-    jq -e '.chain | length > 0 and all(.[]; has("unit") and has("depth"))' >/dev/null ||
-    fail "critical_chain empty or malformed"
+    jq -e '.chain | length > 1 and all(.[]; has("unit") and has("depth"))
+           and (map(.depth) | max) > 0' >/dev/null ||
+    fail "critical_chain returned no tree (a lone root means the drawing was not parsed)"
   tool boot:read critical_chain '{"unit":"systemd-journald.service"}' |
     jq -e '.chain | length > 0' >/dev/null ||
     fail "critical_chain with explicit unit came back empty"

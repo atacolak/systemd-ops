@@ -136,12 +136,17 @@ fn normalize_unit(entry: &Value) -> Result<Value, BackendError> {
             .and_then(Value::as_str)
             .ok_or_else(|| BackendError(format!("varlink unit entry missing '{section}.{key}'")))
     };
+    let id = field("context", "ID")?;
     Ok(json!({
-        "unit": field("context", "ID")?,
+        "unit": id,
         "load": field("runtime", "LoadState")?,
         "active": field("runtime", "ActiveState")?,
         "sub": field("runtime", "SubState")?,
-        "description": field("context", "Description").unwrap_or(""),
+        // systemd omits Description when it equals the unit id, and
+        // systemctl fills the id back in. Falling back to "" instead
+        // made the two backends distinguishable, which is the one
+        // thing this module promises they are not.
+        "description": field("context", "Description").unwrap_or(id),
     }))
 }
 
@@ -252,7 +257,12 @@ mod tests {
             "context": { "ID": "x.service" },
             "runtime": { "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead" }
         });
-        assert_eq!(normalize_unit(&no_desc).unwrap()["description"], json!(""));
+        // Absent Description means "same as the id", which is what
+        // systemctl reports and therefore what this must report.
+        assert_eq!(
+            normalize_unit(&no_desc).unwrap()["description"],
+            json!("x.service")
+        );
         // Unfamiliar shape → refuse, so the caller falls back to the CLI.
         assert!(normalize_unit(&json!({ "context": { "ID": "x.service" } })).is_err());
     }

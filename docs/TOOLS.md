@@ -72,6 +72,13 @@ naming the input.
   be a byte array for non-UTF-8 payloads.
 - **`list_boots`**: no arguments.
 
+A name the manager does not know is not an error here, because the
+journal outlives units: a transient unit that has been collected, a
+unit removed since, and a unit from an earlier boot all have logs and
+no current existence. When there is nothing to show and no such unit is
+loaded, the reply carries a `note` saying so, which separates "this
+unit is quiet" from "you typed the name wrong".
+
 A query that matches nothing is not a failure. journalctl exits 1 when
 `--grep` or a time window selects no entries; `unit_logs` returns an
 empty entry list for that case and reserves `isError` for a journalctl
@@ -80,7 +87,10 @@ failure, which is distinguishable by its message on stderr.
 ## `boot:read`
 
 - **`boot_times`**: no arguments. Phases that did not occur (no EFI, no
-  initrd) are omitted rather than reported as zero.
+  initrd) are omitted rather than reported as zero. In a container
+  there is no firmware, loader or kernel phase at all, and the
+  timestamps for them belong to the host, so only `userspace_usec` and
+  `total_usec` are reported, with `container: 1` to say why.
 - **`critical_chain`**: optional `unit`, analyzing the chain to that
   unit instead of the default target. Timespans are returned verbatim
   (`1min 30.5s`); the server does not reinterpret systemd's formatting.
