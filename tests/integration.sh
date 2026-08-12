@@ -183,7 +183,7 @@ coproc SRV { $MCPD --grant units:write; }
 printf '%s\n' "$(call plan_change '{"action":"stop","unit":"mcpd-write-test.service"}')" >&"${SRV[1]}"
 read -t 30 -r planned2 <&"${SRV[0]}" || fail "no reply from server (plan)"
 plan_id=$(jq -r '.result.content[0].text | fromjson | .plan' <<<"$planned2")
-$HOST systemctl stop mcpd-write-test.service
+$HOST systemctl stop mcpd-write-test.service || fail "out-of-band stop failed"
 printf '%s\n' "$(call apply_plan "{\"plan\":$plan_id}")" >&"${SRV[1]}"
 read -t 30 -r stale <&"${SRV[0]}" || fail "no reply from server (apply)"
 jq -r '.result.content[0].text' <<<"$stale" | grep -qF "stale" ||
@@ -208,18 +208,24 @@ rpc units:write \
   "$(call apply_plan '{"plan":1}')" >/dev/null
 [ "$($HOST systemctl is-enabled mcpd-write-test.service)" = "disabled" ] ||
   fail "unit not disabled after rollback apply"
-# Stale enablement plan: plan mask, mask out-of-band, apply must refuse.
+# Stale enablement plan: plan mask (recording unit_file_state
+# "disabled"), enable the unit out-of-band, apply must refuse. The
+# out-of-band change is enable rather than mask because mask fails for
+# units whose fragment lives in /etc/systemd/system — masking wants to
+# place its /dev/null symlink at that exact path.
 coproc SRV2 { $MCPD --grant units:write; }
 printf '%s\n' "$(call plan_change '{"action":"mask","unit":"mcpd-write-test.service"}')" >&"${SRV2[1]}"
 read -t 30 -r m_planned <&"${SRV2[0]}" || fail "no reply from server (mask plan)"
 m_id=$(jq -r '.result.content[0].text | fromjson | .plan' <<<"$m_planned")
-$HOST systemctl mask mcpd-write-test.service >/dev/null 2>&1
+$HOST systemctl enable mcpd-write-test.service >/dev/null 2>&1 ||
+  fail "out-of-band enable failed"
 printf '%s\n' "$(call apply_plan "{\"plan\":$m_id}")" >&"${SRV2[1]}"
 read -t 30 -r m_stale <&"${SRV2[0]}" || fail "no reply from server (mask apply)"
 jq -r '.result.content[0].text' <<<"$m_stale" | grep -qF "stale" ||
   fail "stale enablement plan was not refused: $m_stale"
 kill "$SRV2_PID" 2>/dev/null || true
-$HOST systemctl unmask mcpd-write-test.service >/dev/null 2>&1
+$HOST systemctl disable mcpd-write-test.service >/dev/null 2>&1 ||
+  fail "cleanup disable failed"
 
 $HOST bash -c 'rm -f /etc/systemd/system/mcpd-write-test.service && systemctl daemon-reload'
 
