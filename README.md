@@ -1,8 +1,8 @@
 # systemd-mcpd
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server that
-exposes a read-only view of systemd to language-model agents. Written in
-Rust. Depends on serde and serde_json, nothing else.
+exposes systemd to language-model agents. Written in Rust. Depends on
+serde and serde_json, nothing else.
 
 Three rules, enforced in code:
 
@@ -13,8 +13,11 @@ Three rules, enforced in code:
    scopes are not advertised in `tools/list` and are refused in
    `tools/call`. Hiding a tool is presentation; refusing the call is the
    control.
-3. There is no write path. A safe write path needs plan/apply/rollback
-   semantics; until it has them, mutation is not offered at all.
+3. Writes go through plan/apply or not at all. No tool mutates directly:
+   a change is first planned — a read-only step returning current state,
+   predicted state, rollback action, and a plan id — then applied by id.
+   Apply re-checks the state the plan was made against and refuses stale
+   plans.
 
 ## Invocation
 
@@ -33,8 +36,11 @@ unknown scope is an error, not a warning.
 | `units:read`   | unit state, properties, timers, sockets, unit files, dependency edges, security analysis |
 | `journal:read` | journal entries, per unit                                |
 | `boot:read`    | boot phase timings, critical chain, blame                |
+| `units:write`  | unit state changes (start, stop, restart, reload), only through plan/apply |
 
-Scopes are independent. Grant the subset you mean.
+Scopes are independent. Grant the subset you mean; grant `units:write`
+only where the agent is supposed to operate the machine rather than
+inspect it.
 
 MCP client configuration (any MCP client; Claude Desktop shown):
 
@@ -65,6 +71,8 @@ MCP client configuration (any MCP client; Claude Desktop shown):
 | `boot_times`        | `boot:read`    | Boot duration per phase, in microseconds    |
 | `critical_chain`    | `boot:read`    | Units that gated reaching a target at boot  |
 | `boot_blame`        | `boot:read`    | Units by own startup time, slowest first    |
+| `plan_change`       | `units:write`  | Plan a unit state change; executes nothing  |
+| `apply_plan`        | `units:write`  | Execute a plan; refuses stale plans         |
 
 Arguments and behavior:
 
@@ -91,11 +99,39 @@ Arguments and behavior:
   initrd) are omitted rather than reported as zero.
 - `failed_units`, `list_timers`, `list_sockets`, `boot_blame`: no
   arguments.
+- `plan_change`: required `action` (`start`, `stop`, `restart`,
+  `reload`) and `unit`. Reads state and records a plan; executes
+  nothing.
+- `apply_plan`: required `plan`, an id from `plan_change`.
 
 On a host that has not finished booting, `boot_times` and
 `critical_chain` return a "not yet finished" error, mirroring
 systemd-analyze. `boot_blame` may answer anyway with the units that
 have started so far; that too mirrors systemd-analyze.
+
+## Write path
+
+The write path is deliberately narrow.
+
+- Only unit state changes: start, stop, restart, reload. Enablement
+  changes (enable, disable, mask) modify the filesystem and are not
+  implemented; see the roadmap.
+- Nothing executes at plan time. `plan_change` performs reads only.
+- `apply_plan` re-reads the unit's active state and compares it against
+  the state recorded at plan time. On mismatch the plan is discarded
+  with an error that says to re-plan. This is a precondition check, not
+  a lock: the window between the check and the systemctl invocation is
+  unguarded, exactly as it is for any other systemctl caller.
+- Plans are single-use, exist only in server memory for the lifetime of
+  the session, and are capped at 32 with oldest-first eviction.
+- Rollback is the inverse action, reported in both the plan and the
+  apply result: `stop` for `start`, `start` for `stop`, null for
+  `restart` and `reload`, which have no inverse.
+- Privileges are the invoking user's. An unprivileged user can plan
+  anything but apply only what polkit permits; the refusal is
+  systemctl's, passed through as a tool error.
+- The one mutating process invocation in the program sits at the end of
+  the apply path; nothing else reaches it.
 
 ## Errors
 
@@ -188,8 +224,8 @@ needed; the hardening applies when you wrap the server in a service.
 - more varlink as systemd serves it: unit listing and boot timestamps
   are native today; journal reads and the analyze verbs still fork the
   CLIs because systemd offers no socket-served equivalent
-- a write path with plan/apply semantics, structured diffs, and
-  rollback — not before those semantics exist
+- enablement changes (enable, disable, mask) behind the same plan/apply
+  gate, with the unit-file diff shown in the plan
 
 ## License
 

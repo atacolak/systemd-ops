@@ -12,6 +12,7 @@ use std::io::{BufRead, Write};
 use serde_json::{json, Value};
 
 use crate::systemd::{self, BackendError, Grants, Scope};
+use crate::write;
 
 /// Protocol revisions we know, newest first. Per spec: echo the client's
 /// requested version if we support it, otherwise answer with our newest and
@@ -244,6 +245,62 @@ const TOOLS: &[Tool] = &[
                       boot; a slow entry here may still have run in parallel.",
         input_schema: || json!({ "type": "object", "properties": {} }),
         run: |_| Ok(systemd::boot_blame()?),
+    },
+    Tool {
+        name: "plan_change",
+        scope: Scope::UnitsWrite,
+        description: "Plan a unit state change without executing anything. Returns the \
+                      unit's current state, the predicted state, the rollback action \
+                      (null when none exists), and a plan id for apply_plan. Plans are \
+                      single-use and last only for this session.",
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "stop", "restart", "reload"],
+                        "description": "The state change to plan."
+                    },
+                    "unit": { "type": "string", "description": "Unit name, e.g. ssh.service" }
+                },
+                "required": ["action", "unit"]
+            })
+        },
+        run: |args| {
+            let action = args
+                .get("action")
+                .and_then(Value::as_str)
+                .and_then(write::Action::parse)
+                .ok_or(CallError::Args(
+                    "missing or unknown action (start, stop, restart, reload)",
+                ))?;
+            Ok(write::plan(action, required_unit(args)?)?)
+        },
+    },
+    Tool {
+        name: "apply_plan",
+        scope: Scope::UnitsWrite,
+        description: "Execute a plan created by plan_change. Re-checks the state the \
+                      plan was made against and refuses stale plans — if the unit \
+                      changed in between, re-plan. Returns a before/after diff and the \
+                      rollback action.",
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "plan": { "type": "integer", "description": "Plan id from plan_change." }
+                },
+                "required": ["plan"]
+            })
+        },
+        run: |args| {
+            let id = args
+                .get("plan")
+                .and_then(Value::as_u64)
+                .ok_or(CallError::Args("missing required argument: plan"))?;
+            Ok(write::apply(id)?)
+        },
     },
 ];
 
@@ -478,6 +535,33 @@ mod tests {
             ["boot_times", "critical_chain", "boot_blame"]
         );
         let msg = replies[1]["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("units:read"), "got: {msg}");
+    }
+
+    #[test]
+    fn write_scope_gates_write_tools() {
+        let grants = Grants::from_args("units:write").unwrap();
+        let replies = exchange(
+            &grants,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"plan_change","arguments":{"action":"enable","unit":"x.service"}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"apply_plan","arguments":{}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"apply_plan","arguments":{"plan":123456789}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_units"}}
+"#,
+        );
+        // Only the write tools are advertised under units:write...
+        assert_eq!(tool_names(&replies[0]), ["plan_change", "apply_plan"]);
+        // ...unknown actions and missing plan ids are protocol errors...
+        assert_eq!(replies[1]["error"]["code"], json!(-32602));
+        assert_eq!(replies[2]["error"]["code"], json!(-32602));
+        // ...an unknown plan is a tool-level error telling the model to
+        // re-plan...
+        assert_eq!(replies[3]["result"]["isError"], json!(true));
+        let msg = replies[3]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(msg.contains("unknown plan"), "got: {msg}");
+        // ...and read tools are refused without their scope.
+        let msg = replies[4]["error"]["message"].as_str().unwrap();
         assert!(msg.contains("units:read"), "got: {msg}");
     }
 

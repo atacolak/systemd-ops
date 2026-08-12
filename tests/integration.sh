@@ -151,4 +151,44 @@ else
   fi
 fi
 
+echo "== write path (plan/apply)"
+wnames=$(rpc units:write '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' |
+  jq -r '.result.tools | map(.name) | join(",")')
+[ "$wnames" = "plan_change,apply_plan" ] ||
+  fail "tools/list under units:write advertised: $wnames"
+expect_error units:read plan_change '{"action":"start","unit":"x.service"}' "units:write"
+expect_error units:write apply_plan '{"plan":424242}' "unknown plan"
+
+# A disposable unit to operate on.
+$HOST bash -c 'printf "[Unit]\nDescription=systemd-mcpd write-path test unit\n[Service]\nExecStart=/bin/sleep 300\n" > /etc/systemd/system/mcpd-write-test.service && systemctl daemon-reload'
+
+# Plan and apply in one session (plans are per-session; the first id is 1).
+replies=$(rpc units:write \
+  "$(call plan_change '{"action":"start","unit":"mcpd-write-test.service"}')" \
+  "$(call apply_plan '{"plan":1}')")
+planned=$(sed -n 1p <<<"$replies" | jq -r '.result.content[0].text')
+applied=$(sed -n 2p <<<"$replies" | jq -r '.result.content[0].text')
+jq -e '.plan == 1 and .current.active == "inactive" and .rollback == "stop"' \
+  <<<"$planned" >/dev/null || fail "plan_change reply malformed: $planned"
+jq -e '.applied == true and .diff.active.before == "inactive" and .diff.active.after == "active"' \
+  <<<"$applied" >/dev/null || fail "apply_plan diff malformed: $applied"
+# The world must have actually changed, per an independent witness.
+[ "$($HOST systemctl is-active mcpd-write-test.service)" = "active" ] ||
+  fail "unit not active after apply"
+
+# Stale plans are refused: plan against a state, change that state
+# out-of-band, apply must refuse. Needs one long-lived session.
+coproc SRV { $MCPD --grant units:write; }
+printf '%s\n' "$(call plan_change '{"action":"stop","unit":"mcpd-write-test.service"}')" >&"${SRV[1]}"
+read -t 30 -r planned2 <&"${SRV[0]}" || fail "no reply from server (plan)"
+plan_id=$(jq -r '.result.content[0].text | fromjson | .plan' <<<"$planned2")
+$HOST systemctl stop mcpd-write-test.service
+printf '%s\n' "$(call apply_plan "{\"plan\":$plan_id}")" >&"${SRV[1]}"
+read -t 30 -r stale <&"${SRV[0]}" || fail "no reply from server (apply)"
+jq -r '.result.content[0].text' <<<"$stale" | grep -qF "stale" ||
+  fail "stale plan was not refused: $stale"
+kill "$SRV_PID" 2>/dev/null || true
+
+$HOST bash -c 'rm -f /etc/systemd/system/mcpd-write-test.service && systemctl daemon-reload'
+
 echo "PASS: all live integration tests"

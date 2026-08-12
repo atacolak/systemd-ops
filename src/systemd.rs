@@ -6,8 +6,10 @@
 //! dependency-free, version-tolerant, and every call auditable as a plain
 //! process invocation.
 //!
-//! Everything in this module is read-only by construction: no verb we invoke
-//! can mutate state, and the argument lists are built from vetted values only.
+//! Every invocation here is read-only, with one deliberate exception:
+//! `apply_verb`, the single mutating call in the program, reachable only
+//! through the plan/apply path in `crate::write`. Argument lists are built
+//! from vetted values only.
 
 use std::fmt;
 use std::process::Command;
@@ -18,20 +20,22 @@ use serde_json::{json, Value};
 /// was granted on the command line. This is the entire point of the program:
 /// authority handed to an agent should be explicit, minimal, and enforced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// The shared `Read` suffix is the point, not an accident: scopes are
-// `noun:verb`, and a future write path will add `*Write` variants beside
-// these. Renaming to appease the lint would erase the taxonomy.
-#[allow(clippy::enum_variant_names)]
 pub enum Scope {
     UnitsRead,
     JournalRead,
     BootRead,
+    UnitsWrite,
 }
 
 impl Scope {
     /// Every scope, in display order. `parse` and error text derive from
     /// this; a new scope is one variant, one `name` arm, one entry here.
-    const ALL: &'static [Scope] = &[Scope::UnitsRead, Scope::JournalRead, Scope::BootRead];
+    const ALL: &'static [Scope] = &[
+        Scope::UnitsRead,
+        Scope::JournalRead,
+        Scope::BootRead,
+        Scope::UnitsWrite,
+    ];
 
     /// The wire name. The one place a scope spells itself — the compiler
     /// forces a new variant to add its arm, and everything else derives.
@@ -40,6 +44,7 @@ impl Scope {
             Scope::UnitsRead => "units:read",
             Scope::JournalRead => "journal:read",
             Scope::BootRead => "boot:read",
+            Scope::UnitsWrite => "units:write",
         }
     }
 
@@ -99,7 +104,7 @@ impl fmt::Display for BackendError {
 /// not because `Command` is exploitable (it never passes through a shell),
 /// but because refusing malformed input early gives the model a precise error
 /// instead of a confusing one from systemctl.
-fn validate_unit_name(name: &str) -> Result<(), BackendError> {
+pub(crate) fn validate_unit_name(name: &str) -> Result<(), BackendError> {
     let ok = !name.is_empty()
         && name.len() <= 256
         && !name.starts_with('-')
@@ -158,6 +163,35 @@ fn run_key_values(
             Some((key.to_string(), Value::String(value.to_string())))
         })
         .collect())
+}
+
+/// The active and sub state of one unit, for the plan/apply path.
+pub(crate) fn unit_state(name: &str) -> Result<(String, String), BackendError> {
+    let props = run_key_values(
+        "systemctl",
+        &[
+            "show",
+            "--no-pager",
+            "--property=ActiveState,SubState",
+            "--",
+            name,
+        ],
+    )?;
+    let get = |key: &str| {
+        props
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    Ok((get("ActiveState"), get("SubState")))
+}
+
+/// Executes a unit state-change verb. The single mutating invocation in
+/// the program; the only caller is `crate::write::apply`, which reaches
+/// here exclusively through an applied plan.
+pub(crate) fn apply_verb(verb: &str, unit: &str) -> Result<(), BackendError> {
+    run("systemctl", &[verb, "--no-pager", "--", unit]).map(|_| ())
 }
 
 /// Unit states accepted by the `list_units` filter. Also the schema enum
@@ -613,7 +647,11 @@ mod tests {
         assert!(g.allows(Scope::UnitsRead));
         assert!(g.allows(Scope::JournalRead));
         assert!(g.allows(Scope::BootRead));
-        assert!(Grants::from_args("units:write").is_err());
+        // The write scope exists now — and granting it grants nothing else.
+        let w = Grants::from_args("units:write").unwrap();
+        assert!(w.allows(Scope::UnitsWrite));
+        assert!(!w.allows(Scope::UnitsRead));
+        assert!(Grants::from_args("units:delete").is_err());
         assert!(Grants::from_args("").unwrap().is_empty());
     }
 

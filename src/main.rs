@@ -11,6 +11,7 @@
 mod mcp;
 mod systemd;
 mod varlink;
+mod write;
 
 use std::io::{stdin, stdout, BufReader};
 use std::process::ExitCode;
@@ -29,10 +30,14 @@ Scopes:
                   dependencies, security analysis
   journal:read    read journal entries per unit
   boot:read       boot phase timings, critical chain, blame
+  units:write     plan and apply unit state changes
+                  (start/stop/restart/reload)
 
 The server speaks MCP over stdio. Tools outside the granted scopes are
-neither advertised nor callable. There are no write scopes; there is
-nothing to misconfigure into mutability.";
+neither advertised nor callable. Writes exist only behind units:write
+and only through plan/apply: a change is planned first (read-only,
+returns current state, predicted state, and rollback), then applied by
+plan id; stale plans are refused.";
 
 fn main() -> ExitCode {
     let mut grants: Option<Grants> = None;

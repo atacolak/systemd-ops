@@ -2,7 +2,7 @@
 name = "systemd-mcpd"
 version = "0.1.0"
 edition = "2021"
-description = "A Model Context Protocol server for systemd. Read-only, capability-scoped."
+description = "A Model Context Protocol server for systemd. Capability-scoped; reads by default, writes only through plan/apply."
 license = "MIT"
 repository = "https://github.com/rhaist/systemd-mcpd"
 readme = "README.md"
