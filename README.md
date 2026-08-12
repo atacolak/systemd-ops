@@ -3,7 +3,7 @@
 [![CI](https://github.com/rhaist/systemd-mcpd/actions/workflows/ci.yml/badge.svg)](https://github.com/rhaist/systemd-mcpd/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![tested on systemd 255 to 261](https://img.shields.io/badge/tested%20on%20systemd-255%20to%20261-informational)](#testing)
-[![MCP 2025-06-18](https://img.shields.io/badge/MCP-2025--06--18-blueviolet)](https://modelcontextprotocol.io)
+[![MCP 2026-07-28](https://img.shields.io/badge/MCP-2026--07--28-blueviolet)](#protocol-revisions)
 [![dependencies: serde, serde_json](https://img.shields.io/badge/dependencies-serde%2C%20serde__json-brightgreen)](Cargo.toml)
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server that
@@ -32,6 +32,7 @@ libsystemd linkage, no D-Bus library, no async runtime.
 **Contents:** [Quick start](#quick-start) &middot;
 [Scopes](#scopes) &middot; [Tools](#tools) &middot;
 [Write path](#write-path) &middot; [Errors](#errors) &middot;
+[Protocol revisions](#protocol-revisions) &middot;
 [Permissions](#permissions) &middot; [Backends](#backends) &middot;
 [Testing](#testing) &middot; [Deployment](#deployment) &middot;
 [Roadmap](#roadmap)
@@ -304,19 +305,81 @@ refused as stale and the agent has to look again.
 
 ## Errors
 
-Failures travel on two channels:
+Failures travel on two channels, split by whether the model can fix
+them:
 
-- Invalid arguments (missing `unit`, out-of-range `priority`, unknown
-  `state`) are JSON-RPC protocol errors, code -32602.
-- Backend failures (a systemctl exit status, an unreachable manager,
-  bootup not finished) are tool results with `isError: true` carrying
-  the backend's message. The session continues and the client receives
-  the message.
+- **Tool errors** (`isError: true`, carrying the message) are anything
+  a corrected call would resolve: invalid arguments (missing `unit`,
+  out-of-range `priority`, unknown `state`), and backend failures (a
+  systemctl exit status, an unreachable manager, bootup not finished).
+  The session continues and the client passes the message to the
+  model.
+- **Protocol errors** (JSON-RPC, code -32602) are for what no argument
+  fixes: an unknown tool, or one outside the granted scopes.
+
+Argument validation lands on the tool channel deliberately. Clients are
+not required to show protocol errors to the model, so reporting a
+misspelled action as one hides the correction from the only party that
+can make it. This is also what the specification asks for; see
+[SEP-1303](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1303).
 
 A query that matches nothing is not a failure. journalctl exits 1 when
 `--grep` or a time window selects no entries; `unit_logs` returns an
 empty entry list for that case and reserves `isError` for a journalctl
 failure, which is distinguishable by its message on stderr.
+
+## Protocol revisions
+
+MCP revision 2026-07-28 removed the `initialize` handshake. A request
+now carries its own protocol version and the client's capabilities in
+`_meta`, every result carries a `resultType`, and `server/discover`
+reports what a server speaks. Most deployed clients have not moved yet,
+so this server speaks both eras:
+
+| Era      | Revisions                                         | Opened by                     |
+|----------|---------------------------------------------------|-------------------------------|
+| Modern   | 2026-07-28                                        | `_meta` on every request      |
+| Legacy   | 2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05    | the `initialize` handshake    |
+
+The era is decided per request, by whether
+`_meta["io.modelcontextprotocol/protocolVersion"]` is present, never by
+what came earlier on the connection. The protocol is stateless and a
+client may interleave unrelated requests on one process.
+
+What a modern request gets that a legacy one does not:
+
+- `resultType: "complete"` on every result, and the server identity in
+  each result's `_meta`.
+- `structuredContent`: the reply as JSON, beside the text block that
+  every era receives. Older revisions have no such field, so it is
+  emitted only where it is defined.
+- `ttlMs` and `cacheScope` on `server/discover` and `tools/list`. The
+  tool set is fixed at startup by `--grant` and cannot change while the
+  process runs, which is why no `listChanged` capability is declared
+  and why the freshness hint is an hour.
+- A declared version this server does not speak is refused with
+  `UnsupportedProtocolVersion` (-32022) listing what it does, and a
+  request missing a required `_meta` field is refused with -32602.
+  Legacy versions are not accepted in `_meta`: they are reachable
+  through `initialize`, which is the only way to speak them.
+
+`server/discover` is answered even when the request declares no version
+at all, since a client probing to find out which era it is talking to
+learns nothing from a refusal.
+
+Not implemented, because this server exposes tools and nothing else:
+resources, prompts, completion, pagination, subscriptions, tasks, MCP
+Apps, and the client features (sampling, roots, elicitation). Roots,
+sampling and logging are deprecated as of 2026-07-28 in any case. There
+is no HTTP transport and therefore no authorization: stdio takes its
+credentials from the process that spawned it.
+
+One consequence of statelessness is worth stating plainly: plan ids
+follow the pattern the specification recommends for state, an explicit
+handle minted by the server and passed back as an ordinary argument,
+but they live in the process's memory. A client that restarts the
+server between `plan_change` and `apply_plan` gets "unknown plan" and
+has to plan again.
 
 ## Permissions
 

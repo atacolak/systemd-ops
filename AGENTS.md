@@ -36,6 +36,15 @@ that survives review.
   form so option parsing cannot misread them.
 - **One registry entry per tool**, in `src/mcp.rs`: name, scope,
   description, schema, handler. There is no second dispatch site.
+- **One dispatch for both protocol eras.** The modern (2026-07-28) and
+  legacy (`initialize`) paths differ only in the envelope around a
+  result. `call_tool` and `tools_list` are shared, so a tool cannot be
+  reachable in one era and gated in the other.
+- **Two error channels, split by who can fix it.** Bad arguments and
+  backend failures are tool errors (`isError`), because a corrected
+  call resolves them and clients are not required to show protocol
+  errors to the model. Protocol errors are for an unknown tool or an
+  ungranted scope.
 
 ## Building and testing
 
@@ -105,6 +114,11 @@ them needs an image built for it (mkosi).
 - **Proving the varlink path.** Never do it by moving
   `/usr/bin/systemctl`. Run the server with an empty `PATH` instead; an
   interrupted run must not leave a host without systemctl.
+- **Protocol revisions.** Read the specification page before coding to
+  a revision; the wire changed more than the version string in
+  2026-07-28. The pages that matter for a tools-only stdio server are
+  `basic/index#meta`, `basic/versioning`, `server/discover`,
+  `server/tools`, and `server/utilities/caching`.
 
 ## Prose
 

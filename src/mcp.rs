@@ -1,11 +1,20 @@
 //! The Model Context Protocol layer.
 //!
 //! MCP's stdio transport is line-delimited JSON-RPC 2.0. The server
-//! implements the four required methods (`initialize`, `tools/list`,
-//! `tools/call`, `ping`) and sends no reply to notifications. At this
-//! size an SDK and its async runtime would account for most of the
-//! binary, so the protocol is implemented directly as a blocking read
-//! loop.
+//! sends no reply to notifications. At this size an SDK and its async
+//! runtime would account for most of the binary, so the protocol is
+//! implemented directly as a blocking read loop.
+//!
+//! The server is dual-era. Revision 2026-07-28 removed the `initialize`
+//! handshake: a modern request carries its protocol version and the
+//! client's capabilities in `_meta`, every result carries a
+//! `resultType`, and `server/discover` reports what the server speaks.
+//! Legacy clients (2025-11-25 and earlier) still open with
+//! `initialize`, and most deployed clients are legacy today, so both
+//! are served. Which era a request belongs to is decided by the request
+//! itself, never by what came before it on the connection: the protocol
+//! is stateless, and a client may interleave unrelated requests on one
+//! process.
 
 use std::io::{BufRead, Write};
 
@@ -14,29 +23,60 @@ use serde_json::{json, Value};
 use crate::systemd::{self, BackendError, Grants, Scope};
 use crate::write;
 
-/// Protocol revisions we know, newest first. Per spec: echo the client's
-/// requested version if we support it, otherwise answer with our newest and
-/// let the client decide whether to proceed.
-const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+/// Modern revisions: version, capabilities and identity ride on every
+/// request. These are the versions accepted in `_meta` and the ones
+/// `server/discover` advertises.
+const MODERN_VERSIONS: &[&str] = &["2026-07-28"];
 
-/// A tool call fails one of two ways, and they travel differently on the
-/// wire: bad arguments are a protocol error (JSON-RPC -32602), backend
-/// failures are tool-level errors (`isError: true`) the model reacts to.
-enum CallError {
-    Args(&'static str),
-    Backend(BackendError),
-}
+/// Legacy revisions, reached through the `initialize` handshake,
+/// newest first. Per spec: echo the client's requested version if we
+/// support it, otherwise answer with our newest and let the client
+/// decide whether to proceed.
+const LEGACY_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// The `_meta` keys the modern era reserves. `protocolVersion` and
+/// `clientCapabilities` are required on every request; `serverInfo`
+/// is what a server puts in each result.
+const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+
+/// `UnsupportedProtocolVersion`, from the range (-32020..-32099) the
+/// specification reserves for itself. Emitting an undefined code from
+/// that range is forbidden, so this is the only one we use.
+const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+/// Guidance for the model, identical in both eras.
+const INSTRUCTIONS: &str = "Capability-scoped view of systemd on this host. Tools appear \
+                            only if their scope was granted at startup. Reads are direct; \
+                            state changes (if units:write was granted) go through \
+                            plan_change/apply_plan and are refused when the planned state \
+                            has drifted.";
+
+/// A tool call that failed. Both bad arguments and backend failures
+/// travel as tool-level errors (`isError: true`): each is feedback a
+/// model can act on by correcting the call, which is what the
+/// specification reserves that channel for. Protocol errors are for
+/// what the model cannot fix, and are decided before a handler runs:
+/// an unknown tool, or one outside the granted scopes.
+struct CallError(String);
 
 impl From<BackendError> for CallError {
     fn from(e: BackendError) -> Self {
-        CallError::Backend(e)
+        CallError(e.to_string())
+    }
+}
+
+impl From<&str> for CallError {
+    fn from(msg: &str) -> Self {
+        CallError(msg.to_string())
     }
 }
 
 fn required_unit(args: &Value) -> Result<&str, CallError> {
     args.get("unit")
         .and_then(Value::as_str)
-        .ok_or(CallError::Args("missing required argument: unit"))
+        .ok_or_else(|| CallError::from("missing required argument: unit"))
 }
 
 /// The name-glob argument the list tools share, spelled once so the four
@@ -408,29 +448,31 @@ const TOOLS: &[Tool] = &[
                 .get("action")
                 .and_then(Value::as_str)
                 .and_then(write::Action::parse)
-                .ok_or(CallError::Args(
-                    "missing or unknown action (start, stop, restart, reload, enable, \
-                     disable, mask, unmask, log-level, log-target)",
-                ))?;
+                .ok_or_else(|| {
+                    CallError::from(
+                        "missing or unknown action (start, stop, restart, reload, enable, \
+                         disable, mask, unmask, log-level, log-target)",
+                    )
+                })?;
             let value = args.get("value").and_then(Value::as_str);
             match (action, value) {
                 (write::Action::LogLevel, Some(v)) if !write::LOG_LEVELS.contains(&v) => {
-                    return Err(CallError::Args(
+                    return Err(CallError::from(
                         "unknown log level (emerg, alert, crit, err, warning, notice, \
                          info, debug)",
                     ))
                 }
                 (write::Action::LogTarget, Some(v)) if !write::LOG_TARGETS.contains(&v) => {
-                    return Err(CallError::Args(
+                    return Err(CallError::from(
                         "unknown log target (console, kmsg, journal, journal-or-kmsg, \
                          auto, null)",
                     ))
                 }
                 (a, None) if a.takes_value() => {
-                    return Err(CallError::Args("this action requires a value"))
+                    return Err(CallError::from("this action requires a value"))
                 }
                 (a, Some(_)) if !a.takes_value() => {
-                    return Err(CallError::Args(
+                    return Err(CallError::from(
                         "value is only accepted for log-level and log-target",
                     ))
                 }
@@ -460,7 +502,7 @@ const TOOLS: &[Tool] = &[
             let id = args
                 .get("plan")
                 .and_then(Value::as_u64)
-                .ok_or(CallError::Args("missing required argument: plan"))?;
+                .ok_or_else(|| CallError::from("missing required argument: plan"))?;
             Ok(write::apply(id)?)
         },
     },
@@ -496,12 +538,27 @@ pub fn serve(input: impl BufRead, mut output: impl Write, grants: &Grants) -> st
             .unwrap_or_default();
         let params = request.get("params").cloned().unwrap_or(Value::Null);
 
-        let reply = match method {
-            "initialize" => result_reply(id, initialize_result(&params)),
-            "ping" => result_reply(id, json!({})),
-            "tools/list" => result_reply(id, tools_list(grants)),
-            "tools/call" => tools_call(id, &params, grants),
-            other => error_reply(id, -32601, &format!("method not found: {other}")),
+        // The era is a property of the request, not of the connection.
+        // A declared protocol version means the modern era; its absence
+        // means a client that opened, or will open, with `initialize`.
+        let declared = params
+            .get("_meta")
+            .and_then(|meta| meta.get(META_VERSION))
+            .and_then(Value::as_str);
+
+        let reply = match declared {
+            Some(version) if !MODERN_VERSIONS.contains(&version) => {
+                unsupported_version_reply(id, version)
+            }
+            Some(_) => modern_reply(id, method, &params, grants),
+            // A discovery probe from a client that has not chosen a
+            // version yet is answered rather than refused: reporting
+            // what this server speaks is the whole purpose of the
+            // method, and refusing it would tell the client nothing.
+            None if method == "server/discover" => {
+                result_reply(id, complete(cacheable(discover_result())))
+            }
+            None => legacy_reply(id, method, &params, grants),
         };
         writeln!(output, "{reply}")?;
         output.flush()?;
@@ -509,24 +566,113 @@ pub fn serve(input: impl BufRead, mut output: impl Write, grants: &Grants) -> st
     Ok(())
 }
 
+fn server_info() -> Value {
+    json!({ "name": "systemd-mcpd", "version": env!("CARGO_PKG_VERSION") })
+}
+
+/// Marks a modern result complete and attaches the server identity the
+/// specification asks every result to carry. `input_required`, the
+/// other result type, belongs to the multi-round-trip pattern: this
+/// server never asks the client for anything mid-call.
+fn complete(mut result: Value) -> Value {
+    result["resultType"] = json!("complete");
+    result["_meta"] = json!({ META_SERVER_INFO: server_info() });
+    result
+}
+
+/// Caching hints, mandatory on complete results from `server/discover`
+/// and `tools/list`.
+///
+/// The advertised set is fixed at startup by `--grant` and cannot
+/// change while the process runs, which is why no `listChanged`
+/// capability is declared and why an hour is a truthful freshness
+/// hint. `public` because the reply holds nothing caller-specific: on
+/// stdio every request reaches the same process under the same grants.
+fn cacheable(mut result: Value) -> Value {
+    result["ttlMs"] = json!(3_600_000);
+    result["cacheScope"] = json!("public");
+    result
+}
+
+fn discover_result() -> Value {
+    json!({
+        "supportedVersions": MODERN_VERSIONS,
+        "capabilities": { "tools": {} },
+        "instructions": INSTRUCTIONS,
+    })
+}
+
+fn unsupported_version_reply(id: Value, requested: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": UNSUPPORTED_PROTOCOL_VERSION,
+            "message": "Unsupported protocol version",
+            "data": { "supported": MODERN_VERSIONS, "requested": requested },
+        }
+    })
+    .to_string()
+}
+
+/// A request in the modern era: 2026-07-28 and later.
+fn modern_reply(id: Value, method: &str, params: &Value, grants: &Grants) -> String {
+    // Client capabilities are required on every request, and a request
+    // missing a required `_meta` field is invalid params. Only requests
+    // that already declared a modern version reach here, so this
+    // cannot reject a legacy client.
+    if params
+        .get("_meta")
+        .and_then(|meta| meta.get(META_CLIENT_CAPABILITIES))
+        .is_none()
+    {
+        return error_reply(
+            id,
+            -32602,
+            &format!("missing required _meta field: {META_CLIENT_CAPABILITIES}"),
+        );
+    }
+
+    match method {
+        "server/discover" => result_reply(id, complete(cacheable(discover_result()))),
+        "ping" => result_reply(id, complete(json!({}))),
+        "tools/list" => result_reply(id, complete(cacheable(tools_list(grants)))),
+        // One dispatch for both eras, so a tool cannot be reachable in
+        // one and gated in the other.
+        "tools/call" => match call_tool(params, grants, true) {
+            Ok(result) => result_reply(id, complete(result)),
+            Err((code, message)) => error_reply(id, code, &message),
+        },
+        other => error_reply(id, -32601, &format!("method not found: {other}")),
+    }
+}
+
+/// A request in the legacy era: the `initialize` handshake, 2025-11-25
+/// and earlier.
+fn legacy_reply(id: Value, method: &str, params: &Value, grants: &Grants) -> String {
+    match method {
+        "initialize" => result_reply(id, initialize_result(params)),
+        "ping" => result_reply(id, json!({})),
+        "tools/list" => result_reply(id, tools_list(grants)),
+        "tools/call" => match call_tool(params, grants, false) {
+            Ok(result) => result_reply(id, result),
+            Err((code, message)) => error_reply(id, code, &message),
+        },
+        other => error_reply(id, -32601, &format!("method not found: {other}")),
+    }
+}
+
 fn initialize_result(params: &Value) -> Value {
     let version = params
         .get("protocolVersion")
         .and_then(Value::as_str)
-        .filter(|v| PROTOCOL_VERSIONS.contains(v))
-        .unwrap_or(PROTOCOL_VERSIONS[0]);
+        .filter(|v| LEGACY_VERSIONS.contains(v))
+        .unwrap_or(LEGACY_VERSIONS[0]);
     json!({
         "protocolVersion": version,
         "capabilities": { "tools": {} },
-        "serverInfo": {
-            "name": "systemd-mcpd",
-            "version": env!("CARGO_PKG_VERSION"),
-        },
-        "instructions": "Capability-scoped view of systemd on this host. Tools appear \
-                         only if their scope was granted at startup. Reads are direct; \
-                         state changes (if units:write was granted) go through \
-                         plan_change/apply_plan and are refused when the planned state \
-                         has drifted."
+        "serverInfo": server_info(),
+        "instructions": INSTRUCTIONS,
     })
 }
 
@@ -547,7 +693,15 @@ fn tools_list(grants: &Grants) -> Value {
     json!({ "tools": tools })
 }
 
-fn tools_call(id: Value, params: &Value, grants: &Grants) -> String {
+/// Runs one tool call, shared by both eras. Returns the result object,
+/// or the code and message of a protocol error.
+///
+/// `structured` adds the reply as JSON in `structuredContent` beside
+/// the text block, which the modern era defines and the legacy clients
+/// this server has to keep working predate. The text block is sent
+/// either way: a tool returning structured content should also
+/// serialize it there.
+fn call_tool(params: &Value, grants: &Grants, structured: bool) -> Result<Value, (i64, String)> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -555,36 +709,40 @@ fn tools_call(id: Value, params: &Value, grants: &Grants) -> String {
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
     let Some(tool) = TOOLS.iter().find(|t| t.name == name) else {
-        return error_reply(id, -32602, &format!("unknown tool: {name}"));
+        return Err((-32602, format!("unknown tool: {name}")));
     };
 
     // Enforced here as well as in `tools/list`: an unadvertised tool
     // must also fail when called directly.
     if !grants.allows(tool.scope) {
-        return error_reply(
-            id,
+        return Err((
             -32602,
-            &format!(
+            format!(
                 "tool '{}' requires scope '{}' which was not granted",
                 name, tool.scope
             ),
-        );
+        ));
     }
 
-    // Backend failures are tool-level errors (isError: true), not protocol
-    // errors: the session continues and the client receives the message.
-    let (text, is_error) = match (tool.run)(&args) {
-        Ok(value) => (value.to_string(), false),
-        Err(CallError::Args(msg)) => return error_reply(id, -32602, msg),
-        Err(CallError::Backend(e)) => (e.to_string(), true),
-    };
-    result_reply(
-        id,
-        json!({
-            "content": [{ "type": "text", "text": text }],
-            "isError": is_error,
+    // Bad arguments and backend failures are both tool-level errors
+    // (isError: true), which is the channel a model can recover from:
+    // the session continues and the client passes the message on.
+    Ok(match (tool.run)(&args) {
+        Ok(value) => {
+            let mut result = json!({
+                "content": [{ "type": "text", "text": value.to_string() }],
+                "isError": false,
+            });
+            if structured {
+                result["structuredContent"] = value;
+            }
+            result
+        }
+        Err(CallError(message)) => json!({
+            "content": [{ "type": "text", "text": message }],
+            "isError": true,
         }),
-    )
+    })
 }
 
 fn result_reply(id: Value, result: Value) -> String {
@@ -625,6 +783,140 @@ mod tests {
             .collect()
     }
 
+    /// A modern request line: `_meta` carrying the required fields.
+    fn modern(id: u32, method: &str, params: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{{params}"_meta":{{"{META_VERSION}":"2026-07-28","{META_CLIENT_CAPABILITIES}":{{}}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn discovery_reports_what_the_server_speaks() {
+        let grants = Grants::from_args("units:read").unwrap();
+        let replies = exchange(&grants, &modern(1, "server/discover", ""));
+        let result = &replies[0]["result"];
+        assert_eq!(result["resultType"], json!("complete"));
+        assert_eq!(result["supportedVersions"], json!(MODERN_VERSIONS));
+        assert_eq!(result["capabilities"]["tools"], json!({}));
+        assert_eq!(
+            result["_meta"][META_SERVER_INFO]["name"],
+            json!("systemd-mcpd")
+        );
+        // server/discover is cacheable, so both hints must be present.
+        assert!(result["ttlMs"].as_i64().is_some_and(|t| t >= 0));
+        assert_eq!(result["cacheScope"], json!("public"));
+    }
+
+    #[test]
+    fn discovery_answers_a_probe_that_declares_no_version() {
+        // A dual-era client probes with server/discover before it knows
+        // which era this server is. Refusing would defeat the probe.
+        let grants = Grants::from_args("units:read").unwrap();
+        let replies = exchange(
+            &grants,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\"}\n",
+        );
+        assert_eq!(
+            replies[0]["result"]["supportedVersions"],
+            json!(MODERN_VERSIONS)
+        );
+    }
+
+    #[test]
+    fn unsupported_modern_version_is_refused_with_the_list() {
+        let grants = Grants::from_args("units:read").unwrap();
+        let replies = exchange(
+            &grants,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{"_meta":{{"{META_VERSION}":"1900-01-01","{META_CLIENT_CAPABILITIES}":{{}}}}}}}}"#
+            ),
+        );
+        let error = &replies[0]["error"];
+        assert_eq!(error["code"], json!(UNSUPPORTED_PROTOCOL_VERSION));
+        assert_eq!(error["data"]["requested"], json!("1900-01-01"));
+        assert_eq!(error["data"]["supported"], json!(MODERN_VERSIONS));
+        // A legacy version is not usable in the modern era either: it
+        // is reachable through initialize, not through _meta.
+        let replies = exchange(
+            &grants,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{"_meta":{{"{META_VERSION}":"2025-06-18","{META_CLIENT_CAPABILITIES}":{{}}}}}}}}"#
+            ),
+        );
+        assert_eq!(
+            replies[0]["error"]["code"],
+            json!(UNSUPPORTED_PROTOCOL_VERSION)
+        );
+    }
+
+    #[test]
+    fn modern_requests_must_carry_client_capabilities() {
+        let grants = Grants::from_args("units:read").unwrap();
+        let replies = exchange(
+            &grants,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{"_meta":{{"{META_VERSION}":"2026-07-28"}}}}}}"#
+            ),
+        );
+        assert_eq!(replies[0]["error"]["code"], json!(-32602));
+        let msg = replies[0]["error"]["message"].as_str().unwrap();
+        assert!(msg.contains(META_CLIENT_CAPABILITIES), "got: {msg}");
+    }
+
+    #[test]
+    fn modern_results_carry_the_era_fields() {
+        let grants = Grants::from_args("units:read").unwrap();
+        let replies = exchange(
+            &grants,
+            &format!("{}\n{}", modern(1, "tools/list", ""), modern(2, "ping", "")),
+        );
+        let list = &replies[0]["result"];
+        assert_eq!(list["resultType"], json!("complete"));
+        assert_eq!(list["cacheScope"], json!("public"));
+        assert!(!list["tools"].as_array().unwrap().is_empty());
+        // Every result carries the discriminator, including empty ones.
+        assert_eq!(replies[1]["result"]["resultType"], json!("complete"));
+    }
+
+    #[test]
+    fn scopes_gate_the_modern_era_too() {
+        // The second dispatch path must not become a way around the
+        // scope check.
+        let grants = Grants::from_args("units:read").unwrap();
+        let replies = exchange(
+            &grants,
+            &modern(
+                1,
+                "tools/call",
+                r#""name":"unit_logs","arguments":{"unit":"ssh.service"},"#,
+            ),
+        );
+        assert_eq!(replies[0]["error"]["code"], json!(-32602));
+        let msg = replies[0]["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("journal:read"), "got: {msg}");
+    }
+
+    #[test]
+    fn bad_arguments_are_tool_errors_the_model_can_correct() {
+        // An unknown action is input validation, not a malformed
+        // request: it reaches the model as isError so it can retry,
+        // rather than as a protocol error the client may swallow.
+        let grants = Grants::from_args("units:write").unwrap();
+        let replies = exchange(
+            &grants,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"plan_change","arguments":{"action":"isolate","unit":"x.service"}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"apply_plan","arguments":{}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"no_such_tool"}}
+"#,
+        );
+        assert_eq!(replies[0]["result"]["isError"], json!(true));
+        let msg = replies[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(msg.contains("unknown action"), "got: {msg}");
+        assert_eq!(replies[1]["result"]["isError"], json!(true));
+        // An unknown tool stays a protocol error: no argument fixes it.
+        assert_eq!(replies[2]["error"]["code"], json!(-32602));
+    }
+
     #[test]
     fn handshake() {
         let grants = Grants::from_args("units:read").unwrap();
@@ -655,8 +947,30 @@ mod tests {
         );
         assert_eq!(
             replies[0]["result"]["protocolVersion"],
-            json!(PROTOCOL_VERSIONS[0])
+            json!(LEGACY_VERSIONS[0])
         );
+    }
+
+    #[test]
+    fn legacy_replies_keep_their_shape() {
+        // Modern clients get resultType, caching hints and structured
+        // content; legacy clients must see none of it, whatever era
+        // fields were added around them.
+        let grants = Grants::from_args("units:write").unwrap();
+        let replies = exchange(
+            &grants,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"apply_plan","arguments":{"plan":123456789}}}
+"#,
+        );
+        let list = &replies[0]["result"];
+        assert!(list.get("resultType").is_none());
+        assert!(list.get("ttlMs").is_none() && list.get("cacheScope").is_none());
+        assert!(list.get("_meta").is_none());
+        let call = &replies[1]["result"];
+        assert!(call.get("resultType").is_none());
+        assert!(call.get("structuredContent").is_none());
+        assert_eq!(call["isError"], json!(true));
     }
 
     #[test]
@@ -719,9 +1033,10 @@ mod tests {
         );
         // Only the write tools are advertised under units:write...
         assert_eq!(tool_names(&replies[0]), ["plan_change", "apply_plan"]);
-        // ...unknown actions and missing plan ids are protocol errors...
-        assert_eq!(replies[1]["error"]["code"], json!(-32602));
-        assert_eq!(replies[2]["error"]["code"], json!(-32602));
+        // ...unknown actions and missing plan ids are tool errors, so
+        // the model sees them and can correct the call...
+        assert_eq!(replies[1]["result"]["isError"], json!(true));
+        assert_eq!(replies[2]["result"]["isError"], json!(true));
         // ...an unknown plan is a tool-level error directing the client
         // to re-plan...
         assert_eq!(replies[3]["result"]["isError"], json!(true));

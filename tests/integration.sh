@@ -55,6 +55,45 @@ expect_error units:read unit_logs '{"unit":"ssh.service"}' "journal:read"
 expect_error units:read boot_times '{}' "boot:read"
 expect_error units:read unit_properties '{"unit":"x;bad"}' "not a valid unit name"
 
+echo "== protocol eras (2026-07-28 and initialize-based)"
+# A modern request declares its version and the client's capabilities in
+# _meta; there is no handshake. The reply must carry the era's fields.
+META='"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}'
+discover=$(rpc units:read "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{$META}}")
+jq -e '.result.resultType == "complete"
+       and (.result.supportedVersions | index("2026-07-28"))
+       and (.result.ttlMs >= 0) and (.result.cacheScope == "public")
+       and (.result._meta["io.modelcontextprotocol/serverInfo"].name == "systemd-mcpd")' \
+  <<<"$discover" >/dev/null || fail "server/discover malformed: $discover"
+# A probe that has not picked a version yet is still answered.
+rpc units:read '{"jsonrpc":"2.0","id":1,"method":"server/discover"}' |
+  jq -e '.result.supportedVersions | index("2026-07-28")' >/dev/null ||
+  fail "server/discover refused a probe that declared no version"
+# Tool results carry the discriminator and the reply as real JSON,
+# identical to the text block clients have always received.
+modern=$(rpc units:read \
+  "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"list_units\",\"arguments\":{\"pattern\":\"systemd-journald.service\"},$META}}")
+jq -e '.result.resultType == "complete" and .result.isError == false
+       and (.result.structuredContent | length == 1)
+       and (.result.structuredContent == (.result.content[0].text | fromjson))' \
+  <<<"$modern" >/dev/null || fail "modern tools/call malformed: $modern"
+# An unknown version is refused with the list of what is supported...
+rpc units:read '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01","io.modelcontextprotocol/clientCapabilities":{}}}}' |
+  jq -e '.error.code == -32022 and (.error.data.supported | index("2026-07-28"))' >/dev/null ||
+  fail "unsupported version was not refused with -32022 and a supported list"
+# ...a missing required _meta field is invalid params...
+rpc units:read '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}' |
+  jq -e '.error.code == -32602' >/dev/null ||
+  fail "missing clientCapabilities was not rejected"
+# ...and the handshake era still works, unchanged.
+rpc units:read '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}' |
+  jq -e '.result.protocolVersion == "2025-11-25" and .result.serverInfo.name == "systemd-mcpd"
+         and (.result | has("resultType") | not)' >/dev/null ||
+  fail "legacy initialize reply wrong"
+rpc units:read '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' |
+  jq -e '(.result | has("resultType") | not) and (.result | has("ttlMs") | not)' >/dev/null ||
+  fail "legacy tools/list leaked modern era fields"
+
 echo "== list_units / failed_units"
 units=$(tool units:read list_units '{}')
 jq -e 'type == "array" and length > 0' <<<"$units" >/dev/null ||
