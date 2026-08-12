@@ -16,7 +16,7 @@ categories = ["command-line-utilities", "os::linux-apis"]
 # The published crate is the buildable source and its documentation.
 # The test tiers pull QEMU images and boot guests, which nobody
 # unpacking a crate wants; they live in the repository.
-exclude = ["/tests", "/.github", "/.claude"]
+exclude = ["/tests", "/.github"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -79,12 +79,6 @@ MCPD=$PWD/target/release/systemd-mcpd HOST= sudo bash tests/integration.sh
 MCPD=$PWD/target/release/systemd-mcpd HOST= sudo bash tests/varlink-proof.sh
 ```
 
-A sudoers rule that grants these two scripts without a password matches
-the command by absolute path and carries the variables through
-`env_keep`, so under one the invocation is
-`sudo /usr/bin/bash /path/to/tests/integration.sh` with no `-E`: a
-relative path does not match the rule, and `-E` is refused outright.
-
 Root is required: the suites create transient units, write a unit file
 under `/etc/systemd/system`, and read the system journal.
 `varlink-proof.sh` also needs systemd >= 258 for the socket.
@@ -148,18 +142,20 @@ them needs an image built for it (mkosi).
 
 ## Prose
 
-Documentation, comments, and commit messages state facts. The general
-standard is the one collected at
-[conorbronsdon/avoid-ai-writing](https://github.com/conorbronsdon/avoid-ai-writing),
-which is worth reading once rather than restating here. On top of it,
-this repository holds to:
+Documentation, comments, and commit messages state facts. In practice
+that means:
 
 - no em dashes, including in tool descriptions sent to clients
 - limits documented with the same weight as features: what is
   unguarded, what is version-dependent, what was not implemented
-- numbers and names in place of adjectives
+- numbers and names in place of adjectives: "590 units, 90 KB", not
+  "a large reply"
 - code described by behavior, not character: an error is returned,
   not "said"
+- no marketing register, no significance inflation, no closing
+  flourish. If a sentence survives deleting its adjectives, delete
+  them
+- claims carry their evidence: what was measured, on what, and when
 
 Commit messages state what changed, why, and what was observed. Do not
 add `Co-Authored-By` or other attribution trailers.
