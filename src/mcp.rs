@@ -95,6 +95,20 @@ fn pattern_arg(args: &Value) -> Option<&str> {
     args.get("pattern").and_then(Value::as_str)
 }
 
+/// The `unit` argument, shared by the tools that take one. The example
+/// varies: not every unit implements every interface.
+fn unit_schema(example: &str) -> Value {
+    json!({ "type": "string", "description": format!("Unit name, e.g. {example}") })
+}
+
+/// A tool that takes no arguments. Not `additionalProperties: false`,
+/// the stricter form the specification also allows: clients do send
+/// junk arguments to no-argument tools, and this server ignores what it
+/// does not read.
+fn no_arguments() -> Value {
+    json!({ "type": "object", "properties": {} })
+}
+
 /// One tool: its wire description, the scope that gates it, and its handler.
 struct Tool {
     name: &'static str,
@@ -139,7 +153,7 @@ const TOOLS: &[Tool] = &[
         name: "failed_units",
         scope: Scope::UnitsRead,
         description: "List units that are currently in the failed state.",
-        input_schema: || json!({ "type": "object", "properties": {} }),
+        input_schema: no_arguments,
         run: |_| Ok(systemd::failed_units()?),
     },
     Tool {
@@ -154,7 +168,7 @@ const TOOLS: &[Tool] = &[
             json!({
                 "type": "object",
                 "properties": {
-                    "unit": { "type": "string", "description": "Unit name, e.g. ssh.service" },
+                    "unit": unit_schema("ssh.service"),
                     "properties": {
                         "type": "array",
                         "items": { "type": "string" },
@@ -241,7 +255,7 @@ const TOOLS: &[Tool] = &[
             json!({
                 "type": "object",
                 "properties": {
-                    "unit": { "type": "string", "description": "Unit name, e.g. ssh.service" }
+                    "unit": unit_schema("ssh.service")
                 },
                 "required": ["unit"]
             })
@@ -258,7 +272,7 @@ const TOOLS: &[Tool] = &[
             json!({
                 "type": "object",
                 "properties": {
-                    "unit": { "type": "string", "description": "Unit name, e.g. ssh.service" }
+                    "unit": unit_schema("ssh.service")
                 },
                 "required": ["unit"]
             })
@@ -277,7 +291,7 @@ const TOOLS: &[Tool] = &[
             json!({
                 "type": "object",
                 "properties": {
-                    "unit": { "type": "string", "description": "Unit name, e.g. systemd-logind.service" }
+                    "unit": unit_schema("systemd-logind.service")
                 },
                 "required": ["unit"]
             })
@@ -293,7 +307,7 @@ const TOOLS: &[Tool] = &[
             json!({
                 "type": "object",
                 "properties": {
-                    "unit": { "type": "string", "description": "Unit name, e.g. ssh.service" },
+                    "unit": unit_schema("ssh.service"),
                     "lines": {
                         "type": "integer",
                         "minimum": 1,
@@ -348,7 +362,7 @@ const TOOLS: &[Tool] = &[
         description: "List the boots recorded in the journal, with boot ids and first/last \
                       entry timestamps. Boot offsets from this list select a boot in \
                       unit_logs.",
-        input_schema: || json!({ "type": "object", "properties": {} }),
+        input_schema: no_arguments,
         run: |_| Ok(systemd::list_boots()?),
     },
     Tool {
@@ -357,7 +371,7 @@ const TOOLS: &[Tool] = &[
         description: "How long the last boot took, split into firmware, loader, kernel, initrd \
                       and userspace phases. Microsecond values, read from the same manager \
                       timestamps systemd-analyze uses. Phases that did not occur are omitted.",
-        input_schema: || json!({ "type": "object", "properties": {} }),
+        input_schema: no_arguments,
         run: |_| Ok(systemd::boot_times()?),
     },
     Tool {
@@ -432,7 +446,7 @@ const TOOLS: &[Tool] = &[
                                  "log-level", "log-target"],
                         "description": "The change to plan."
                     },
-                    "unit": { "type": "string", "description": "Unit name, e.g. ssh.service" },
+                    "unit": unit_schema("ssh.service"),
                     "value": {
                         "type": "string",
                         "description": "For log-level: emerg..debug. For log-target: \
