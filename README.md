@@ -36,7 +36,7 @@ unknown scope is an error, not a warning.
 | `units:read`   | unit state, properties, timers, sockets, unit files, dependency edges, security analysis |
 | `journal:read` | journal entries, per unit                                |
 | `boot:read`    | boot phase timings, critical chain, blame                |
-| `units:write`  | unit lifecycle and enablement changes, only through plan/apply |
+| `units:write`  | unit lifecycle, enablement, and log-control changes, only through plan/apply |
 
 Scopes are independent. Grant `units:write` only where the agent is
 expected to operate the machine rather than inspect it.
@@ -66,7 +66,9 @@ MCP client configuration (any MCP client; Claude Desktop shown):
 | `list_unit_files`   | `units:read`   | Installed unit files and enablement state   |
 | `unit_dependencies` | `units:read`   | One unit's dependency edges, by relation    |
 | `unit_security`     | `units:read`   | systemd-analyze exposure analysis of one unit |
-| `unit_logs`         | `journal:read` | Recent journal entries for one unit         |
+| `unit_log_control`  | `units:read`   | One service's runtime log level and target  |
+| `unit_logs`         | `journal:read` | Journal entries for one unit, filtered      |
+| `list_boots`        | `journal:read` | Boots recorded in the journal               |
 | `boot_times`        | `boot:read`    | Boot duration per phase, in microseconds    |
 | `critical_chain`    | `boot:read`    | Units that gated reaching a target at boot  |
 | `boot_blame`        | `boot:read`    | Units by own startup time, slowest first    |
@@ -78,19 +80,25 @@ Arguments and behavior:
 - `list_units`: optional `state`, one of `active`, `inactive`, `failed`,
   `activating`, `deactivating`. Matches the unit's active state. The
   filter is applied by the server, identically over both backends.
-- `unit_properties`, `unit_dependencies`, `unit_security`: required
-  `unit`. Unit names are validated against the unit-name character set
+- `unit_properties`, `unit_dependencies`, `unit_security`,
+  `unit_log_control`: required `unit`. `unit_log_control` reads through
+  systemd's LogControl1 interface and fails for services that do not
+  implement it. Unit names are validated against the unit-name character set
   before they reach an argument list; malformed names are refused with
   an error naming the input.
 - `list_unit_files`: optional `state`, an enablement state (`enabled`,
   `static`, `masked`, `generated`, ...). Compared by equality; unit-file
   states are version-dependent, so an unknown value matches nothing
   rather than erroring.
-- `unit_logs`: required `unit`; optional `lines` (1..1000, default 50)
-  and `priority` (0..7; returns entries at that syslog priority or more
-  severe). Entries carry `timestamp` (RFC 3339 UTC), `priority` and
-  `pid` as integers, and `message` verbatim — it can legitimately be a
-  byte array for non-UTF-8 payloads.
+- `unit_logs`: required `unit`; optional `lines` (1..1000, default 50),
+  `priority` (0..7; entries at that syslog priority or more severe),
+  `since`/`until` (journalctl time syntax: "2026-08-12 06:00:00",
+  "-5min", "yesterday"), `boot` (offset: 0 current, -1 previous; see
+  `list_boots`), and `grep` (regular expression over the message).
+  Entries carry `timestamp` (RFC 3339 UTC), `priority` and `pid` as
+  integers, and `message` verbatim — it can legitimately be a byte
+  array for non-UTF-8 payloads.
+- `list_boots`: no arguments.
 - `critical_chain`: optional `unit`, analyzing the chain to that unit
   instead of the default target. Timespans are returned verbatim
   ("1min 30.5s"); the server does not reinterpret systemd's formatting.
@@ -99,7 +107,10 @@ Arguments and behavior:
 - `failed_units`, `list_timers`, `list_sockets`, `boot_blame`: no
   arguments.
 - `plan_change`: required `action` (`start`, `stop`, `restart`,
-  `reload`, `enable`, `disable`, `mask`, `unmask`) and `unit`. Reads
+  `reload`, `enable`, `disable`, `mask`, `unmask`, `log-level`,
+  `log-target`) and `unit`. The log-control actions require `value`
+  (levels `emerg`..`debug`; targets `console`, `kmsg`, `journal`,
+  `journal-or-kmsg`, `auto`, `null`); other actions reject it. Reads
   state and records a plan; executes nothing.
 - `apply_plan`: required `plan`, an id from `plan_change`.
 
@@ -110,12 +121,18 @@ have started so far; that too mirrors systemd-analyze.
 
 ## Write path
 
-The write path covers unit lifecycle and enablement changes.
+The write path covers unit lifecycle, enablement, and log-control
+changes.
 
 - Lifecycle actions (start, stop, restart, reload) operate on the
   unit's active state; enablement actions (enable, disable, mask,
-  unmask) operate on its unit-file state. Each plan records, and each
-  apply re-checks, the state dimension its action changes.
+  unmask) operate on its unit-file state; log-control actions
+  (log-level, log-target) operate on the service's LogControl1 value.
+  Each plan records, and each apply re-checks, the state dimension its
+  action changes.
+- Log-control actions carry a `value` and predict it as the outcome;
+  their rollback is the same action with the previously observed value,
+  which the plan records — the one action class with an exact undo.
 - Nothing executes at plan time. `plan_change` performs reads only.
 - `apply_plan` compares the current state against the state recorded at
   plan time. On mismatch the plan is discarded with an error directing
@@ -128,10 +145,12 @@ The write path covers unit lifecycle and enablement changes.
   result, not in the plan.
 - Plans are single-use, exist only in server memory for the lifetime of
   the session, and are capped at 32 with oldest-first eviction.
-- Rollback is the inverse action, reported in both the plan and the
-  apply result: start/stop and enable/disable invert each other, mask
-  inverts to unmask, and restart and reload report null. The predicted
-  state for unmask is null: the outcome depends on the unit's install
+- Rollback is reported in both the plan and the apply result as an
+  object: `{"action": ...}` with a `value` where the inverse needs one.
+  start/stop and enable/disable invert each other, mask inverts to
+  unmask, log-control actions invert to themselves with the previous
+  value, and restart and reload report null. The predicted state for
+  unmask is null: the outcome depends on the unit's install
   configuration.
 - Privileges are the invoking user's. An unprivileged user can plan
   anything but apply only what polkit permits; the refusal is
@@ -234,6 +253,11 @@ As systemd extends its varlink interfaces, the corresponding CLI
 invocations here are planned to be replaced with socket calls behind
 the existing probe-and-fall-back mechanism, keeping the output shapes
 unchanged.
+
+Also under consideration: the manager-wide log level (`systemctl
+log-level`, unit-less and therefore outside the current plan machinery)
+and journald maintenance (rotate, flush; vacuum deletes data and needs
+more than a precondition check).
 
 ## License
 

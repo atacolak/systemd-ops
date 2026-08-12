@@ -170,10 +170,27 @@ const TOOLS: &[Tool] = &[
         run: |args| Ok(systemd::unit_security(required_unit(args)?)?),
     },
     Tool {
+        name: "unit_log_control",
+        scope: Scope::UnitsRead,
+        description: "One service's runtime log level and log target, read through \
+                      systemd's LogControl1 interface. Fails for services that do not \
+                      implement the interface.",
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "unit": { "type": "string", "description": "Unit name, e.g. systemd-journald.service" }
+                },
+                "required": ["unit"]
+            })
+        },
+        run: |args| Ok(systemd::unit_log_control(required_unit(args)?)?),
+    },
+    Tool {
         name: "unit_logs",
         scope: Scope::JournalRead,
-        description: "Read the most recent journal entries for one unit, optionally \
-                      filtered by maximum priority.",
+        description: "Read journal entries for one unit, filtered by priority, time \
+                      window, boot, and message pattern.",
         input_schema: || {
             json!({
                 "type": "object",
@@ -192,16 +209,49 @@ const TOOLS: &[Tool] = &[
                         "maximum": 7,
                         "description": "Only entries at this syslog priority or more severe \
                                         (0=emerg .. 7=debug)."
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": "Start of the time window, journalctl syntax \
+                                        ('2026-08-12 06:00:00', '-5min', 'yesterday')."
+                    },
+                    "until": {
+                        "type": "string",
+                        "description": "End of the time window, journalctl syntax."
+                    },
+                    "boot": {
+                        "type": "integer",
+                        "description": "Boot offset: 0 is the current boot, -1 the one before."
+                    },
+                    "grep": {
+                        "type": "string",
+                        "description": "Only entries whose message matches this regular \
+                                        expression."
                     }
                 },
                 "required": ["unit"]
             })
         },
         run: |args| {
-            let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(50);
-            let priority = args.get("priority").and_then(Value::as_u64);
-            Ok(systemd::unit_logs(required_unit(args)?, lines, priority)?)
+            let filter = systemd::LogFilter {
+                lines: args.get("lines").and_then(Value::as_u64).unwrap_or(50),
+                priority: args.get("priority").and_then(Value::as_u64),
+                since: args.get("since").and_then(Value::as_str),
+                until: args.get("until").and_then(Value::as_str),
+                boot: args.get("boot").and_then(Value::as_i64),
+                grep: args.get("grep").and_then(Value::as_str),
+            };
+            Ok(systemd::unit_logs(required_unit(args)?, &filter)?)
         },
+    },
+    Tool {
+        name: "list_boots",
+        scope: Scope::JournalRead,
+        description: "List the boots recorded in the journal, with boot ids and first/last \
+                      entry timestamps. Boot offsets from this list select a boot in \
+                      unit_logs.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        run: |_| Ok(systemd::list_boots()?),
     },
     Tool {
         name: "boot_times",
@@ -248,13 +298,14 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "plan_change",
         scope: Scope::UnitsWrite,
-        description: "Plan a unit lifecycle change (start, stop, restart, reload) or \
-                      enablement change (enable, disable, mask, unmask) without \
+        description: "Plan a unit lifecycle change (start, stop, restart, reload), \
+                      enablement change (enable, disable, mask, unmask), or log-control \
+                      change (log-level, log-target, which require a value) without \
                       executing anything. Returns the unit's current state, the \
-                      predicted state (null where the outcome depends on install \
-                      configuration), the rollback action (null when none exists), and \
-                      a plan id for apply_plan. Plans are single-use and last only for \
-                      this session.",
+                      predicted state (null where the outcome cannot be derived), the \
+                      rollback action (with the value that restores the previous state, \
+                      where one applies), and a plan id for apply_plan. Plans are \
+                      single-use and last only for this session.",
         input_schema: || {
             json!({
                 "type": "object",
@@ -262,10 +313,17 @@ const TOOLS: &[Tool] = &[
                     "action": {
                         "type": "string",
                         "enum": ["start", "stop", "restart", "reload",
-                                 "enable", "disable", "mask", "unmask"],
+                                 "enable", "disable", "mask", "unmask",
+                                 "log-level", "log-target"],
                         "description": "The change to plan."
                     },
-                    "unit": { "type": "string", "description": "Unit name, e.g. ssh.service" }
+                    "unit": { "type": "string", "description": "Unit name, e.g. ssh.service" },
+                    "value": {
+                        "type": "string",
+                        "description": "For log-level: emerg..debug. For log-target: \
+                                        console, kmsg, journal, journal-or-kmsg, auto, \
+                                        null. Rejected for other actions."
+                    }
                 },
                 "required": ["action", "unit"]
             })
@@ -276,10 +334,34 @@ const TOOLS: &[Tool] = &[
                 .and_then(Value::as_str)
                 .and_then(write::Action::parse)
                 .ok_or(CallError::Args(
-                    "missing or unknown action (start, stop, restart, reload, \
-                     enable, disable, mask, unmask)",
+                    "missing or unknown action (start, stop, restart, reload, enable, \
+                     disable, mask, unmask, log-level, log-target)",
                 ))?;
-            Ok(write::plan(action, required_unit(args)?)?)
+            let value = args.get("value").and_then(Value::as_str);
+            match (action, value) {
+                (write::Action::LogLevel, Some(v)) if !write::LOG_LEVELS.contains(&v) => {
+                    return Err(CallError::Args(
+                        "unknown log level (emerg, alert, crit, err, warning, notice, \
+                         info, debug)",
+                    ))
+                }
+                (write::Action::LogTarget, Some(v)) if !write::LOG_TARGETS.contains(&v) => {
+                    return Err(CallError::Args(
+                        "unknown log target (console, kmsg, journal, journal-or-kmsg, \
+                         auto, null)",
+                    ))
+                }
+                (a, None) if a.takes_value() => {
+                    return Err(CallError::Args("this action requires a value"))
+                }
+                (a, Some(_)) if !a.takes_value() => {
+                    return Err(CallError::Args(
+                        "value is only accepted for log-level and log-target",
+                    ))
+                }
+                _ => {}
+            }
+            Ok(write::plan(action, required_unit(args)?, value)?)
         },
     },
     Tool {
@@ -523,6 +605,7 @@ mod tests {
                 "list_unit_files",
                 "unit_dependencies",
                 "unit_security",
+                "unit_log_control",
             ]
         );
         // ...and calling one anyway is refused, not routed.

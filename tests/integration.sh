@@ -47,7 +47,7 @@ expect_error() { # expect_error <scopes> <tool> <args-json> <substring>
 echo "== scope gating"
 names=$(rpc units:read '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' |
   jq -r '.result.tools | map(.name) | join(",")')
-[ "$names" = "list_units,failed_units,unit_properties,list_timers,list_sockets,list_unit_files,unit_dependencies,unit_security" ] ||
+[ "$names" = "list_units,failed_units,unit_properties,list_timers,list_sockets,list_unit_files,unit_dependencies,unit_security,unit_log_control" ] ||
   fail "tools/list under units:read advertised: $names"
 expect_error units:read unit_logs '{"unit":"ssh.service"}' "journal:read"
 expect_error units:read boot_times '{}' "boot:read"
@@ -82,13 +82,16 @@ tool units:read list_unit_files '{"state":"static"}' |
   jq -e 'length > 0 and all(.[]; .state == "static")' >/dev/null ||
   fail "list_unit_files state filter leaked non-static rows"
 
-echo "== unit_dependencies / unit_security"
+echo "== unit_dependencies / unit_security / unit_log_control"
 tool units:read unit_dependencies '{"unit":"multi-user.target"}' |
   jq -e '.dependencies.After | length > 0' >/dev/null ||
   fail "multi-user.target has no After edges"
 tool units:read unit_security '{"unit":"systemd-journald.service"}' |
   jq -e '.analysis | type == "array" and length > 0' >/dev/null ||
   fail "unit_security produced no analysis rows"
+tool units:read unit_log_control '{"unit":"systemd-journald.service"}' |
+  jq -e '(.log_level | length > 0) and (.log_target | length > 0)' >/dev/null ||
+  fail "unit_log_control returned empty values"
 
 echo "== unit_logs (canary through a transient unit)"
 $HOST systemd-run --unit=mcpd-canary.service --collect \
@@ -106,6 +109,16 @@ done
 # The lines cap holds...
 tool journal:read unit_logs '{"unit":"mcpd-canary.service","lines":3}' |
   jq -e '.entries | length <= 3' >/dev/null || fail "lines cap not applied"
+# ...the query filters reach journalctl: a recent time window, the
+# current boot, and a message pattern must all still find the canary,
+# and a future window must not...
+tool journal:read unit_logs '{"unit":"mcpd-canary.service","since":"-2min","boot":0,"grep":"canary-marker"}' |
+  jq -e '.entries | map(.message) | index("mcpd-canary-marker")' >/dev/null ||
+  fail "since/boot/grep filters lost the canary"
+tool journal:read unit_logs '{"unit":"mcpd-canary.service","since":"+1min"}' |
+  jq -e '.entries | length == 0' >/dev/null || fail "future since window returned entries"
+tool journal:read list_boots '{}' |
+  jq -e 'type == "array" and length >= 1' >/dev/null || fail "list_boots empty"
 # ...and the priority filter reaches journalctl: the canary logged at
 # info, so emerg-only must be empty and debug-and-above must include it.
 tool journal:read unit_logs '{"unit":"mcpd-canary.service","priority":0}' |
@@ -169,7 +182,7 @@ replies=$(rpc units:write \
   "$(call apply_plan '{"plan":1}')")
 planned=$(sed -n 1p <<<"$replies" | jq -r '.result.content[0].text')
 applied=$(sed -n 2p <<<"$replies" | jq -r '.result.content[0].text')
-jq -e '.plan == 1 and .current.active == "inactive" and .rollback == "stop"' \
+jq -e '.plan == 1 and .current.active == "inactive" and .rollback.action == "stop"' \
   <<<"$planned" >/dev/null || fail "plan_change reply malformed: $planned"
 jq -e '.applied == true and .diff.active.before == "inactive" and .diff.active.after == "active"' \
   <<<"$applied" >/dev/null || fail "apply_plan diff malformed: $applied"
@@ -196,7 +209,7 @@ replies=$(rpc units:write \
   "$(call apply_plan '{"plan":1}')")
 en_planned=$(sed -n 1p <<<"$replies" | jq -r '.result.content[0].text')
 en_applied=$(sed -n 2p <<<"$replies" | jq -r '.result.content[0].text')
-jq -e '.current.unit_file_state == "disabled" and .predicted.unit_file_state == "enabled" and .rollback == "disable"' \
+jq -e '.current.unit_file_state == "disabled" and .predicted.unit_file_state == "enabled" and .rollback.action == "disable"' \
   <<<"$en_planned" >/dev/null || fail "enable plan malformed: $en_planned"
 jq -e '.diff.unit_file_state.before == "disabled" and .diff.unit_file_state.after == "enabled" and (.changes | length > 0)' \
   <<<"$en_applied" >/dev/null || fail "enable apply diff malformed: $en_applied"
@@ -228,5 +241,31 @@ $HOST systemctl disable mcpd-write-test.service >/dev/null 2>&1 ||
   fail "cleanup disable failed"
 
 $HOST bash -c 'rm -f /etc/systemd/system/mcpd-write-test.service && systemctl daemon-reload'
+
+echo "== write path (log tuning)"
+# Bad values are protocol errors before anything runs.
+expect_error units:write plan_change '{"action":"log-level","unit":"systemd-journald.service","value":"chatty"}' "unknown log level"
+expect_error units:write plan_change '{"action":"log-level","unit":"systemd-journald.service"}' "requires a value"
+expect_error units:write plan_change '{"action":"start","unit":"x.service","value":"debug"}' "only accepted for"
+# Tune journald to debug and read the rollback value out of the plan.
+replies=$(rpc units:write \
+  "$(call plan_change '{"action":"log-level","unit":"systemd-journald.service","value":"debug"}')" \
+  "$(call apply_plan '{"plan":1}')")
+ll_planned=$(sed -n 1p <<<"$replies" | jq -r '.result.content[0].text')
+ll_applied=$(sed -n 2p <<<"$replies" | jq -r '.result.content[0].text')
+prev_level=$(jq -r '.current.log_level' <<<"$ll_planned")
+[ -n "$prev_level" ] || fail "log-level plan recorded no current level"
+jq -e '.predicted.log_level == "debug" and .rollback.action == "log-level" and .rollback.value != null' \
+  <<<"$ll_planned" >/dev/null || fail "log-level plan malformed: $ll_planned"
+jq -e '.diff.log_level.after == "debug"' <<<"$ll_applied" >/dev/null ||
+  fail "log-level apply diff malformed: $ll_applied"
+[ "$($HOST systemctl service-log-level systemd-journald.service)" = "debug" ] ||
+  fail "journald log level not debug after apply"
+# Restore using the rollback value the plan reported.
+rpc units:write \
+  "$(call plan_change "{\"action\":\"log-level\",\"unit\":\"systemd-journald.service\",\"value\":\"$prev_level\"}")" \
+  "$(call apply_plan '{"plan":1}')" >/dev/null
+[ "$($HOST systemctl service-log-level systemd-journald.service)" = "$prev_level" ] ||
+  fail "journald log level not restored to $prev_level"
 
 echo "PASS: all live integration tests"

@@ -28,16 +28,33 @@ pub enum Action {
     Disable,
     Mask,
     Unmask,
+    LogLevel,
+    LogTarget,
 }
 
 /// Which state dimension an action changes, and therefore which
 /// property the plan records and the apply precondition re-checks:
-/// `ActiveState` for lifecycle actions, `UnitFileState` for enablement.
+/// `ActiveState` for lifecycle actions, `UnitFileState` for enablement,
+/// the LogControl1 value for log tuning.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     UnitState,
     FileState,
+    LogControl,
 }
+
+/// Accepted values for the log-control actions, checked before argv.
+pub const LOG_LEVELS: &[&str] = &[
+    "emerg", "alert", "crit", "err", "warning", "notice", "info", "debug",
+];
+pub const LOG_TARGETS: &[&str] = &[
+    "console",
+    "kmsg",
+    "journal",
+    "journal-or-kmsg",
+    "auto",
+    "null",
+];
 
 impl Action {
     pub fn parse(s: &str) -> Option<Self> {
@@ -50,11 +67,22 @@ impl Action {
             "disable" => Some(Action::Disable),
             "mask" => Some(Action::Mask),
             "unmask" => Some(Action::Unmask),
+            "log-level" => Some(Action::LogLevel),
+            "log-target" => Some(Action::LogTarget),
             _ => None,
         }
     }
 
-    /// Also the systemctl verb — the names are systemd's own.
+    /// The wire name, as accepted by plan_change.
+    fn name(self) -> &'static str {
+        match self {
+            Action::LogLevel => "log-level",
+            Action::LogTarget => "log-target",
+            other => other.verb(),
+        }
+    }
+
+    /// The systemctl verb — the names are systemd's own.
     fn verb(self) -> &'static str {
         match self {
             Action::Start => "start",
@@ -65,6 +93,8 @@ impl Action {
             Action::Disable => "disable",
             Action::Mask => "mask",
             Action::Unmask => "unmask",
+            Action::LogLevel => "service-log-level",
+            Action::LogTarget => "service-log-target",
         }
     }
 
@@ -72,11 +102,18 @@ impl Action {
         match self {
             Action::Start | Action::Stop | Action::Restart | Action::Reload => Kind::UnitState,
             Action::Enable | Action::Disable | Action::Mask | Action::Unmask => Kind::FileState,
+            Action::LogLevel | Action::LogTarget => Kind::LogControl,
         }
     }
 
+    /// Whether this action takes a value ("debug", "journal", ...).
+    pub fn takes_value(self) -> bool {
+        self.kind() == Kind::LogControl
+    }
+
     /// The action that undoes this one. Restart and reload have no
-    /// inverse; the reply reports null for them.
+    /// inverse; the reply reports null for them. Log-control actions
+    /// invert to themselves with the previously observed value.
     fn inverse(self) -> Option<Action> {
         match self {
             Action::Start => Some(Action::Stop),
@@ -86,12 +123,15 @@ impl Action {
             Action::Disable => Some(Action::Enable),
             Action::Mask => Some(Action::Unmask),
             Action::Unmask => Some(Action::Mask),
+            Action::LogLevel => Some(Action::LogLevel),
+            Action::LogTarget => Some(Action::LogTarget),
         }
     }
 
     /// The state the unit is expected to be in afterwards. None for
-    /// unmask: the resulting enablement state depends on the unit's
-    /// install configuration and cannot be predicted from the action.
+    /// unmask, whose outcome depends on the unit's install
+    /// configuration; log-control predictions come from the requested
+    /// value instead.
     fn predicted(self) -> Option<&'static str> {
         match self {
             Action::Start | Action::Restart | Action::Reload => Some("active"),
@@ -99,16 +139,21 @@ impl Action {
             Action::Enable => Some("enabled"),
             Action::Disable => Some("disabled"),
             Action::Mask => Some("masked"),
-            Action::Unmask => None,
+            Action::Unmask | Action::LogLevel | Action::LogTarget => None,
         }
     }
 
     /// The JSON key for this action's state dimension, used in the
     /// `current`, `predicted`, and `diff` objects.
     fn state_key(self) -> &'static str {
-        match self.kind() {
-            Kind::UnitState => "active",
-            Kind::FileState => "unit_file_state",
+        match self {
+            Action::LogLevel => "log_level",
+            Action::LogTarget => "log_target",
+            other => match other.kind() {
+                Kind::UnitState => "active",
+                Kind::FileState => "unit_file_state",
+                Kind::LogControl => unreachable!("log actions matched above"),
+            },
         }
     }
 }
@@ -119,8 +164,10 @@ struct Plan {
     action: Action,
     /// The observed value of the action's state dimension at plan time.
     observed: String,
-    /// SubState at plan time; empty for enablement actions.
+    /// SubState at plan time; empty for non-lifecycle actions.
     sub: String,
+    /// The requested value, for actions that take one.
+    value: Option<String>,
 }
 
 /// The stdio loop is single-threaded, so the Mutex is uncontended; it
@@ -136,10 +183,26 @@ fn observe(action: Action, unit: &str) -> Result<(String, String), BackendError>
     match action.kind() {
         Kind::UnitState => systemd::unit_state(unit),
         Kind::FileState => Ok((systemd::unit_file_state(unit)?, String::new())),
+        Kind::LogControl => Ok((
+            systemd::service_log_get(action.verb(), unit)?,
+            String::new(),
+        )),
     }
 }
 
-pub fn plan(action: Action, unit: &str) -> Result<Value, BackendError> {
+/// The rollback description: the inverse action, carrying the
+/// previously observed value where the inverse needs one.
+fn rollback_json(action: Action, observed: &str) -> Value {
+    match action.inverse() {
+        None => Value::Null,
+        Some(inverse) if inverse.takes_value() => {
+            json!({ "action": inverse.name(), "value": observed })
+        }
+        Some(inverse) => json!({ "action": inverse.name() }),
+    }
+}
+
+pub fn plan(action: Action, unit: &str, value: Option<&str>) -> Result<Value, BackendError> {
     systemd::validate_unit_name(unit)?;
     let (observed, sub) = observe(action, unit)?;
     let key = action.state_key();
@@ -147,6 +210,11 @@ pub fn plan(action: Action, unit: &str) -> Result<Value, BackendError> {
     if action.kind() == Kind::UnitState {
         current["sub"] = json!(sub);
     }
+    // Log-control predictions are the requested value; everything else
+    // predicts from the action.
+    let predicted = value
+        .map(Value::from)
+        .unwrap_or_else(|| action.predicted().map(Value::from).unwrap_or(Value::Null));
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let mut plans = PLANS.lock().unwrap();
     if plans.len() >= MAX_PLANS {
@@ -158,14 +226,16 @@ pub fn plan(action: Action, unit: &str) -> Result<Value, BackendError> {
         action,
         observed: observed.clone(),
         sub,
+        value: value.map(String::from),
     });
     Ok(json!({
         "plan": id,
         "unit": unit,
-        "action": action.verb(),
+        "action": action.name(),
+        "value": value,
         "current": current,
-        "predicted": { key: action.predicted() },
-        "rollback": action.inverse().map(Action::verb),
+        "predicted": { key: predicted },
+        "rollback": rollback_json(action, &observed),
         "note": "nothing has been executed; apply with apply_plan",
     }))
 }
@@ -189,7 +259,7 @@ pub fn apply(id: u64) -> Result<Value, BackendError> {
         )));
     }
 
-    let changes = systemd::apply_verb(plan.action.verb(), &plan.unit)?;
+    let changes = systemd::apply_verb(plan.action.verb(), &plan.unit, plan.value.as_deref())?;
     let (observed_after, sub_after) = observe(plan.action, &plan.unit)?;
     let key = plan.action.state_key();
     let mut diff = json!({
@@ -201,14 +271,14 @@ pub fn apply(id: u64) -> Result<Value, BackendError> {
     Ok(json!({
         "plan": id,
         "unit": plan.unit,
-        "action": plan.action.verb(),
+        "action": plan.action.name(),
         "applied": true,
         "diff": diff,
         // Filesystem changes as systemd reported them (symlink
         // creations and removals for enablement actions; usually empty
-        // for lifecycle actions).
+        // otherwise).
         "changes": changes,
-        "rollback": plan.action.inverse().map(Action::verb),
+        "rollback": rollback_json(plan.action, &plan.observed),
     }))
 }
 
@@ -236,6 +306,30 @@ mod tests {
         assert_eq!(Action::Unmask.predicted(), None);
         assert_eq!(Action::Start.state_key(), "active");
         assert_eq!(Action::Enable.state_key(), "unit_file_state");
+    }
+
+    #[test]
+    fn log_control_actions() {
+        assert_eq!(Action::parse("log-level"), Some(Action::LogLevel));
+        assert_eq!(Action::parse("log-target"), Some(Action::LogTarget));
+        assert_eq!(Action::LogLevel.verb(), "service-log-level");
+        assert_eq!(Action::LogLevel.name(), "log-level");
+        assert!(Action::LogLevel.takes_value());
+        assert!(!Action::Start.takes_value());
+        assert_eq!(Action::LogLevel.state_key(), "log_level");
+        assert_eq!(Action::LogTarget.state_key(), "log_target");
+        // Log-control actions invert to themselves with the previous
+        // value; lifecycle inverses carry no value.
+        assert_eq!(
+            rollback_json(Action::LogLevel, "info"),
+            serde_json::json!({ "action": "log-level", "value": "info" })
+        );
+        assert_eq!(
+            rollback_json(Action::Start, "inactive"),
+            serde_json::json!({ "action": "stop" })
+        );
+        assert_eq!(rollback_json(Action::Restart, "active"), Value::Null);
+        assert!(LOG_LEVELS.contains(&"debug") && LOG_TARGETS.contains(&"journal"));
     }
 
     #[test]

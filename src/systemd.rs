@@ -191,6 +191,32 @@ pub(crate) fn unit_state(name: &str) -> Result<(String, String), BackendError> {
     Ok((get("ActiveState"), get("SubState")))
 }
 
+/// `list_boots`: the boots recorded in the journal, oldest first —
+/// `journalctl --list-boots --output=json` passed through.
+pub fn list_boots() -> Result<Value, BackendError> {
+    run_json(
+        "journalctl",
+        &["--list-boots", "--output=json", "--no-pager"],
+    )
+}
+
+/// The current LogControl1 value for one verb ("service-log-level" or
+/// "service-log-target"). Fails for services that do not implement the
+/// interface; the error is systemctl's.
+pub(crate) fn service_log_get(verb: &str, unit: &str) -> Result<String, BackendError> {
+    let stdout = run("systemctl", &[verb, "--no-pager", "--", unit])?;
+    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+}
+
+/// `unit_log_control`: one service's runtime log level and target, read
+/// through systemd's LogControl1 interface.
+pub fn unit_log_control(name: &str) -> Result<Value, BackendError> {
+    validate_unit_name(name)?;
+    let level = service_log_get("service-log-level", name)?;
+    let target = service_log_get("service-log-target", name)?;
+    Ok(json!({ "unit": name, "log_level": level, "log_target": target }))
+}
+
 /// The enablement state of one unit's file, for the plan/apply path.
 /// Empty for units without a unit file (for example transient units).
 pub(crate) fn unit_file_state(name: &str) -> Result<String, BackendError> {
@@ -205,13 +231,22 @@ pub(crate) fn unit_file_state(name: &str) -> Result<String, BackendError> {
         .to_string())
 }
 
-/// Executes a unit state-change or enablement verb. The single mutating
-/// invocation in the program; the only caller is `crate::write::apply`,
-/// which reaches here exclusively through an applied plan. Returns the
-/// non-empty output lines — systemctl reports enablement symlink
-/// creations and removals on stderr.
-pub(crate) fn apply_verb(verb: &str, unit: &str) -> Result<Vec<String>, BackendError> {
-    let output = run_output("systemctl", &[verb, "--no-pager", "--", unit])?;
+/// Executes a unit state-change, enablement, or log-control verb. The
+/// single mutating invocation in the program; the only caller is
+/// `crate::write::apply`, which reaches here exclusively through an
+/// applied plan. `value` carries the positional argument log-control
+/// verbs take. Returns the non-empty output lines — systemctl reports
+/// enablement symlink creations and removals on stderr.
+pub(crate) fn apply_verb(
+    verb: &str,
+    unit: &str,
+    value: Option<&str>,
+) -> Result<Vec<String>, BackendError> {
+    let mut args = vec![verb, "--no-pager", "--", unit];
+    if let Some(value) = value {
+        args.push(value);
+    }
+    let output = run_output("systemctl", &args)?;
     let lines = |bytes: &[u8]| {
         String::from_utf8_lossy(bytes)
             .lines()
@@ -393,26 +428,82 @@ pub fn unit_properties(name: &str) -> Result<Value, BackendError> {
 ///
 /// journalctl emits one JSON object per line with dozens of metadata
 /// fields; four are kept, to bound output size.
-pub fn unit_logs(name: &str, lines: u64, priority: Option<u64>) -> Result<Value, BackendError> {
+/// Filters accepted by `unit_logs` beyond the unit itself.
+#[derive(Default)]
+pub struct LogFilter<'a> {
+    pub lines: u64,
+    pub priority: Option<u64>,
+    pub since: Option<&'a str>,
+    pub until: Option<&'a str>,
+    pub boot: Option<i64>,
+    pub grep: Option<&'a str>,
+}
+
+/// journalctl parses its own timestamp syntax ("2026-08-12 06:00:00",
+/// "-5min", "yesterday") and rejects invalid input with a usable error;
+/// this check only keeps the value shaped like a timestamp before it
+/// becomes an argv element.
+fn validate_time_spec(spec: &str) -> Result<(), BackendError> {
+    let ok = !spec.is_empty()
+        && spec.len() <= 64
+        && spec
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || " :+-.@/".contains(c));
+    if ok {
+        Ok(())
+    } else {
+        Err(BackendError(format!(
+            "'{spec}' is not a valid time specification"
+        )))
+    }
+}
+
+pub fn unit_logs(name: &str, filter: &LogFilter) -> Result<Value, BackendError> {
     validate_unit_name(name)?;
-    let lines = lines.clamp(1, 1000);
-    let n = lines.to_string();
-    // `--unit=`/`--priority=` keep flag and value paired in one argv
+    let n = filter.lines.clamp(1, 1000).to_string();
+    // `--unit=`-style pairing keeps each flag and its value in one argv
     // element, leaving no option-parsing ambiguity. The name is validated
     // above and can never start with '-'.
     let unit_arg = format!("--unit={name}");
-    let mut args = vec!["--output=json", "--no-pager", "-n", &n, &unit_arg];
-    let priority_arg;
-    if let Some(p) = priority {
+    let mut args = vec![
+        "--output=json".to_string(),
+        "--no-pager".to_string(),
+        "-n".to_string(),
+        n,
+        unit_arg,
+    ];
+    if let Some(p) = filter.priority {
         if p > 7 {
             return Err(BackendError(format!(
                 "priority {p} out of range (0=emerg .. 7=debug)"
             )));
         }
-        priority_arg = format!("--priority={p}");
-        args.push(&priority_arg);
+        args.push(format!("--priority={p}"));
     }
-    let stdout = run("journalctl", &args)?;
+    if let Some(since) = filter.since {
+        validate_time_spec(since)?;
+        args.push(format!("--since={since}"));
+    }
+    if let Some(until) = filter.until {
+        validate_time_spec(until)?;
+        args.push(format!("--until={until}"));
+    }
+    if let Some(boot) = filter.boot {
+        if !(-1000..=1000).contains(&boot) {
+            return Err(BackendError(format!("boot offset {boot} out of range")));
+        }
+        args.push(format!("--boot={boot}"));
+    }
+    if let Some(grep) = filter.grep {
+        if grep.is_empty() || grep.len() > 256 {
+            return Err(BackendError(
+                "grep pattern must be 1..256 characters".into(),
+            ));
+        }
+        args.push(format!("--grep={grep}"));
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let stdout = run("journalctl", &arg_refs)?;
 
     let text = String::from_utf8_lossy(&stdout);
     let entries: Vec<Value> = text
