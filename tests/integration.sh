@@ -7,7 +7,9 @@
 #         (default: target/release/systemd-mcpd)
 #   HOST  command prefix that executes commands on the same systemd the
 #         server talks to; empty means "right here"
-#         (e.g. "docker exec sysd" when the server runs in a container)
+#         (e.g. "docker exec -i sysd" when the server runs in a
+#         container). It must forward stdin: some commands below pipe
+#         content in, and a prefix that drops stdin writes empty files.
 #
 # Needs jq, and enough privilege to read the system journal and create
 # transient units (root, or a root docker exec into a container).
@@ -230,6 +232,10 @@ expect_error units:write apply_plan '{"plan":424242}' "unknown plan"
 # performed by whichever shell ssh hands the string to, not in the guest.
 printf '[Unit]\nDescription=systemd-mcpd write-path test unit\n[Service]\nExecStart=/bin/sleep 300\n[Install]\nWantedBy=multi-user.target\n' |
   $HOST tee "$WRITE_UNIT" >/dev/null
+# systemd reads a zero-length unit file as masked, which surfaces much
+# later as a confusing "is masked" failure. Catch it here instead.
+$HOST test -s "$WRITE_UNIT" ||
+  fail "unit file is empty: does HOST forward stdin? (docker exec needs -i)"
 $HOST systemctl daemon-reload
 
 # Plan and apply in one session (plans are per-session; the first id is 1).
