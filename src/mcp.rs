@@ -248,18 +248,22 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "plan_change",
         scope: Scope::UnitsWrite,
-        description: "Plan a unit state change without executing anything. Returns the \
-                      unit's current state, the predicted state, the rollback action \
-                      (null when none exists), and a plan id for apply_plan. Plans are \
-                      single-use and last only for this session.",
+        description: "Plan a unit lifecycle change (start, stop, restart, reload) or \
+                      enablement change (enable, disable, mask, unmask) without \
+                      executing anything. Returns the unit's current state, the \
+                      predicted state (null where the outcome depends on install \
+                      configuration), the rollback action (null when none exists), and \
+                      a plan id for apply_plan. Plans are single-use and last only for \
+                      this session.",
         input_schema: || {
             json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["start", "stop", "restart", "reload"],
-                        "description": "The state change to plan."
+                        "enum": ["start", "stop", "restart", "reload",
+                                 "enable", "disable", "mask", "unmask"],
+                        "description": "The change to plan."
                     },
                     "unit": { "type": "string", "description": "Unit name, e.g. ssh.service" }
                 },
@@ -272,7 +276,8 @@ const TOOLS: &[Tool] = &[
                 .and_then(Value::as_str)
                 .and_then(write::Action::parse)
                 .ok_or(CallError::Args(
-                    "missing or unknown action (start, stop, restart, reload)",
+                    "missing or unknown action (start, stop, restart, reload, \
+                     enable, disable, mask, unmask)",
                 ))?;
             Ok(write::plan(action, required_unit(args)?)?)
         },
@@ -282,8 +287,9 @@ const TOOLS: &[Tool] = &[
         scope: Scope::UnitsWrite,
         description: "Execute a plan created by plan_change. Re-checks the state the \
                       plan was made against and refuses stale plans — if the unit \
-                      changed in between, re-plan. Returns a before/after diff and the \
-                      rollback action.",
+                      changed in between, re-plan. Returns a before/after diff, the \
+                      filesystem changes systemd reported (symlink creations and \
+                      removals for enablement actions), and the rollback action.",
         input_schema: || {
             json!({
                 "type": "object",
@@ -547,7 +553,7 @@ mod tests {
         let replies = exchange(
             &grants,
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"plan_change","arguments":{"action":"enable","unit":"x.service"}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"plan_change","arguments":{"action":"isolate","unit":"x.service"}}}
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"apply_plan","arguments":{}}}
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"apply_plan","arguments":{"plan":123456789}}}
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_units"}}

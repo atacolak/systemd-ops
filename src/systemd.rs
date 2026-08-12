@@ -122,7 +122,7 @@ pub(crate) fn validate_unit_name(name: &str) -> Result<(), BackendError> {
 /// exit status and stderr. Every process this server spawns goes through
 /// here: one place to audit, one place that pins the environment (no pager,
 /// no color — we are parsing this output, not reading it).
-fn run(program: &str, args: &[&str]) -> Result<Vec<u8>, BackendError> {
+fn run_output(program: &str, args: &[&str]) -> Result<std::process::Output, BackendError> {
     let output = Command::new(program)
         .args(args)
         .env("SYSTEMD_PAGER", "cat")
@@ -138,7 +138,11 @@ fn run(program: &str, args: &[&str]) -> Result<Vec<u8>, BackendError> {
             stderr.trim()
         )));
     }
-    Ok(output.stdout)
+    Ok(output)
+}
+
+fn run(program: &str, args: &[&str]) -> Result<Vec<u8>, BackendError> {
+    run_output(program, args).map(|output| output.stdout)
 }
 
 /// Runs a command and parses its stdout as JSON.
@@ -187,11 +191,38 @@ pub(crate) fn unit_state(name: &str) -> Result<(String, String), BackendError> {
     Ok((get("ActiveState"), get("SubState")))
 }
 
-/// Executes a unit state-change verb. The single mutating invocation in
-/// the program; the only caller is `crate::write::apply`, which reaches
-/// here exclusively through an applied plan.
-pub(crate) fn apply_verb(verb: &str, unit: &str) -> Result<(), BackendError> {
-    run("systemctl", &[verb, "--no-pager", "--", unit]).map(|_| ())
+/// The enablement state of one unit's file, for the plan/apply path.
+/// Empty for units without a unit file (for example transient units).
+pub(crate) fn unit_file_state(name: &str) -> Result<String, BackendError> {
+    let props = run_key_values(
+        "systemctl",
+        &["show", "--no-pager", "--property=UnitFileState", "--", name],
+    )?;
+    Ok(props
+        .get("UnitFileState")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string())
+}
+
+/// Executes a unit state-change or enablement verb. The single mutating
+/// invocation in the program; the only caller is `crate::write::apply`,
+/// which reaches here exclusively through an applied plan. Returns the
+/// non-empty output lines — systemctl reports enablement symlink
+/// creations and removals on stderr.
+pub(crate) fn apply_verb(verb: &str, unit: &str) -> Result<Vec<String>, BackendError> {
+    let output = run_output("systemctl", &[verb, "--no-pager", "--", unit])?;
+    let lines = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect::<Vec<_>>()
+    };
+    let mut changes = lines(&output.stdout);
+    changes.extend(lines(&output.stderr));
+    Ok(changes)
 }
 
 /// Unit states accepted by the `list_units` filter. Also the schema enum

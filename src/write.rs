@@ -24,6 +24,19 @@ pub enum Action {
     Stop,
     Restart,
     Reload,
+    Enable,
+    Disable,
+    Mask,
+    Unmask,
+}
+
+/// Which state dimension an action changes, and therefore which
+/// property the plan records and the apply precondition re-checks:
+/// `ActiveState` for lifecycle actions, `UnitFileState` for enablement.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    UnitState,
+    FileState,
 }
 
 impl Action {
@@ -33,6 +46,10 @@ impl Action {
             "stop" => Some(Action::Stop),
             "restart" => Some(Action::Restart),
             "reload" => Some(Action::Reload),
+            "enable" => Some(Action::Enable),
+            "disable" => Some(Action::Disable),
+            "mask" => Some(Action::Mask),
+            "unmask" => Some(Action::Unmask),
             _ => None,
         }
     }
@@ -44,6 +61,17 @@ impl Action {
             Action::Stop => "stop",
             Action::Restart => "restart",
             Action::Reload => "reload",
+            Action::Enable => "enable",
+            Action::Disable => "disable",
+            Action::Mask => "mask",
+            Action::Unmask => "unmask",
+        }
+    }
+
+    fn kind(self) -> Kind {
+        match self {
+            Action::Start | Action::Stop | Action::Restart | Action::Reload => Kind::UnitState,
+            Action::Enable | Action::Disable | Action::Mask | Action::Unmask => Kind::FileState,
         }
     }
 
@@ -54,14 +82,33 @@ impl Action {
             Action::Start => Some(Action::Stop),
             Action::Stop => Some(Action::Start),
             Action::Restart | Action::Reload => None,
+            Action::Enable => Some(Action::Disable),
+            Action::Disable => Some(Action::Enable),
+            Action::Mask => Some(Action::Unmask),
+            Action::Unmask => Some(Action::Mask),
         }
     }
 
-    /// The active state the unit is expected to be in afterwards.
-    fn predicted(self) -> &'static str {
+    /// The state the unit is expected to be in afterwards. None for
+    /// unmask: the resulting enablement state depends on the unit's
+    /// install configuration and cannot be predicted from the action.
+    fn predicted(self) -> Option<&'static str> {
         match self {
-            Action::Start | Action::Restart | Action::Reload => "active",
-            Action::Stop => "inactive",
+            Action::Start | Action::Restart | Action::Reload => Some("active"),
+            Action::Stop => Some("inactive"),
+            Action::Enable => Some("enabled"),
+            Action::Disable => Some("disabled"),
+            Action::Mask => Some("masked"),
+            Action::Unmask => None,
+        }
+    }
+
+    /// The JSON key for this action's state dimension, used in the
+    /// `current`, `predicted`, and `diff` objects.
+    fn state_key(self) -> &'static str {
+        match self.kind() {
+            Kind::UnitState => "active",
+            Kind::FileState => "unit_file_state",
         }
     }
 }
@@ -70,7 +117,9 @@ struct Plan {
     id: u64,
     unit: String,
     action: Action,
-    active: String,
+    /// The observed value of the action's state dimension at plan time.
+    observed: String,
+    /// SubState at plan time; empty for enablement actions.
     sub: String,
 }
 
@@ -81,9 +130,23 @@ static PLANS: Mutex<Vec<Plan>> = Mutex::new(Vec::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_PLANS: usize = 32;
 
+/// Reads the state dimension the action's precondition uses:
+/// (observed value, SubState or empty).
+fn observe(action: Action, unit: &str) -> Result<(String, String), BackendError> {
+    match action.kind() {
+        Kind::UnitState => systemd::unit_state(unit),
+        Kind::FileState => Ok((systemd::unit_file_state(unit)?, String::new())),
+    }
+}
+
 pub fn plan(action: Action, unit: &str) -> Result<Value, BackendError> {
     systemd::validate_unit_name(unit)?;
-    let (active, sub) = systemd::unit_state(unit)?;
+    let (observed, sub) = observe(action, unit)?;
+    let key = action.state_key();
+    let mut current = json!({ key: observed });
+    if action.kind() == Kind::UnitState {
+        current["sub"] = json!(sub);
+    }
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let mut plans = PLANS.lock().unwrap();
     if plans.len() >= MAX_PLANS {
@@ -93,15 +156,15 @@ pub fn plan(action: Action, unit: &str) -> Result<Value, BackendError> {
         id,
         unit: unit.to_string(),
         action,
-        active: active.clone(),
-        sub: sub.clone(),
+        observed: observed.clone(),
+        sub,
     });
     Ok(json!({
         "plan": id,
         "unit": unit,
         "action": action.verb(),
-        "current": { "active": active, "sub": sub },
-        "predicted": { "active": action.predicted() },
+        "current": current,
+        "predicted": { key: action.predicted() },
         "rollback": action.inverse().map(Action::verb),
         "note": "nothing has been executed; apply with apply_plan",
     }))
@@ -118,25 +181,33 @@ pub fn apply(id: u64) -> Result<Value, BackendError> {
         plans.remove(index)
     };
 
-    let (active_now, _) = systemd::unit_state(&plan.unit)?;
-    if active_now != plan.active {
+    let (observed_now, _) = observe(plan.action, &plan.unit)?;
+    if observed_now != plan.observed {
         return Err(BackendError(format!(
             "plan {id} is stale: '{}' was {} at plan time but is {} now; re-plan",
-            plan.unit, plan.active, active_now
+            plan.unit, plan.observed, observed_now
         )));
     }
 
-    systemd::apply_verb(plan.action.verb(), &plan.unit)?;
-    let (active_after, sub_after) = systemd::unit_state(&plan.unit)?;
+    let changes = systemd::apply_verb(plan.action.verb(), &plan.unit)?;
+    let (observed_after, sub_after) = observe(plan.action, &plan.unit)?;
+    let key = plan.action.state_key();
+    let mut diff = json!({
+        key: { "before": plan.observed, "after": observed_after },
+    });
+    if plan.action.kind() == Kind::UnitState {
+        diff["sub"] = json!({ "before": plan.sub, "after": sub_after });
+    }
     Ok(json!({
         "plan": id,
         "unit": plan.unit,
         "action": plan.action.verb(),
         "applied": true,
-        "diff": {
-            "active": { "before": plan.active, "after": active_after },
-            "sub": { "before": plan.sub, "after": sub_after },
-        },
+        "diff": diff,
+        // Filesystem changes as systemd reported them (symlink
+        // creations and removals for enablement actions; usually empty
+        // for lifecycle actions).
+        "changes": changes,
         "rollback": plan.action.inverse().map(Action::verb),
     }))
 }
@@ -148,13 +219,23 @@ mod tests {
     #[test]
     fn actions() {
         assert_eq!(Action::parse("start"), Some(Action::Start));
-        assert_eq!(Action::parse("enable"), None);
+        assert_eq!(Action::parse("enable"), Some(Action::Enable));
+        assert_eq!(Action::parse("isolate"), None);
         assert_eq!(Action::Start.inverse(), Some(Action::Stop));
         assert_eq!(Action::Stop.inverse(), Some(Action::Start));
         assert_eq!(Action::Restart.inverse(), None);
         assert_eq!(Action::Reload.inverse(), None);
-        assert_eq!(Action::Stop.predicted(), "inactive");
-        assert_eq!(Action::Restart.predicted(), "active");
+        assert_eq!(Action::Enable.inverse(), Some(Action::Disable));
+        assert_eq!(Action::Mask.inverse(), Some(Action::Unmask));
+        assert_eq!(Action::Unmask.inverse(), Some(Action::Mask));
+        assert_eq!(Action::Stop.predicted(), Some("inactive"));
+        assert_eq!(Action::Restart.predicted(), Some("active"));
+        assert_eq!(Action::Enable.predicted(), Some("enabled"));
+        assert_eq!(Action::Mask.predicted(), Some("masked"));
+        // unmask's outcome depends on the unit's install configuration.
+        assert_eq!(Action::Unmask.predicted(), None);
+        assert_eq!(Action::Start.state_key(), "active");
+        assert_eq!(Action::Enable.state_key(), "unit_file_state");
     }
 
     #[test]

@@ -159,8 +159,9 @@ wnames=$(rpc units:write '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' |
 expect_error units:read plan_change '{"action":"start","unit":"x.service"}' "units:write"
 expect_error units:write apply_plan '{"plan":424242}' "unknown plan"
 
-# A disposable unit to operate on.
-$HOST bash -c 'printf "[Unit]\nDescription=systemd-mcpd write-path test unit\n[Service]\nExecStart=/bin/sleep 300\n" > /etc/systemd/system/mcpd-write-test.service && systemctl daemon-reload'
+# A disposable unit to operate on, with an [Install] section so the
+# enablement actions have something to work with.
+$HOST bash -c 'printf "[Unit]\nDescription=systemd-mcpd write-path test unit\n[Service]\nExecStart=/bin/sleep 300\n[Install]\nWantedBy=multi-user.target\n" > /etc/systemd/system/mcpd-write-test.service && systemctl daemon-reload'
 
 # Plan and apply in one session (plans are per-session; the first id is 1).
 replies=$(rpc units:write \
@@ -188,6 +189,37 @@ read -t 30 -r stale <&"${SRV[0]}" || fail "no reply from server (apply)"
 jq -r '.result.content[0].text' <<<"$stale" | grep -qF "stale" ||
   fail "stale plan was not refused: $stale"
 kill "$SRV_PID" 2>/dev/null || true
+
+echo "== write path (enablement)"
+replies=$(rpc units:write \
+  "$(call plan_change '{"action":"enable","unit":"mcpd-write-test.service"}')" \
+  "$(call apply_plan '{"plan":1}')")
+en_planned=$(sed -n 1p <<<"$replies" | jq -r '.result.content[0].text')
+en_applied=$(sed -n 2p <<<"$replies" | jq -r '.result.content[0].text')
+jq -e '.current.unit_file_state == "disabled" and .predicted.unit_file_state == "enabled" and .rollback == "disable"' \
+  <<<"$en_planned" >/dev/null || fail "enable plan malformed: $en_planned"
+jq -e '.diff.unit_file_state.before == "disabled" and .diff.unit_file_state.after == "enabled" and (.changes | length > 0)' \
+  <<<"$en_applied" >/dev/null || fail "enable apply diff malformed: $en_applied"
+[ "$($HOST systemctl is-enabled mcpd-write-test.service)" = "enabled" ] ||
+  fail "unit not enabled after apply"
+# ...and back, exercising the reported rollback action.
+rpc units:write \
+  "$(call plan_change '{"action":"disable","unit":"mcpd-write-test.service"}')" \
+  "$(call apply_plan '{"plan":1}')" >/dev/null
+[ "$($HOST systemctl is-enabled mcpd-write-test.service)" = "disabled" ] ||
+  fail "unit not disabled after rollback apply"
+# Stale enablement plan: plan mask, mask out-of-band, apply must refuse.
+coproc SRV2 { $MCPD --grant units:write; }
+printf '%s\n' "$(call plan_change '{"action":"mask","unit":"mcpd-write-test.service"}')" >&"${SRV2[1]}"
+read -t 30 -r m_planned <&"${SRV2[0]}" || fail "no reply from server (mask plan)"
+m_id=$(jq -r '.result.content[0].text | fromjson | .plan' <<<"$m_planned")
+$HOST systemctl mask mcpd-write-test.service >/dev/null 2>&1
+printf '%s\n' "$(call apply_plan "{\"plan\":$m_id}")" >&"${SRV2[1]}"
+read -t 30 -r m_stale <&"${SRV2[0]}" || fail "no reply from server (mask apply)"
+jq -r '.result.content[0].text' <<<"$m_stale" | grep -qF "stale" ||
+  fail "stale enablement plan was not refused: $m_stale"
+kill "$SRV2_PID" 2>/dev/null || true
+$HOST systemctl unmask mcpd-write-test.service >/dev/null 2>&1
 
 $HOST bash -c 'rm -f /etc/systemd/system/mcpd-write-test.service && systemctl daemon-reload'
 

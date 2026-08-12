@@ -36,7 +36,7 @@ unknown scope is an error, not a warning.
 | `units:read`   | unit state, properties, timers, sockets, unit files, dependency edges, security analysis |
 | `journal:read` | journal entries, per unit                                |
 | `boot:read`    | boot phase timings, critical chain, blame                |
-| `units:write`  | unit state changes (start, stop, restart, reload), only through plan/apply |
+| `units:write`  | unit lifecycle and enablement changes, only through plan/apply |
 
 Scopes are independent. Grant `units:write` only where the agent is
 expected to operate the machine rather than inspect it.
@@ -99,8 +99,8 @@ Arguments and behavior:
 - `failed_units`, `list_timers`, `list_sockets`, `boot_blame`: no
   arguments.
 - `plan_change`: required `action` (`start`, `stop`, `restart`,
-  `reload`) and `unit`. Reads state and records a plan; executes
-  nothing.
+  `reload`, `enable`, `disable`, `mask`, `unmask`) and `unit`. Reads
+  state and records a plan; executes nothing.
 - `apply_plan`: required `plan`, an id from `plan_change`.
 
 On a host that has not finished booting, `boot_times` and
@@ -110,22 +110,29 @@ have started so far; that too mirrors systemd-analyze.
 
 ## Write path
 
-The write path covers unit state changes only.
+The write path covers unit lifecycle and enablement changes.
 
-- Only unit state changes: start, stop, restart, reload. Enablement
-  changes (enable, disable, mask) modify the filesystem and are not
-  implemented; see the roadmap.
+- Lifecycle actions (start, stop, restart, reload) operate on the
+  unit's active state; enablement actions (enable, disable, mask,
+  unmask) operate on its unit-file state. Each plan records, and each
+  apply re-checks, the state dimension its action changes.
 - Nothing executes at plan time. `plan_change` performs reads only.
-- `apply_plan` re-reads the unit's active state and compares it against
-  the state recorded at plan time. On mismatch the plan is discarded
-  with an error that says to re-plan. This is a precondition check, not
-  a lock: the window between the check and the systemctl invocation is
-  unguarded, exactly as it is for any other systemctl caller.
+- `apply_plan` compares the current state against the state recorded at
+  plan time. On mismatch the plan is discarded with an error directing
+  the client to re-plan. This is a precondition check, not a lock: the
+  window between the check and the systemctl invocation is unguarded,
+  as it is for any other systemctl caller.
+- The apply result reports the filesystem changes systemd printed
+  (symlink creations and removals for enablement actions) as `changes`.
+  systemctl has no dry run for enablement, so these appear in the apply
+  result, not in the plan.
 - Plans are single-use, exist only in server memory for the lifetime of
   the session, and are capped at 32 with oldest-first eviction.
 - Rollback is the inverse action, reported in both the plan and the
-  apply result: `stop` for `start`, `start` for `stop`, null for
-  `restart` and `reload`, which have no inverse.
+  apply result: start/stop and enable/disable invert each other, mask
+  inverts to unmask, and restart and reload report null. The predicted
+  state for unmask is null: the outcome depends on the unit's install
+  configuration.
 - Privileges are the invoking user's. An unprivileged user can plan
   anything but apply only what polkit permits; the refusal is
   systemctl's, passed through as a tool error.
@@ -223,8 +230,6 @@ needed; the hardening applies when you wrap the server in a service.
 - more varlink as systemd serves it: unit listing and boot timestamps
   are native today; journal reads and the analyze verbs still fork the
   CLIs because systemd offers no socket-served equivalent
-- enablement changes (enable, disable, mask) behind the same plan/apply
-  gate, with the unit-file diff shown in the plan
 
 ## License
 

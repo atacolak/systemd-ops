@@ -1,6 +1,6 @@
 [package]
 name = "systemd-mcpd"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A Model Context Protocol server for systemd. Capability-scoped; reads by default, writes only through plan/apply."
 license = "MIT"
