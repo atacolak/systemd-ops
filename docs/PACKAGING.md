@@ -40,7 +40,8 @@ make CARGOFLAGS="--release --locked --offline"
 |---|---|
 | `$(bindir)/systemd-mcpd` | the binary |
 | `$(man1dir)/systemd-mcpd.1` | the man page, with the version substituted into its `.TH` line |
-| `$(unitdir)/systemd-mcpd.service` | sample hardened unit |
+| `$(unitdir)/systemd-mcpd.socket` | socket unit, `Accept=yes`, mode 0600 |
+| `$(unitdir)/systemd-mcpd@.service` | hardened per-connection template |
 | `$(docdir)/` | README and the docs directory |
 | `$(licensedir)/LICENSE` | the license |
 
@@ -65,13 +66,20 @@ cargo vendor vendor/
 parse. That is below the declared MSRV, so any toolchain that can build
 this can read the lockfile.
 
-## The unit file is optional
+## The units are optional
 
 The usual deployment is an MCP client spawning the binary as a child
-process over stdio, which needs no unit file, no service, and no
-enablement. `systemd-mcpd.service` is a sample for the case where an
-operator wants the server supervised, and it should not be enabled by
-the package. It grants read scopes only.
+process over stdio, which needs no unit, no service, and no enablement.
+The socket unit is for operators who want a supervised instance
+instead, and the package should not enable it: it listens on
+`/run/systemd-mcpd.sock`, and anything that can open that socket gets
+the scopes the service grants. It grants read scopes only, and the
+socket is mode 0600.
+
+Do not add `%post` enablement, and do not widen `SocketMode=`.
+`systemd-mcpd@.service` is a template; `systemd-mcpd.socket`
+instantiates it per connection, so the socket is the unit an operator
+enables.
 
 ## Testing during a package build
 

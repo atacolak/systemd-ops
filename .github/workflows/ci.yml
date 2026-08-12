@@ -93,10 +93,16 @@ jobs:
         run: rustup update stable && rustup default stable
       - name: Build
         run: cargo build --release
-      - name: Verify unit file
+      - name: Verify units
+        # The socket unit is the one that gets enabled; the service is
+        # a template it instantiates per connection. Both the binary
+        # and the man page have to be in place first: verify resolves
+        # ExecStart= and follows Documentation=, and reports a missing
+        # either as a failure.
         run: |
           sudo cp target/release/systemd-mcpd /usr/local/bin/
-          systemd-analyze verify ./systemd-mcpd.service
+          sudo install -D -m 0644 systemd-mcpd.1 /usr/share/man/man1/systemd-mcpd.1
+          systemd-analyze verify ./systemd-mcpd.socket ./systemd-mcpd@.service
       - name: Live integration tests
         # Root, so the transient canary unit and the system journal are
         # reachable without group membership setup.

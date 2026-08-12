@@ -27,8 +27,9 @@ version. Do not convert them without also deciding who does the
 bumping.
 
 Packaging surface, kept in step with the code: `Makefile` (install
-targets), `systemd-mcpd.1` (man page), `systemd-mcpd.service` (sample
-unit), `CHANGELOG.md`, and `docs/PACKAGING.md`. A new flag or scope
+targets), `systemd-mcpd.1` (man page), `systemd-mcpd.socket` and
+`systemd-mcpd@.service` (the socket-activated pair), `CHANGELOG.md`,
+and `docs/PACKAGING.md`. A new flag or scope
 means updating the man page and the changelog too. `rust-version` in
 `Cargo.toml` is a promise to packagers and CI checks it in both
 directions, so raising it is a deliberate act, not a side effect.
@@ -130,6 +131,14 @@ them needs an image built for it (mkosi).
   2026-07-28. The pages that matter for a tools-only stdio server are
   `basic/index#meta`, `basic/versioning`, `server/discover`,
   `server/tools`, and `server/utilities/caching`.
+- **A unit for a stdio program must be socket-activated.** A plain
+  service reads EOF from `/dev/null` and exits 0 having done nothing,
+  which is what this repository shipped until it was tested. The pair
+  is `Accept=yes` plus a template with `StandardInput=socket`, and
+  `StandardError=journal` matters: stderr follows stdout otherwise, and
+  a diagnostic written into the protocol stream reaches the client as a
+  parse error. `systemd-analyze verify` follows `Documentation=man:`,
+  so CI installs the man page before it runs.
 - **The conformance suite is HTTP-only.** Server scenarios take a
   `--url`, so reaching a stdio server needs `tests/http-shim.py`. On
   npm, `latest` (0.1.16) has no 2026-07-28 server scenarios; the

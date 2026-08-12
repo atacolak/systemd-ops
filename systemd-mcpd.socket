@@ -1,0 +1,37 @@
+# Socket activation for systemd-mcpd.
+#
+# The server speaks line-delimited JSON-RPC on stdin and stdout. That
+# framing works unchanged over a stream socket, which the MCP transport
+# specification says in as many words, so the systemd-native way to
+# supervise this program is a per-connection socket unit rather than a
+# long-running service. Without one, a unit for a stdio program reads
+# EOF from /dev/null and exits before it has done anything.
+#
+# Not needed for the usual case, where an MCP client spawns the binary
+# itself and owns both ends of the pipe. This is for the case where
+# something on the machine wants to connect to a supervised, hardened
+# instance instead.
+#
+#     systemctl start systemd-mcpd.socket
+#     socat - UNIX-CONNECT:/run/systemd-mcpd.sock
+
+[Unit]
+Description=Model Context Protocol server for systemd (socket)
+Documentation=man:systemd-mcpd(1)
+
+[Socket]
+ListenStream=/run/systemd-mcpd.sock
+
+# One server instance per connection, with the connection on its
+# standard input and output.
+Accept=yes
+
+# Anything that can open this socket gets whatever scopes the service
+# grants. The default mode is 0666, which on a machine with other
+# users would hand all of them the ability to operate systemd, so say
+# 0600 and mean it. Widen it deliberately, to a group you trust, or not
+# at all.
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target

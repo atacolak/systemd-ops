@@ -1,12 +1,13 @@
-# systemd-mcpd: a hardened unit for the MCP server.
+# systemd-mcpd: one hardened server per connection.
 #
-# Sample unit for socket-activated or supervised use. When run as an MCP
-# stdio child by a client (the usual case), you don't need this file,
-# but the hardening below is the recommended posture if you wrap it.
+# A template, instantiated by systemd-mcpd.socket for each connection.
+# An MCP client that spawns the binary itself needs none of this; the
+# file is here for the case where an instance is supervised instead,
+# and for the hardening, which is worth copying either way.
 
 [Unit]
 Description=Model Context Protocol server for systemd (read-only grants)
-Documentation=https://modelcontextprotocol.io
+Documentation=man:systemd-mcpd(1)
 
 [Service]
 # Read scopes only. units:write is not granted here; add it only when
@@ -15,6 +16,14 @@ Documentation=https://modelcontextprotocol.io
 ExecStart=/usr/local/bin/systemd-mcpd --grant units:read,journal:read,boot:read
 DynamicUser=yes
 SupplementaryGroups=systemd-journal
+
+# The connection is the protocol stream. Diagnostics must not go to it:
+# stderr inherits stdout unless told otherwise, and a startup error
+# written into the stream would reach the client as a protocol parse
+# error rather than as the message it is.
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
 
 # Full hardening. This instance grants read scopes only, so nothing
 # here should hurt; if you grant units:write above, the hardening still
@@ -55,5 +64,5 @@ ProcSubset=pid
 # It creates no files. If a future version does, they are its own.
 UMask=0077
 
-[Install]
-WantedBy=multi-user.target
+# No [Install]: instances are started by systemd-mcpd.socket, which is
+# the unit to enable.

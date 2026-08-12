@@ -171,11 +171,26 @@ The server runs with the invoking user's privileges and no others.
 
 ## Deployment
 
-`systemd-mcpd.service` runs the server under `DynamicUser` with
-`ProtectSystem=strict`, a system-service syscall filter, and an empty
-capability bounding set. CI verifies the unit file. When an MCP client
-spawns the server directly (the common case), the unit file is not
-needed; the hardening applies when you wrap the server in a service.
+Normally an MCP client spawns the binary itself and owns both ends of
+the pipe, and no unit file is involved.
+
+For the case where you want a supervised instance on the machine
+instead, `systemd-mcpd.socket` and `systemd-mcpd@.service` provide one
+per connection. The framing is one JSON-RPC message per line over a
+stream, which works the same over a Unix socket as over a pipe, so the
+socket unit sets `Accept=yes` and each connection gets its own hardened
+instance under `DynamicUser` with an empty capability bounding set.
+
+```
+systemctl enable --now systemd-mcpd.socket
+socat - UNIX-CONNECT:/run/systemd-mcpd.sock
+```
+
+The socket is mode 0600. Anything that can open it gets the scopes the
+service grants, so widen that deliberately or not at all. A plain
+long-running service is the wrong shape for this program: with no
+client on the other end of stdin it reads EOF and exits before doing
+anything.
 
 ## Installing
 

@@ -69,15 +69,17 @@ install: build
 	chmod 0644 $(DESTDIR)$(man1dir)/systemd-mcpd.1
 	$(INSTALL) -d -m 0755 $(DESTDIR)$(unitdir)
 	sed 's,/usr/local/bin/systemd-mcpd,$(bindir)/systemd-mcpd,' \
-	    systemd-mcpd.service > $(DESTDIR)$(unitdir)/systemd-mcpd.service
-	chmod 0644 $(DESTDIR)$(unitdir)/systemd-mcpd.service
+	    systemd-mcpd@.service > $(DESTDIR)$(unitdir)/systemd-mcpd@.service
+	chmod 0644 $(DESTDIR)$(unitdir)/systemd-mcpd@.service
+	$(INSTALL) -D -m 0644 systemd-mcpd.socket $(DESTDIR)$(unitdir)/systemd-mcpd.socket
 	$(INSTALL) -D -m 0644 -t $(DESTDIR)$(docdir) $(DOCS)
 	$(INSTALL) -D -m 0644 LICENSE $(DESTDIR)$(licensedir)/LICENSE
 
 uninstall:
 	rm -f $(DESTDIR)$(bindir)/systemd-mcpd
 	rm -f $(DESTDIR)$(man1dir)/systemd-mcpd.1
-	rm -f $(DESTDIR)$(unitdir)/systemd-mcpd.service
+	rm -f $(DESTDIR)$(unitdir)/systemd-mcpd@.service
+	rm -f $(DESTDIR)$(unitdir)/systemd-mcpd.socket
 	rm -rf $(DESTDIR)$(docdir) $(DESTDIR)$(licensedir)
 
 clean:
