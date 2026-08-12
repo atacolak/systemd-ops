@@ -1,39 +1,42 @@
 # systemd-mcpd
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server for systemd.
-Read-only. Capability-scoped. Two dependencies. 579 KB.
+A [Model Context Protocol](https://modelcontextprotocol.io) server that
+exposes a read-only view of systemd to language-model agents. Written in
+Rust. Depends on serde and serde_json, nothing else.
 
-PID 1 as a tool call — but only the tools you explicitly handed over.
+Three rules, enforced in code:
 
-## Why
+1. Nothing is granted by default. The server refuses to start without
+   `--grant`. The authority handed to an agent is stated once, on the
+   command line, where it is visible in the process table.
+2. Scopes gate both visibility and execution. Tools outside the granted
+   scopes are not advertised in `tools/list` and are refused in
+   `tools/call`. Hiding a tool is presentation; refusing the call is the
+   control.
+3. There is no write path. A safe write path needs plan/apply/rollback
+   semantics; until it has them, mutation is not offered at all.
 
-Agents are starting to operate Linux machines. Today they do it by running
-shell commands and parsing human-oriented output, which means every agent
-session is a root shell with vibes. This server is an experiment in the
-alternative: a **typed, scoped, auditable** interface between a model and
-the init system.
+## Invocation
 
-Three positions, enforced in code:
-
-1. **Nothing is granted by default.** The server refuses to start without
-   `--grant`. Authority handed to a model should be a deliberate act that
-   appears in your process table, not a default someone forgot to narrow.
-2. **Scopes gate both visibility and execution.** Ungranted tools are not
-   advertised in `tools/list` *and* are refused in `tools/call`. Hiding a
-   tool is UX; refusing the call is security.
-3. **Read-only is structural, not configurable.** There are no write scopes
-   in v0.1. Not because writes are out of scope forever, but because a safe
-   write path needs plan/apply/rollback semantics — and shipping mutation
-   without them would be exactly the thing this project exists to argue
-   against.
-
-## Usage
-
-```console
-$ systemd-mcpd --grant units:read,journal:read,boot:read
+```
+systemd-mcpd --grant <scope>[,<scope>...]
+systemd-mcpd --help | --version
 ```
 
-Claude Desktop / any MCP client:
+The server speaks MCP (line-delimited JSON-RPC 2.0) on stdin/stdout,
+reads requests until EOF, and exits 0. Startup errors — no grant, an
+unknown scope, an unknown flag — go to stderr with exit status 1. An
+unknown scope is an error, not a warning.
+
+| Scope          | Grants                                                   |
+|----------------|----------------------------------------------------------|
+| `units:read`   | unit state, properties, timers, sockets, unit files, dependency edges, security analysis |
+| `journal:read` | journal entries, per unit                                |
+| `boot:read`    | boot phase timings, critical chain, blame                |
+
+Scopes are independent. Grant the subset you mean.
+
+MCP client configuration (any MCP client; Claude Desktop shown):
 
 ```json
 {
@@ -46,111 +49,147 @@ Claude Desktop / any MCP client:
 }
 ```
 
-Every scope is independent — grant less if you want less.
-
-Then ask your model: *"which units failed since boot, and why?"* — it will
-find `failed_units`, pull `unit_logs` for each, and answer from structured
-data instead of scraping `systemctl status` prose. Or *"what made boot
-slow?"* — that lands on `boot_times` and `critical_chain`.
-
-Note that `journal:read` sees exactly what the invoking user can read:
-run as a member of the `systemd-journal` group to read the full journal
-(the shipped unit file already arranges this).
-
 ## Tools
 
-| Tool                | Scope          | Does                                        |
+| Tool                | Scope          | Returns                                     |
 |---------------------|----------------|---------------------------------------------|
-| `list_units`        | `units:read`   | All loaded units, optional state filter     |
-| `failed_units`      | `units:read`   | Units currently failed                      |
+| `list_units`        | `units:read`   | Loaded units with load/active/sub state     |
+| `failed_units`      | `units:read`   | Units currently in the failed state         |
 | `unit_properties`   | `units:read`   | Full property set of one unit               |
-| `list_timers`       | `units:read`   | Timer units: schedules and what they run    |
-| `list_sockets`      | `units:read`   | Socket units: listeners and what they run   |
+| `list_timers`       | `units:read`   | Timer units: schedules and activated units  |
+| `list_sockets`      | `units:read`   | Socket units: listeners and activated units |
 | `list_unit_files`   | `units:read`   | Installed unit files and enablement state   |
 | `unit_dependencies` | `units:read`   | One unit's dependency edges, by relation    |
-| `unit_security`     | `units:read`   | systemd-analyze's exposure analysis of one unit |
-| `unit_logs`         | `journal:read` | Recent journal entries, optional priority filter |
-| `boot_times`        | `boot:read`    | Boot duration split by phase, in µs         |
+| `unit_security`     | `units:read`   | systemd-analyze exposure analysis of one unit |
+| `unit_logs`         | `journal:read` | Recent journal entries for one unit         |
+| `boot_times`        | `boot:read`    | Boot duration per phase, in microseconds    |
 | `critical_chain`    | `boot:read`    | Units that gated reaching a target at boot  |
 | `boot_blame`        | `boot:read`    | Units by own startup time, slowest first    |
 
-## Design notes
+Arguments and behavior:
 
-- **Backend:** the stable JSON interfaces of `systemctl --output=json` and
-  `journalctl -o json`. No libsystemd linkage, no D-Bus library: every call
-  the server makes is a plain, auditable process invocation, and the binary
-  survives systemd version skew the way the CLIs do.
-- **Native varlink where systemd serves it.** On systemd ≥ 258 unit listing
-  and boot timestamps talk straight to PID 1's varlink socket
-  (`io.systemd.Unit.List` and `io.systemd.Manager.Describe` on
-  `/run/systemd/io.systemd.Manager`, verified against the v261.2 interface
-  definitions) — spoken by ~150 lines of stdlib `UnixStream`, no varlink
-  crate. The probe is the `connect()` itself: any surprise — no socket, old
-  systemd, unfamiliar reply shape — falls back to `systemctl` silently,
-  with the same JSON shape either way, so the caller never learns which
-  backend answered. Journal reads stay on `journalctl` deliberately: the
-  varlink journal API (`io.systemd.JournalAccess`, systemd 260) is served
-  by exec'ing journalctl, not by a socket, so it would spawn the same
-  process for a worse interface.
-- **No async runtime.** MCP's stdio transport is line-delimited JSON-RPC on
-  a pipe. A blocking read loop is the honest shape of that; tokio would be
-  most of the binary for none of the benefit.
-- **Input validation before argv.** Unit names are checked against the unit
-  name grammar before touching an argument list — not because `Command` is
-  shell-injectable (it isn't), but because a model deserves a precise error
-  over a confusing one, and defense in depth is free here.
-- **Journal entries are pruned** to timestamp/priority/message/pid. Handing
-  a model forty metadata fields per line is how context windows die. What
-  survives is typed: RFC 3339 timestamps, integer priority and pid.
-- **Two prose parsers, fenced.** `critical_chain` and `boot_blame` are the
-  only tools with no machine-readable source anywhere in systemd — not
-  D-Bus, not varlink, not `--output=json`. Each is parsed by a pure
-  function with tests over captured output, and each gets deleted the day
-  systemd grows a structured equivalent. Everything else is JSON or
-  `Key=Value` at the source — `unit_dependencies` reads dependency edges
-  from unit properties rather than scraping `list-dependencies`' tree
-  drawing, and `boot_times` reads the manager timestamps `systemd-analyze
-  time` reads.
+- `list_units`: optional `state`, one of `active`, `inactive`, `failed`,
+  `activating`, `deactivating`. Matches the unit's active state. The
+  filter is applied by the server, identically over both backends.
+- `unit_properties`, `unit_dependencies`, `unit_security`: required
+  `unit`. Unit names are validated against the unit-name character set
+  before they reach an argument list; malformed names are refused with
+  an error naming the input.
+- `list_unit_files`: optional `state`, an enablement state (`enabled`,
+  `static`, `masked`, `generated`, ...). Compared by equality; unit-file
+  states are version-dependent, so an unknown value matches nothing
+  rather than erroring.
+- `unit_logs`: required `unit`; optional `lines` (1..1000, default 50)
+  and `priority` (0..7; returns entries at that syslog priority or more
+  severe). Entries carry `timestamp` (RFC 3339 UTC), `priority` and
+  `pid` as integers, and `message` verbatim — it can legitimately be a
+  byte array for non-UTF-8 payloads.
+- `critical_chain`: optional `unit`, analyzing the chain to that unit
+  instead of the default target. Timespans are returned verbatim
+  ("1min 30.5s"); the server does not reinterpret systemd's formatting.
+- `boot_times`: no arguments. Phases that did not occur (no EFI, no
+  initrd) are omitted rather than reported as zero.
+- `failed_units`, `list_timers`, `list_sockets`, `boot_blame`: no
+  arguments.
+
+On a host that has not finished booting, `boot_times` and
+`critical_chain` return a "not yet finished" error, mirroring
+systemd-analyze. `boot_blame` may answer anyway with the units that
+have started so far; that too mirrors systemd-analyze.
+
+## Errors
+
+Failures travel on two channels, and the distinction is deliberate:
+
+- Invalid arguments — missing `unit`, out-of-range `priority`, unknown
+  `state` — are JSON-RPC protocol errors, code -32602.
+- Backend failures — a systemctl exit status, an unreachable manager,
+  bootup not finished — are tool results with `isError: true` carrying
+  the backend's message. The session continues; the model reads the
+  error and reacts.
+
+## Permissions
+
+The server holds no privileges of its own; it sees exactly what the
+invoking user can see.
+
+- `units:read`, `boot:read`: PID 1's varlink socket is
+  world-connectable and systemctl works unprivileged. No setup needed.
+- `journal:read`: the journal is read with the invoking user's access.
+  Reading the full system journal requires membership in the
+  `systemd-journal` group; the shipped unit file arranges this.
+
+## Backends
+
+The primary interfaces are the stable machine formats of the systemd
+CLIs: `systemctl --output=json`, `systemctl show` (`Key=Value`), and
+`journalctl --output=json`. There is no libsystemd linkage and no D-Bus
+library; every backend call is a plain process invocation, and the
+binary tolerates systemd version skew the way the CLIs do.
+
+On systemd >= 258, unit listing and boot timestamps use PID 1's varlink
+socket directly (`io.systemd.Unit.List` and `io.systemd.Manager.Describe`
+on `/run/systemd/io.systemd.Manager`, verified against the v261.2
+interface definitions). The client is ~150 lines over stdlib
+`UnixStream`; no varlink crate. The probe is the `connect()` itself:
+any failure — no socket, older systemd, an error reply, an unfamiliar
+reply shape — falls back to the CLI silently. Both backends are
+normalized to the same output shape and the caller cannot tell which
+one answered; the state filter is applied after either backend so the
+filter semantics cannot diverge.
+
+Journal reads stay on journalctl deliberately. The varlink journal API
+(`io.systemd.JournalAccess`, systemd 260) is served by executing
+journalctl, not by a bound socket, so calling it would spawn the same
+process for a less capable interface.
+
+Two tools have no machine-readable source anywhere in systemd — not
+D-Bus, not varlink, not `--output=json`: `critical_chain` and
+`boot_blame`. Their prose output is parsed by pure functions with tests
+over captured output; those parsers are to be deleted when systemd
+grows structured equivalents. `unit_dependencies` is not in that group:
+it reads dependency edges from unit properties instead of scraping the
+`list-dependencies` tree rendering.
+
+There is no async runtime. The stdio transport is a pipe read in a
+blocking loop; an executor would add binary size and nothing else.
 
 ## Building
 
-```console
-$ cargo build --release
 ```
-
-Dependencies: `serde`, `serde_json`. That's the list.
+cargo build --release
+```
 
 ## Testing
 
-`cargo test` covers the protocol and the parsers. CI goes further: every
-push drives the real binary against two live systemds —
+`cargo test` covers the protocol layer and the parsers. CI additionally
+runs the binary against two live systemds on every push:
 
-- **the GitHub runner itself** (systemd 255, a real VM with PID 1): all
-  six tools end to end, including a transient canary unit whose log line
-  must round-trip through `unit_logs`, plus `systemd-analyze verify` on
-  the shipped unit file;
-- **a Fedora container booted with systemd ≥ 258 as PID 1**: the varlink
-  backend, proven the honest way — `systemctl` is deleted from the host,
-  so if `list_units` still answers, only the socket could have answered —
-  followed by a differential check that both backends emit the same shape.
+- the GitHub runner itself (systemd 255, PID 1, live journal): every
+  tool end to end over the CLI backend, including a transient canary
+  unit whose log line must round-trip through `unit_logs`, and
+  `systemd-analyze verify` of the shipped unit file;
+- a Fedora container booted with systemd >= 258 as PID 1: the varlink
+  backend. The proof deletes systemctl inside the container — if
+  `list_units` and `boot_times` still answer, only the socket could
+  have — and a differential check asserts both backends emit identical
+  row shapes.
 
 ## Deployment
 
-`systemd-mcpd.service` ships with the full hardening buffet
-(`DynamicUser`, `ProtectSystem=strict`, syscall filtering, empty capability
-bounding set). systemd confining the thing that talks to systemd is not
-irony, it's layering.
+`systemd-mcpd.service` runs the server under `DynamicUser` with
+`ProtectSystem=strict`, a system-service syscall filter, and an empty
+capability bounding set. CI verifies the unit file. When an MCP client
+spawns the server directly (the common case), the unit file is not
+needed; the hardening applies when you wrap the server in a service.
 
 ## Roadmap
 
-- more varlink as systemd grows it: unit listing and boot timestamps are
-  native today; journal reads and the analyze verbs still fork the CLIs
-  because systemd serves them no other way (`io.systemd.JournalAccess`
-  exists since systemd 260, but it is exec-served by journalctl, not a
-  socket)
-- the hard one: a write path with plan/apply semantics, structured diffs,
-  and generation rollback. If that sentence sounds like a config management
-  manifesto, yes. That's the point.
+- more varlink as systemd serves it: unit listing and boot timestamps
+  are native today; journal reads and the analyze verbs still fork the
+  CLIs because systemd offers no socket-served equivalent
+- a write path with plan/apply semantics, structured diffs, and
+  rollback — not before those semantics exist
 
 ## License
 
