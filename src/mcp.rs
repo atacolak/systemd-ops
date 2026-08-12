@@ -541,12 +541,23 @@ pub fn serve(input: impl BufRead, mut output: impl Write, grants: &Grants) -> st
         // The era is a property of the request, not of the connection.
         // A declared protocol version means the modern era; its absence
         // means a client that opened, or will open, with `initialize`.
-        let declared = params
-            .get("_meta")
+        let meta = params.get("_meta");
+        let declared = meta
             .and_then(|meta| meta.get(META_VERSION))
             .and_then(Value::as_str);
+        // Client capabilities are a modern field, so a request carrying
+        // them without a version is a broken modern request rather than
+        // a legacy one. Serving it under the older semantics would hide
+        // the client's mistake behind an answer that looks fine.
+        let modern_but_versionless =
+            declared.is_none() && meta.is_some_and(|m| m.get(META_CLIENT_CAPABILITIES).is_some());
 
         let reply = match declared {
+            _ if modern_but_versionless => error_reply(
+                id,
+                -32602,
+                &format!("missing required _meta field: {META_VERSION}"),
+            ),
             Some(version) if !MODERN_VERSIONS.contains(&version) => {
                 unsupported_version_reply(id, version)
             }
@@ -861,6 +872,31 @@ mod tests {
         assert_eq!(replies[0]["error"]["code"], json!(-32602));
         let msg = replies[0]["error"]["message"].as_str().unwrap();
         assert!(msg.contains(META_CLIENT_CAPABILITIES), "got: {msg}");
+    }
+
+    #[test]
+    fn a_versionless_modern_request_is_not_served_as_legacy() {
+        // Found by the conformance suite: a request carrying client
+        // capabilities has declared itself modern, so a missing version
+        // is a malformed request, not an invitation to answer under the
+        // handshake semantics.
+        let grants = Grants::from_args("units:read").unwrap();
+        let replies = exchange(
+            &grants,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{"_meta":{{"{META_CLIENT_CAPABILITIES}":{{}}}}}}}}"#
+            ),
+        );
+        assert_eq!(replies[0]["error"]["code"], json!(-32602));
+        let msg = replies[0]["error"]["message"].as_str().unwrap();
+        assert!(msg.contains(META_VERSION), "got: {msg}");
+        // A legacy request with an unrelated _meta key is still legacy:
+        // progressToken predates the modern fields.
+        let replies = exchange(
+            &grants,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"progressToken":7}}}"#,
+        );
+        assert!(replies[0]["result"]["tools"].is_array());
     }
 
     #[test]

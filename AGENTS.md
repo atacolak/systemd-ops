@@ -119,6 +119,12 @@ them needs an image built for it (mkosi).
   2026-07-28. The pages that matter for a tools-only stdio server are
   `basic/index#meta`, `basic/versioning`, `server/discover`,
   `server/tools`, and `server/utilities/caching`.
+- **The conformance suite is HTTP-only.** Server scenarios take a
+  `--url`, so reaching a stdio server needs `tests/http-shim.py`. On
+  npm, `latest` (0.1.16) has no 2026-07-28 server scenarios; the
+  0.2.0 prereleases do. Most failures against this server are the
+  shim's HTTP status codes or primitives it does not implement, so
+  read the check names rather than the totals.
 
 ## Prose
 
