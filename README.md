@@ -227,9 +227,13 @@ needed; the hardening applies when you wrap the server in a service.
 
 ## Roadmap
 
-- more varlink as systemd serves it: unit listing and boot timestamps
-  are native today; journal reads and the analyze verbs still fork the
-  CLIs because systemd offers no socket-served equivalent
+The remaining work tracks systemd's varlink subsystem. Unit listing and
+boot timestamps are native today; journal reads and the analyze verbs
+still fork the CLIs because systemd offers no socket-served equivalent.
+As systemd extends its varlink interfaces, the corresponding CLI
+invocations here are planned to be replaced with socket calls behind
+the existing probe-and-fall-back mechanism, keeping the output shapes
+unchanged.
 
 ## License
 
