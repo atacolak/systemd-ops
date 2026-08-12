@@ -129,9 +129,11 @@ Stated because the alternative is that someone finds them by being bitten.
   the difference between a message that was withheld and an entry that
   had none.
 
-The last four came from pointing language-model agents at a live server
-and asking them to break it, which found more in an afternoon than the
-scripted suites had in a week. The first four were already known.
+The last four came out of an adversarial pass against a live server:
+thousands of generated calls, hostile journal content, and every tool
+driven with arguments its schema forbids. That found more in an
+afternoon than the scripted suites had in a week. The first four were
+already known.
 
 ## Error channels
 
