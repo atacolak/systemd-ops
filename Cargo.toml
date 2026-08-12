@@ -2,10 +2,21 @@
 name = "systemd-mcpd"
 version = "0.6.0"
 edition = "2021"
+# Verified in CI, both directions: 1.82 builds, 1.81 does not, because
+# Option::is_none_or stabilized in 1.82.
+rust-version = "1.82"
 description = "A Model Context Protocol server for systemd. Capability-scoped; reads by default, writes only through plan/apply."
 license = "MIT"
 repository = "https://github.com/rhaist/systemd-mcpd"
+homepage = "https://github.com/rhaist/systemd-mcpd"
+documentation = "https://github.com/rhaist/systemd-mcpd/blob/main/docs/TOOLS.md"
 readme = "README.md"
+keywords = ["systemd", "mcp", "model-context-protocol", "journald", "sysadmin"]
+categories = ["command-line-utilities", "os::linux-apis"]
+# The published crate is the buildable source and its documentation.
+# The test tiers pull QEMU images and boot guests, which nobody
+# unpacking a crate wants; they live in the repository.
+exclude = ["/tests", "/.github", "/.claude"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

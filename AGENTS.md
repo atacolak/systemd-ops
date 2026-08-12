@@ -20,6 +20,13 @@ that survives review.
 | `src/varlink.rs` | varlink client for PID 1's socket                        |
 | `src/write.rs`   | plan/apply state machine                                 |
 
+Packaging surface, kept in step with the code: `Makefile` (install
+targets), `systemd-mcpd.1` (man page), `systemd-mcpd.service` (sample
+unit), `CHANGELOG.md`, and `docs/PACKAGING.md`. A new flag or scope
+means updating the man page and the changelog too. `rust-version` in
+`Cargo.toml` is a promise to packagers and CI checks it in both
+directions, so raising it is a deliberate act, not a side effect.
+
 ## Invariants
 
 - **Scopes gate twice.** A tool absent from `tools/list` must also be

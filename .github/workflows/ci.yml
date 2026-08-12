@@ -25,6 +25,35 @@ jobs:
       - name: Release build
         run: cargo build --release
 
+  # The declared MSRV is a promise to downstream packagers, so it is
+  # checked in both directions: the floor must build, and the version
+  # below it must not. A floor that silently rises is worse than a high
+  # one, and one that could be lowered should be.
+  msrv:
+    name: MSRV (rust-version in Cargo.toml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read the declared floor
+        id: msrv
+        run: |
+          version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          [ -n "$version" ] || { echo "::error::no rust-version in Cargo.toml"; exit 1; }
+          below=$(echo "$version" | awk -F. '{print $1 "." $2 - 1}')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "below=$below" >> "$GITHUB_OUTPUT"
+      - name: Build at the floor
+        run: |
+          rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
+          cargo +${{ steps.msrv.outputs.version }} build --release --locked
+      - name: The version below must fail
+        run: |
+          rustup toolchain install ${{ steps.msrv.outputs.below }} --profile minimal
+          if cargo +${{ steps.msrv.outputs.below }} build --release --locked; then
+            echo "::error::builds on ${{ steps.msrv.outputs.below }}; lower rust-version"
+            exit 1
+          fi
+
   # The runner itself is a real systemd host: a full VM with PID 1
   # systemd (255 on ubuntu-24.04) and a live journal. That exercises the
   # CLI backend of every tool end to end, including the fallback path,

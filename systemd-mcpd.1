@@ -1,0 +1,119 @@
+.TH SYSTEMD\-MCPD 1 "2026-08-12" "systemd-mcpd" "User Commands"
+.SH NAME
+systemd\-mcpd \- Model Context Protocol server exposing systemd
+.SH SYNOPSIS
+.B systemd\-mcpd
+.BI \-\-grant " scope" [, scope ...]
+.br
+.B systemd\-mcpd
+.RB [ \-\-help | \-\-version ]
+.SH DESCRIPTION
+.B systemd\-mcpd
+serves the Model Context Protocol over stdin and stdout, exposing a
+capability\-scoped view of systemd to a language\-model client: unit
+state, unit properties, timers, sockets, unit files, dependency edges,
+journal entries, boot timings, and, where granted, unit lifecycle and
+enablement changes.
+.PP
+The transport is line\-delimited JSON\-RPC 2.0. The server reads
+requests until end of file and exits 0. It is normally started by an
+MCP client as a child process rather than run interactively.
+.PP
+Nothing is exposed by default. The server refuses to start unless
+.B \-\-grant
+names at least one scope. Tools outside the granted scopes are neither
+advertised nor callable.
+.PP
+Data comes from PID 1's varlink socket where available (systemd 258 and
+later) and from
+.BR systemctl (1),
+.BR journalctl (1)
+and
+.BR systemd\-analyze (1)
+otherwise. The reply is the same either way.
+.SH OPTIONS
+.TP
+.BI \-\-grant " scope" [, scope ...]
+Grant capability scopes, comma separated. Required. An unknown scope is
+an error, not a warning.
+.TP
+.BR \-h ", " \-\-help
+Print usage and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.SH SCOPES
+.TP
+.B units:read
+Unit state, properties, timers, sockets, unit files, dependency edges,
+and the sandboxing exposure analysis of one unit.
+.TP
+.B journal:read
+Journal entries for one unit, and the boots recorded in the journal.
+.TP
+.B boot:read
+Boot phase timings, the critical chain, and per\-unit startup times.
+.TP
+.B units:write
+Unit lifecycle (start, stop, restart, reload), enablement (enable,
+disable, mask, unmask) and log\-control changes. Every change is planned
+first and applied by plan identifier; an apply is refused if the state
+changed since the plan was made.
+.PP
+Scopes are independent. Granting
+.B units:write
+grants no read scope, and neither implies the other.
+.SH EXIT STATUS
+.TP
+.B 0
+The client closed the connection.
+.TP
+.B 1
+No scope was granted, an argument was unknown, or the streams failed.
+.SH SECURITY
+The server runs with the privileges of the process that started it and
+acquires no others. It is not setuid and does not read the environment
+for configuration. An unprivileged instance can plan any change but
+apply only what
+.BR polkit (8)
+permits; the refusal is systemctl's, passed through unchanged.
+.PP
+Reading the complete system journal requires membership in the
+.B systemd\-journal
+group. The shipped unit file arranges this and runs the server under
+.BR DynamicUser= .
+.SH FILES
+.TP
+.I /usr/lib/systemd/system/systemd\-mcpd.service
+Sample hardened unit. Not required when an MCP client spawns the server
+directly, which is the usual case.
+.TP
+.I /run/systemd/io.systemd.Manager
+PID 1's varlink socket, used where present.
+.SH EXAMPLES
+Read\-only, as an MCP client would start it:
+.PP
+.RS 4
+.EX
+systemd\-mcpd \-\-grant units:read,journal:read,boot:read
+.EE
+.RE
+.PP
+Read and change unit state:
+.PP
+.RS 4
+.EX
+systemd\-mcpd \-\-grant units:read,units:write
+.EE
+.RE
+.SH SEE ALSO
+.BR systemctl (1),
+.BR journalctl (1),
+.BR systemd\-analyze (1),
+.BR systemd.service (5)
+.PP
+Protocol and tool reference:
+.UR https://github.com/rhaist/systemd-mcpd
+.UE
+.SH AUTHOR
+Robert Haist.

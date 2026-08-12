@@ -177,6 +177,18 @@ capability bounding set. CI verifies the unit file. When an MCP client
 spawns the server directly (the common case), the unit file is not
 needed; the hardening applies when you wrap the server in a service.
 
+## Installing
+
+```
+make
+sudo make prefix=/usr/local install
+```
+
+This installs the binary, the man page, the sample unit file, the docs
+and the license, and honors `DESTDIR` and the usual directory
+variables. Packagers: [docs/PACKAGING.md](docs/PACKAGING.md) has the
+toolchain floor, the offline build, and what is deliberately absent.
+
 ## Documentation
 
 - [docs/TOOLS.md](docs/TOOLS.md): every tool's arguments and reply shape
@@ -184,6 +196,9 @@ needed; the hardening applies when you wrap the server in a service.
   path guarantees, roadmap
 - [docs/TESTING.md](docs/TESTING.md): the three test tiers and the
   conformance suite
+- [docs/PACKAGING.md](docs/PACKAGING.md): what a distribution packager
+  needs
+- [CHANGELOG.md](CHANGELOG.md): what changed per version
 - [AGENTS.md](AGENTS.md): working notes for coding agents
 
 ## License

@@ -1,0 +1,66 @@
+# Release: publish a source tarball a packager can pin.
+#
+# GitHub generates its own tarball for every tag, but that one is
+# produced on demand and its checksum has moved in the past, which is a
+# problem for any package that records a hash. This workflow uploads a
+# tarball built once, with its checksum, plus a vendored copy of the
+# dependency tree for builds that cannot reach the network.
+#
+# No third-party actions, same as CI.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # A tag that disagrees with Cargo.toml means the version bump was
+      # forgotten. Better to fail here than to ship a tarball whose
+      # --version output contradicts its name.
+      - name: Tag matches Cargo.toml
+        run: |
+          tag=${GITHUB_REF_NAME#v}
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$tag" = "$crate" ] || {
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          }
+
+      - name: Gates
+        run: |
+          rustup update stable && rustup default stable
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+
+      - name: Source tarball
+        run: |
+          name=systemd-mcpd-${GITHUB_REF_NAME#v}
+          git archive --format=tar --prefix="$name/" HEAD | gzip -9n > "$name.tar.gz"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      # Vendored dependencies, for distributions that build offline.
+      # Includes the config cargo needs to use it.
+      - name: Vendor tarball
+        run: |
+          name=systemd-mcpd-${GITHUB_REF_NAME#v}
+          cargo vendor --locked vendor > vendor-config.toml
+          tar -czf "$name-vendor.tar.gz" vendor vendor-config.toml
+          sha256sum "$name-vendor.tar.gz" > "$name-vendor.tar.gz.sha256"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "See CHANGELOG.md for what changed." \
+            systemd-mcpd-*.tar.gz systemd-mcpd-*.tar.gz.sha256
