@@ -118,31 +118,59 @@ pub(crate) fn validate_unit_name(name: &str) -> Result<(), BackendError> {
     }
 }
 
-/// Runs a command and returns its stdout, or a `BackendError` carrying the
-/// exit status and stderr. Every process this server spawns goes through
-/// here: one place to audit, one place that pins the environment (no pager,
-/// no color — we are parsing this output, not reading it).
-fn run_output(program: &str, args: &[&str]) -> Result<std::process::Output, BackendError> {
-    let output = Command::new(program)
+/// Spawns a command and returns its output whatever the exit status.
+/// Every process this server spawns goes through here: one place to
+/// audit, one place that pins the environment (no pager, no color — we
+/// are parsing this output, not reading it).
+fn spawn(program: &str, args: &[&str]) -> Result<std::process::Output, BackendError> {
+    Command::new(program)
         .args(args)
         .env("SYSTEMD_PAGER", "cat")
         .env("SYSTEMD_COLORS", "false")
         .output()
-        .map_err(|e| BackendError(format!("failed to run {program}: {e}")))?;
+        .map_err(|e| BackendError(format!("failed to run {program}: {e}")))
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(BackendError(format!(
-            "{program} exited with {}: {}",
-            output.status,
-            stderr.trim()
-        )));
+fn exit_error(program: &str, output: &std::process::Output) -> BackendError {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    BackendError(format!(
+        "{program} exited with {}: {}",
+        output.status,
+        stderr.trim()
+    ))
+}
+
+/// Runs a command and returns its output, or a `BackendError` carrying
+/// the exit status and stderr.
+fn run_output(program: &str, args: &[&str]) -> Result<std::process::Output, BackendError> {
+    let output = spawn(program, args)?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(exit_error(program, &output))
     }
-    Ok(output)
 }
 
 fn run(program: &str, args: &[&str]) -> Result<Vec<u8>, BackendError> {
     run_output(program, args).map(|output| output.stdout)
+}
+
+/// Runs a journal query, treating "no entries matched" as an empty
+/// result rather than a failure.
+///
+/// journalctl exits 1 when a filter (`--grep`, a time window) selects
+/// nothing, which is an ordinary answer to a search. That case is
+/// distinguishable: exit 1 with both streams empty, where a real
+/// failure writes a message to stderr.
+fn run_journal_query(program: &str, args: &[&str]) -> Result<Vec<u8>, BackendError> {
+    let output = spawn(program, args)?;
+    let no_matches =
+        output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty();
+    if output.status.success() || no_matches {
+        Ok(output.stdout)
+    } else {
+        Err(exit_error(program, &output))
+    }
 }
 
 /// Runs a command and parses its stdout as JSON.
@@ -503,7 +531,7 @@ pub fn unit_logs(name: &str, filter: &LogFilter) -> Result<Value, BackendError> 
         args.push(format!("--grep={grep}"));
     }
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let stdout = run("journalctl", &arg_refs)?;
+    let stdout = run_journal_query("journalctl", &arg_refs)?;
 
     let text = String::from_utf8_lossy(&stdout);
     let entries: Vec<Value> = text

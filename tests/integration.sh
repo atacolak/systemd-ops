@@ -133,6 +133,13 @@ tool journal:read unit_logs '{"unit":"mcpd-canary.service","since":"-2min","boot
   fail "since/boot/grep filters lost the canary"
 tool journal:read unit_logs '{"unit":"mcpd-canary.service","since":"+1min"}' |
   jq -e '.entries | length == 0' >/dev/null || fail "future since window returned entries"
+# A filter that matches nothing is an empty result, not an error:
+# journalctl exits 1 for "no entries matched", which must not surface
+# as a tool failure. `tool` fails the run if isError is true.
+tool journal:read unit_logs '{"unit":"mcpd-canary.service","grep":"zzz-no-such-string-zzz"}' |
+  jq -e '.entries | length == 0' >/dev/null || fail "no-match grep was not an empty result"
+# ...while a genuine journalctl failure still reports isError.
+expect_error journal:read unit_logs '{"unit":"mcpd-canary.service","boot":999}' "journalctl"
 tool journal:read list_boots '{}' |
   jq -e 'type == "array" and length >= 1' >/dev/null || fail "list_boots empty"
 # ...and the priority filter reaches journalctl: the canary logged at
