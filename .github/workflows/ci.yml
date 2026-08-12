@@ -30,14 +30,39 @@ jobs:
         run: cargo test
       - name: Release build
         run: cargo build --release
-      - name: Man page
+      - name: Documentation matches the code
         # groff -ww is the check Debian runs as
         # manpage-has-errors-from-man; lexgrog decides whether apropos
-        # can index the page at all. The script also compares the
-        # documented scopes and flags against the built binary.
+        # can index the page at all. The script also holds the man page
+        # and the README table against the binary and the registry.
         run: |
           sudo apt-get install -y -qq groff man-db
-          MCPD=target/release/systemd-mcpd bash tests/manpage.sh
+          MCPD=target/release/systemd-mcpd bash tests/docs.sh
+
+      # What a packager runs. Neither was gated, so a renamed file would
+      # have broken `make install` and surfaced downstream rather than
+      # here.
+      - name: Staged install
+        run: |
+          make DESTDIR=/tmp/stage prefix=/usr install
+          for f in /tmp/stage/usr/bin/systemd-mcpd \
+                   /tmp/stage/usr/share/man/man1/systemd-mcpd.1 \
+                   /tmp/stage/usr/lib/systemd/system/systemd-mcpd.socket \
+                   /tmp/stage/usr/lib/systemd/system/systemd-mcpd@.service \
+                   /tmp/stage/usr/share/licenses/systemd-mcpd/LICENSE; do
+            [ -e "$f" ] || { echo "::error::make install did not produce $f"; exit 1; }
+          done
+          # The ExecStart rewrite is the part with no other check.
+          grep -q '^ExecStart=/usr/bin/systemd-mcpd ' \
+            /tmp/stage/usr/lib/systemd/system/systemd-mcpd@.service ||
+            { echo "::error::install did not rewrite ExecStart to bindir"; exit 1; }
+          make DESTDIR=/tmp/stage prefix=/usr uninstall
+          ! find /tmp/stage -name 'systemd-mcpd*' | grep -q . ||
+            { echo "::error::uninstall left files behind"; exit 1; }
+      - name: Crate packages
+        # Publishing is not automated, but a crate that cannot be built
+        # from its own tarball is a bad surprise to find at that moment.
+        run: cargo package --locked
 
   # The declared MSRV is a promise to downstream packagers, so it is
   # checked in both directions: the floor must build, and the version

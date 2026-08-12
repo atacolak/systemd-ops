@@ -114,9 +114,12 @@ jq -e 'map(.unit) | index("systemd-journald.service")' <<<"$matched" >/dev/null 
   fail "journald lost by the systemd-*.service pattern"
 # Both filters at once, and a pattern matching nothing is an empty
 # answer rather than an error.
+# `all` over an empty array is true, so the length check is what stops
+# this passing on a filter that wrongly returned nothing. Any host
+# running systemd has active sockets.
 tool units:read list_units '{"pattern":"*.socket","state":"active"}' |
-  jq -e 'all(.[]; (.unit | endswith(".socket")) and .active == "active")' >/dev/null ||
-  fail "list_units state+pattern filters leaked rows"
+  jq -e 'length > 0 and all(.[]; (.unit | endswith(".socket")) and .active == "active")' >/dev/null ||
+  fail "list_units state+pattern filters leaked rows or matched nothing"
 tool units:read list_units '{"pattern":"zzz-no-such-unit-zzz*"}' |
   jq -e 'length == 0' >/dev/null || fail "no-match pattern did not return an empty array"
 expect_error units:read list_units '{"pattern":""}' "pattern must be"
@@ -139,11 +142,17 @@ echo "== list_timers / list_sockets / list_unit_files"
 timers=$(tool units:read list_timers '{}')
 jq -e 'type == "array"' <<<"$timers" >/dev/null || fail "list_timers not an array"
 # Timestamps are RFC 3339, not raw microseconds, and the fields
-# systemctl fills in inconsistently (left, passed) are gone.
-jq -e 'all(.[]; has("unit") and has("activates") and has("next") and has("last")
-             and (has("left") | not) and (has("passed") | not)
-             and (.next == null or (.next | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*Z$"))))' \
-  <<<"$timers" >/dev/null || fail "list_timers rows malformed: $(jq -c '.[0]' <<<"$timers")"
+# systemctl fills in inconsistently (left, passed) are gone. A host
+# with no timers at all would satisfy `all` vacuously, so say when the
+# check did not run rather than reporting a pass it did not earn.
+if [ "$(jq length <<<"$timers")" -gt 0 ]; then
+  jq -e 'all(.[]; has("unit") and has("activates") and has("next") and has("last")
+               and (has("left") | not) and (has("passed") | not)
+               and (.next == null or (.next | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*Z$"))))' \
+    <<<"$timers" >/dev/null || fail "list_timers rows malformed: $(jq -c '.[0]' <<<"$timers")"
+else
+  echo "   (no timers on this host: the row-shape check did not run)"
+fi
 tool units:read list_timers '{"pattern":"zzz-no-such-timer-zzz*"}' |
   jq -e 'length == 0' >/dev/null || fail "list_timers pattern not applied"
 tool units:read list_sockets '{}' |

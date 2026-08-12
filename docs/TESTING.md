@@ -14,20 +14,29 @@ Three tiers, in cost order, plus the conformance suite.
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-MCPD=target/release/systemd-mcpd bash tests/manpage.sh
+MCPD=target/release/systemd-mcpd bash tests/docs.sh
 ```
 
 `make check` runs all of them.
 
-The man page check is three things: `groff -mandoc -ww -z`, which is
-what Debian runs as `manpage-has-errors-from-man`; `lexgrog`, which
-decides whether `apropos` can index the page; and a comparison of the
-scopes and long options in the page against the ones the built binary
-reports in `--help`, in both directions. The last is the point. Bad
-roff is loud, but a page that documents a flag the binary dropped is
-silent, and the person who finds out is a user or a packager. It needs
-groff and lexgrog, and skips itself under `make check` if they are
-absent.
+`tests/docs.sh` holds the documentation against the code, in four
+parts: `groff -mandoc -ww -z`, which is what Debian runs as
+`manpage-has-errors-from-man`; `lexgrog`, which decides whether
+`apropos` can index the page; a comparison of the scopes and long
+options in the man page against what the built binary reports in
+`--help`, in both directions; and a comparison of the README tool
+table, names and scopes, against the registry in `src/mcp.rs`, plus a
+check that every tool has an entry in `TOOLS.md`.
+
+The comparisons are the point. Bad roff is loud, but a page that
+documents a flag the binary dropped, or a table that advertises a tool
+under the wrong scope, is silent, and the person who finds out is a
+user. It needs groff and lexgrog, and skips itself under `make check`
+if they are absent.
+
+CI also runs a staged `make install` and `cargo package`: both
+are things only a packager exercises, so nothing else would notice a
+renamed file until it reached one.
 
 ## Live suites
 
@@ -35,13 +44,15 @@ CI runs the binary against two live systemds on every push:
 
 - the GitHub runner itself (systemd 255, PID 1, live journal): every
   tool end to end over the CLI backend, including a transient canary
-  unit whose log line must round-trip through `unit_logs`, and
-  `systemd-analyze verify` of the shipped unit file;
+  unit whose log line must round-trip through `unit_logs`,
+  `systemd-analyze verify` of the shipped units, and a check that
+  starts the socket unit and drives a request through it;
 - a Fedora container booted with systemd >= 258 as PID 1: the varlink
   backend. Each backend is made the only one available: the socket is
   renamed to force the CLI, and the server is run with an empty `PATH`
   so it cannot execute systemctl. A differential check then asserts
-  both backends emit identical row shapes.
+  both backends emit identical row shapes, and identical values for a
+  canary unit the run started itself.
 
 Both suites take `MCPD` (how to run the server) and `HOST` (how to
 reach the target systemd, empty for this machine). They need root to

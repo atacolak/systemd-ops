@@ -52,9 +52,9 @@ check test: build
 	$(CARGO) clippy --all-targets --locked -- -D warnings
 	$(CARGO) fmt --check
 	@if command -v groff >/dev/null && command -v lexgrog >/dev/null; then \
-	    MCPD=$(BIN) sh tests/manpage.sh; \
+	    MCPD=$(BIN) bash tests/docs.sh; \
 	else \
-	    echo "skipping the man page check: groff or lexgrog is missing"; \
+	    echo "skipping the documentation check: groff or lexgrog is missing"; \
 	fi
 
 # The unit file ships with a /usr/local ExecStart, which is right for a

@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# Checks the man page: that roff is happy with it, that apropos can
-# index it, and that it still describes the binary that exists.
+# Checks the documentation against the thing it documents: that roff is
+# happy with the man page, that apropos can index it, and that the man
+# page and the markdown still describe the binary and the tools that
+# exist.
 #
-# The last part is the reason this is a script rather than a note in a
-# contributing file. A man page does not fail loudly when a flag is
-# added; it just quietly becomes wrong, and the person who finds out is
-# a user or a packager.
+# Documentation does not fail loudly when the code moves. It just
+# becomes wrong, and the person who finds out is a user or a packager.
+# Everything here compares a document against the source of truth
+# rather than reading it for sense.
 #
-# Needs groff and lexgrog (man-db), and the built binary for the
-# synchronization check:
+# Needs groff and lexgrog (man-db), and the built binary:
 #
-#   MCPD=target/release/systemd-mcpd bash tests/manpage.sh
+#   MCPD=target/release/systemd-mcpd bash tests/docs.sh
 set -euo pipefail
 
 PAGE=${PAGE:-systemd-mcpd.1}
@@ -58,4 +59,39 @@ done
 grep -q '^\.TH SYSTEMD\\-MCPD 1 .*"systemd-mcpd" "User Commands"' "$PAGE" ||
   fail "the .TH line no longer has the form make install substitutes into"
 
-echo "PASS: man page is clean, indexable, and matches the binary"
+echo "== the tool tables match the registry"
+# The registry in src/mcp.rs is the source of truth: it is what the
+# server advertises. A tool renamed there and not here leaves the
+# README describing something no client can call.
+scope_name() { # Rust variant -> wire name
+  case $1 in
+    UnitsRead) echo units:read ;;
+    JournalRead) echo journal:read ;;
+    BootRead) echo boot:read ;;
+    UnitsWrite) echo units:write ;;
+    *) fail "unknown scope variant $1, teach this script about it" ;;
+  esac
+}
+registry=$(mktemp)
+# Each entry is `name: "x"` followed by `scope: Scope::Y`.
+paste -d' ' \
+  <(grep -oP '^\s+name: "\K[a-z_]+' src/mcp.rs) \
+  <(grep -oP '^\s+scope: Scope::\K\w+' src/mcp.rs) |
+  while read -r name variant; do echo "$name $(scope_name "$variant")"; done |
+  sort > "$registry"
+[ -s "$registry" ] || fail "found no tools in src/mcp.rs; has the registry changed shape?"
+
+# The README table carries both facts, so compare both.
+readme=$(mktemp)
+grep -oP '^\| `\K[a-z_]+` +\| `[a-z:]+`' README.md |
+  tr -d '`|' | awk '{print $1, $2}' | sort > "$readme"
+diff "$registry" "$readme" ||
+  fail "the README tool table disagrees with src/mcp.rs (left: code, right: README)"
+
+# TOOLS.md documents arguments per tool; every tool needs an entry.
+while read -r name _; do
+  grep -q "\`$name\`" docs/TOOLS.md || fail "$name is not documented in docs/TOOLS.md"
+done < "$registry"
+rm -f "$registry" "$readme"
+
+echo "PASS: man page is clean and indexable, and the docs match the code"

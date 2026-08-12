@@ -959,6 +959,66 @@ mod tests {
         assert!(!glob_match("a[bc].service", "ab.service"));
     }
 
+    /// The obviously correct matcher: try every split, exponential in
+    /// the worst case, unusable in production and ideal as an oracle.
+    /// `glob_match` is the fast version with one backtrack point, which
+    /// is where a subtle wrong answer would live.
+    fn glob_match_naive(p: &[u8], n: &[u8]) -> bool {
+        match (p.first(), n.first()) {
+            (None, _) => n.is_empty(),
+            (Some(b'*'), _) => {
+                glob_match_naive(&p[1..], n) || (!n.is_empty() && glob_match_naive(p, &n[1..]))
+            }
+            (Some(b'?'), Some(_)) => glob_match_naive(&p[1..], &n[1..]),
+            (Some(a), Some(b)) if a == b => glob_match_naive(&p[1..], &n[1..]),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn glob_agrees_with_the_naive_oracle() {
+        // Exhaustive over short strings rather than sampled: every
+        // pattern of up to 4 characters from "ab*?" against every name
+        // of up to 4 from "ab". That is where backtracking bugs live,
+        // and it runs in milliseconds. Deterministic, so a failure
+        // reproduces.
+        let pattern_alphabet = [b'a', b'b', b'*', b'?'];
+        let name_alphabet = [b'a', b'b'];
+        let words = |alphabet: &[u8], max: u32| {
+            let mut out = vec![Vec::new()];
+            let mut frontier = vec![Vec::new()];
+            for _ in 0..max {
+                let mut next = Vec::new();
+                for word in &frontier {
+                    for &c in alphabet {
+                        let mut w: Vec<u8> = word.clone();
+                        w.push(c);
+                        next.push(w);
+                    }
+                }
+                out.extend(next.iter().cloned());
+                frontier = next;
+            }
+            out
+        };
+        let patterns = words(&pattern_alphabet, 4);
+        let names = words(&name_alphabet, 4);
+        let mut checked = 0;
+        for p in &patterns {
+            let p = std::str::from_utf8(p).unwrap();
+            for n in &names {
+                let n = std::str::from_utf8(n).unwrap();
+                assert_eq!(
+                    glob_match(p, n),
+                    glob_match_naive(p.as_bytes(), n.as_bytes()),
+                    "disagree: pattern {p:?} name {n:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 10_000, "only {checked} pairs compared");
+    }
+
     #[test]
     fn name_filtering() {
         let rows = [

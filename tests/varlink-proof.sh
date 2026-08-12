@@ -114,4 +114,14 @@ diff <(jq -S 'map(keys) | unique' "$WORK/cli.json") \
   <(jq -S 'map(keys) | unique' "$WORK/varlink.json") ||
   fail "backends disagree on row shape"
 
+# Same values, not just the same keys. Shape equality would still hold
+# if one backend reported a state the other spells differently, which
+# is exactly what normalizing PascalCase varlink fields onto systemctl's
+# short names could get wrong. The canary is the unit to compare: it was
+# started by this run, it is a plain sleep, and its state does not move
+# between the two captures the way another unit's might.
+diff <(jq -S --arg u "$CANARY_UNIT" '.[] | select(.unit == $u)' "$WORK/cli.json") \
+  <(jq -S --arg u "$CANARY_UNIT" '.[] | select(.unit == $u)' "$WORK/varlink.json") ||
+  fail "backends disagree on the canary's values, not just its keys"
+
 echo "PASS: varlink proof and differential"
