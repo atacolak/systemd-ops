@@ -47,7 +47,8 @@ CI runs the binary against two live systemds on every push:
   unit whose log line must round-trip through `unit_logs`,
   `systemd-analyze verify` of the shipped units, and a check that
   starts the socket unit and drives a request through it;
-- a Fedora container booted with systemd >= 258 as PID 1: the varlink
+- a Fedora container booted with systemd >= 258 as PID 1 (259 at the
+  time of writing): the varlink
   backend. Each backend is made the only one available: the socket is
   renamed to force the CLI, and the server is run with an empty `PATH`
   so it cannot execute systemctl. A differential check then asserts
@@ -98,6 +99,9 @@ python3 tests/http-shim.py --port 3000 -- \
 npx @modelcontextprotocol/conformance@0.2.0-alpha.11 server \
   --url http://127.0.0.1:3000/mcp --scenario tools-list --spec-version 2026-07-28
 ```
+
+Results below were measured at b1ed0ff and are worth re-running before
+a release, since protocol changes move them.
 
 What applies, and passes: `tools-list` (3 of 3, in both eras),
 `caching` (the `tools/list` hints, a non-negative TTL, a valid cache

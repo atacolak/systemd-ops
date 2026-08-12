@@ -106,6 +106,32 @@ Stated because the alternative is that someone finds them by being bitten.
 - **No response size caps.** An unfiltered `list_units` is one line of
   roughly 100 KB, and `unit_logs` will return 1000 entries if asked.
   The filters exist so a caller does not have to.
+- **Arguments of the wrong type are ignored, not refused.** Every
+  argument is read with a typed accessor, so `{"pattern": 123}` reads
+  as no pattern at all and returns the whole inventory rather than an
+  error. The schema says what the types are; the server does not
+  enforce them, which means a schema-violating call gets a
+  plausible-looking answer to a different question. The same applies to
+  a number below a documented minimum, where a number above the maximum
+  does error.
+- **An apply reports `applied: true` without checking the prediction
+  came true.** It reports the diff it observed, which is the honest
+  part, but a caller reading only the flag learns less than it looks.
+  A `restart` in particular shows `active` before and after, because
+  the diff compares the state dimension the action changes and a
+  restart does not change it; the process behind it did change.
+- **`changes` carries whatever systemctl printed.** For enablement that
+  is the symlink report, which is the point, but systemctl also prints
+  hints and warnings on the same streams and those arrive in the same
+  array.
+- **Journal messages above roughly 4 KB read as `null`.** That is
+  journalctl's data threshold, and the reply does not currently mark
+  the difference between a message that was withheld and an entry that
+  had none.
+
+The last four came from pointing language-model agents at a live server
+and asking them to break it, which found more in an afternoon than the
+scripted suites had in a week. The first four were already known.
 
 ## Error channels
 

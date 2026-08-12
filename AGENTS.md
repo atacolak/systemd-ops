@@ -149,8 +149,10 @@ them needs an image built for it (mkosi).
 ## Prose
 
 Documentation, comments, and commit messages state facts. The general
-standard is the `avoid-ai-writing` skill; install it rather than
-copying its rules here. The repository also holds to:
+standard is the one collected at
+[conorbronsdon/avoid-ai-writing](https://github.com/conorbronsdon/avoid-ai-writing),
+which is worth reading once rather than restating here. On top of it,
+this repository holds to:
 
 - no em dashes, including in tool descriptions sent to clients
 - limits documented with the same weight as features: what is

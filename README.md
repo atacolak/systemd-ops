@@ -213,6 +213,7 @@ toolchain floor, the offline build, and what is deliberately absent.
   conformance suite
 - [docs/PACKAGING.md](docs/PACKAGING.md): what a distribution packager
   needs
+- [SECURITY.md](SECURITY.md): what is in scope, and where to report
 - [CHANGELOG.md](CHANGELOG.md): what changed per version
 - [AGENTS.md](AGENTS.md): working notes for coding agents
 

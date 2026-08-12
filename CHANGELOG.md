@@ -13,11 +13,28 @@ having done nothing. The socket unit sets `Accept=yes` and mode 0600,
 and instantiates the template per connection. Packages install both and
 should enable neither.
 
-Wire: `unit_properties` and `plan_change` now report "no such unit" for
-a name the manager does not know. `systemctl show` synthesizes such a
-unit with `LoadState=not-found` and exit 0, so both previously answered
-as though it existed. Unit names may now begin with `-`, which
-`-.mount` and `-.slice` require.
+Wire: `critical_chain` returns the whole tree again; under `LC_ALL=C`,
+which the server now pins, systemd-analyze draws it in ASCII and the
+parser read only the box-drawing form, reducing every chain to its
+root. `boot_times` no longer reports a fabricated kernel phase in a
+container, and marks the reply `container: 1`. `unit_dependencies`
+reports "no such unit" instead of answering with fifteen empty
+relations. `unit_logs` keeps answering for units that no longer exist,
+because the journal outlives them, but carries a `note` when there is
+nothing to show and no such unit is loaded. The varlink and CLI
+backends agree again on `description` for units without an explicit
+`Description=`.
+
+Protocol: a JSON-RPC batch, or any line of valid JSON that is not an
+object, is answered with -32600 instead of silence. A line that is not
+valid UTF-8 is answered with -32700 and the session continues, where
+before it ended the session with a message on stderr.
+
+`unit_properties` and `plan_change` report "no such unit" for a name
+the manager does not know. `systemctl show` synthesizes such a unit
+with `LoadState=not-found` and exit 0, so both previously answered as
+though it existed. Unit names may begin with `-`, which `-.mount` and
+`-.slice` require.
 
 - Speaks MCP revision 2026-07-28 alongside the `initialize` handshake
   era. A request declaring `io.modelcontextprotocol/protocolVersion` in
