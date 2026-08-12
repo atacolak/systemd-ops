@@ -89,11 +89,10 @@ enables.
 make check
 ```
 
-That includes the man page check: `groff -mandoc -ww -z` (Debian's
-`manpage-has-errors-from-man`), `lexgrog` for the whatis entry, and a
-comparison of the documented scopes and flags against the built
-binary. It skips itself if groff or lexgrog is missing, so it will not
-break a minimal build chroot.
+That includes the man page lint: `groff -mandoc -ww -z` (Debian's
+`manpage-has-errors-from-man`) and `lexgrog` for the whatis entry. It
+skips itself if groff or lexgrog is missing, so it will not break a
+minimal build chroot.
 
 The live suites under `tests/` need root, a running systemd, and the
 ability to create transient units and write to `/etc/systemd/system`.

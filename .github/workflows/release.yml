@@ -26,9 +26,12 @@ jobs:
       # forgotten. Better to fail here than to ship a tarball whose
       # --version output contradicts its name.
       - name: Tag matches Cargo.toml
+        # cargo already parses the manifest; ask it rather than matching
+        # the first `version =` line, which is also how a dependency's
+        # version would be read by accident.
         run: |
           tag=${GITHUB_REF_NAME#v}
-          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          crate=$(cargo metadata --no-deps --format-version 1 | jq -er '.packages[0].version')
           [ "$tag" = "$crate" ] || {
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
             exit 1

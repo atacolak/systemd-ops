@@ -75,9 +75,13 @@ jobs:
       - uses: actions/checkout@v7
       - name: Read the declared floor
         id: msrv
+        # cargo metadata rather than sed on Cargo.toml: cargo already
+        # parses the manifest and will emit the field as JSON, so there
+        # is no reason to re-implement a TOML reader in a regex.
         run: |
-          version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
-          [ -n "$version" ] || { echo "::error::no rust-version in Cargo.toml"; exit 1; }
+          version=$(cargo metadata --no-deps --format-version 1 |
+            jq -er '.packages[0].rust_version') ||
+            { echo "::error::no rust-version in Cargo.toml"; exit 1; }
           below=$(echo "$version" | awk -F. '{print $1 "." $2 - 1}')
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "below=$below" >> "$GITHUB_OUTPUT"

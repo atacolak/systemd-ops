@@ -14,29 +14,29 @@ Three tiers, in cost order, plus the conformance suite.
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-MCPD=target/release/systemd-mcpd bash tests/docs.sh
+bash tests/docs.sh
 ```
 
 `make check` runs all of them.
 
-`tests/docs.sh` holds the documentation against the code, in four
-parts: `groff -mandoc -ww -z`, which is what Debian runs as
-`manpage-has-errors-from-man`; `lexgrog`, which decides whether
-`apropos` can index the page; a comparison of the scopes and long
-options in the man page against what the built binary reports in
-`--help`, in both directions; and a comparison of the README tool
-table, names and scopes, against the registry in `src/mcp.rs`, plus a
-check that every tool has an entry in `TOOLS.md`.
+`tests/docs.sh` lints the man page: `groff -mandoc -ww -z`, which is
+what Debian runs as `manpage-has-errors-from-man`, and `lexgrog`, which
+decides whether `apropos` can index it. It needs groff and lexgrog, and
+skips itself under `make check` if they are absent.
 
-The comparisons are the point. Bad roff is loud, but a page that
-documents a flag the binary dropped, or a table that advertises a tool
-under the wrong scope, is silent, and the person who finds out is a
-user. It needs groff and lexgrog, and skips itself under `make check`
-if they are absent.
+It briefly also compared the scopes in `--help` against the man page,
+and the README tool table against the registry, by scraping both with
+regexes. That is gone. Deriving facts by parsing text written for
+people is the thing this project refuses to do to systemctl, and it
+should not do it to itself: the checks broke on reindented usage lines,
+could not see a description that went stale without changing shape, and
+turned a documentation slip into a rejected build. Keeping the tool
+table honest is a review job, or a generation job, not a grep.
 
-CI also runs a staged `make install` and `cargo package`: both
-are things only a packager exercises, so nothing else would notice a
-renamed file until it reached one.
+CI also runs a staged `make install` and `cargo package`: both are
+things only a packager exercises, so nothing else would notice a
+renamed file until it reached one. Those assert on files and on one
+exact line of a generated unit, not on prose.
 
 ## Live suites
 
