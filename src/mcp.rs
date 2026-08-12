@@ -687,8 +687,8 @@ fn initialize_result(params: &Value) -> Value {
     })
 }
 
-/// Only granted tools are advertised; ungranted tools are additionally
-/// refused in `tools/call`.
+/// Only granted tools are advertised; ungranted tools are also refused
+/// in `tools/call`.
 fn tools_list(grants: &Grants) -> Value {
     let tools: Vec<Value> = TOOLS
         .iter()

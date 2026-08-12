@@ -16,10 +16,10 @@ an optional `pattern`: a glob over the unit name supporting `*` and `?`.
 | `user@????.service`    | four-character instance names              |
 
 Bracket expressions are not implemented; `[` matches itself. A pattern
-that matches nothing returns an empty array rather than an error.
-Filtering is worth reaching for: an ordinary host has several hundred
-loaded units and as many unit files, and the unfiltered `list_units`
-reply is the largest this server produces.
+that matches nothing returns an empty array rather than an error. An
+ordinary host has several hundred loaded units and as many unit files,
+and the unfiltered `list_units` reply is the largest this server
+produces.
 
 Unit names are validated against the unit-name character set before
 they reach an argument list; malformed names are refused with an error

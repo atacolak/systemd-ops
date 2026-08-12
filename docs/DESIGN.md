@@ -126,12 +126,12 @@ sampling and logging are deprecated as of 2026-07-28 in any case. There
 is no HTTP transport and therefore no authorization: stdio takes its
 credentials from the process that spawned it.
 
-One consequence of statelessness is worth stating plainly: plan ids
-follow the pattern the specification recommends for state, an explicit
-handle minted by the server and passed back as an ordinary argument,
-but they live in the process's memory. A client that restarts the
-server between `plan_change` and `apply_plan` gets "unknown plan" and
-has to plan again.
+Statelessness has one consequence for the write path. Plan ids follow
+the pattern the specification recommends for state, an explicit handle
+minted by the server and passed back as an ordinary argument, but they
+live in the process's memory. A client that restarts the server
+between `plan_change` and `apply_plan` gets "unknown plan" and has to
+plan again.
 
 ## Roadmap
 

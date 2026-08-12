@@ -31,23 +31,23 @@ directions, so raising it is a deliberate act, not a side effect.
 
 - **Scopes gate twice.** A tool absent from `tools/list` must also be
   refused by `tools/call`. Both paths read the same `Scope`.
-- **One mutating call.** `systemd::apply_verb` is the only invocation
+- **One mutating call:** `systemd::apply_verb` is the only invocation
   that changes system state, reachable only from `write::apply`. Do not
   add a second; route new mutations through plan/apply.
 - **Backends are indistinguishable.** varlink and CLI results are
   normalized to the same shape, and filters are applied after either
   backend rather than inside one. A caller must not be able to tell
   which answered.
-- **Argv, never a shell.** Values reaching an argument list are
+- **Argv, never a shell:** values reaching an argument list are
   validated first, and flags carrying values use the `--flag=value`
   form so option parsing cannot misread them.
 - **One registry entry per tool**, in `src/mcp.rs`: name, scope,
   description, schema, handler. There is no second dispatch site.
-- **One dispatch for both protocol eras.** The modern (2026-07-28) and
+- **One dispatch for both protocol eras:** the modern (2026-07-28) and
   legacy (`initialize`) paths differ only in the envelope around a
   result. `call_tool` and `tools_list` are shared, so a tool cannot be
   reachable in one era and gated in the other.
-- **Two error channels, split by who can fix it.** Bad arguments and
+- **Two error channels, split by who can fix it:** bad arguments and
   backend failures are tool errors (`isError`), because a corrected
   call resolves them and clients are not required to show protocol
   errors to the model. Protocol errors are for an unknown tool or an
@@ -97,28 +97,28 @@ them needs an image built for it (mkosi).
 
 ## Things that cost time to learn
 
-- **Empty filter results.** journalctl exits 1 when a filter matches
+- **Empty filter results:** journalctl exits 1 when a filter matches
   nothing, which is an answer rather than a failure.
   `run_journal_query` distinguishes the two: no matches produces exit 1
   with both streams empty, a real failure writes to stderr.
-- **Masking `/etc` fragments.** `systemctl mask` fails for units whose
+- **Masking `/etc` fragments:** `systemctl mask` fails for units whose
   fragment lives in `/etc/systemd/system`, because the mask symlink
   wants that exact path. Use a different verb to manufacture
   enablement drift in tests.
 - **LogControl1 needs `BusName=`.** `systemctl service-log-level` talks
   D-Bus, so it works for logind and resolved but not for journald,
   which serves log control over varlink instead.
-- **Unfinished boots.** Hosts that never finish booting (CI runner VMs)
+- **Unfinished boots:** hosts that never finish booting (CI runner VMs)
   make `boot_times` and `critical_chain` return a "not yet finished"
   error, while `boot_blame` may still answer. Tests assert whichever
   behavior the host exhibits.
-- **Method naming.** `io.systemd.Unit.List` lists units, not
+- **Method naming:** `io.systemd.Unit.List` lists units, not
   `Manager.ListUnits`. Verify varlink interfaces against the systemd
   source (`src/shared/varlink-io.systemd.*.c`) before coding to them.
-- **Proving the varlink path.** Never do it by moving
+- **Proving the varlink path:** never do it by moving
   `/usr/bin/systemctl`. Run the server with an empty `PATH` instead; an
   interrupted run must not leave a host without systemctl.
-- **Protocol revisions.** Read the specification page before coding to
+- **Protocol revisions:** read the specification page before coding to
   a revision; the wire changed more than the version string in
   2026-07-28. The pages that matter for a tools-only stdio server are
   `basic/index#meta`, `basic/versioning`, `server/discover`,
@@ -134,7 +134,7 @@ them needs an image built for it (mkosi).
 
 Documentation, comments, and commit messages state facts. The general
 standard is the `avoid-ai-writing` skill; install it rather than
-copying its rules here. The repository additionally holds to:
+copying its rules here. The repository also holds to:
 
 - no em dashes, including in tool descriptions sent to clients
 - limits documented with the same weight as features: what is

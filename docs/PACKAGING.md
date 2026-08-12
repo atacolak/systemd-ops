@@ -1,7 +1,7 @@
 # Packaging
 
 What a distribution packager needs, in one place. If something here is
-wrong or missing for your distribution, that is a bug worth filing.
+wrong or missing for your distribution, that is a bug: please file it.
 
 ## Facts
 
@@ -61,9 +61,9 @@ resolves to exactly the versions upstream tested. For an offline build:
 cargo vendor vendor/
 ```
 
-Note that `Cargo.lock` is format version 4, which needs cargo 1.78 or
-later to parse. That is below the declared MSRV, so any toolchain that
-can build this can read the lockfile.
+`Cargo.lock` is format version 4, which needs cargo 1.78 or later to
+parse. That is below the declared MSRV, so any toolchain that can build
+this can read the lockfile.
 
 ## The unit file is optional
 
@@ -95,14 +95,14 @@ against an installed package.
 
 ## Things that are deliberately absent
 
-- **No shipped `debian/` or `.spec` directory.** Distribution packaging
+- **No shipped `debian/` or `.spec` directory:** distribution packaging
   belongs to the distribution, and an upstream copy goes stale without
   anyone noticing.
-- **No bundled dependencies.** Two crates, both packaged everywhere.
-- **No setuid, no capabilities, no `/etc` file, no state directory.**
-  The binary runs with the privileges of whoever spawns it and stores
+- **No bundled dependencies:** two crates, both packaged everywhere.
+- **No setuid, no capabilities, no `/etc` file, no state directory:**
+  the binary runs with the privileges of whoever spawns it and stores
   nothing.
-- **No shell completions.** There are three flags.
+- **No shell completions:** there are three flags.
 
 ## Reporting
 

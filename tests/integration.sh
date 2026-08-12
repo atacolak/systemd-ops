@@ -248,7 +248,7 @@ tool journal:read unit_logs "{\"unit\":\"$CANARY_UNIT\",\"since\":\"+1min\"}" |
 # as a tool failure. `tool` fails the run if isError is true.
 tool journal:read unit_logs "{\"unit\":\"$CANARY_UNIT\",\"grep\":\"zzz-no-such-string-zzz\"}" |
   jq -e '.entries | length == 0' >/dev/null || fail "no-match grep was not an empty result"
-# ...while a genuine journalctl failure still reports isError.
+# ...while a failure that writes to stderr still reports isError.
 expect_error journal:read unit_logs "{\"unit\":\"$CANARY_UNIT\",\"boot\":999}" "journalctl"
 tool journal:read list_boots '{}' |
   jq -e 'type == "array" and length >= 1' >/dev/null || fail "list_boots empty"
