@@ -32,7 +32,8 @@ TAG=
 # a distro respinning a point release does not break this check.
 IMAGES=${IMAGES:-"\
 debian-13=https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2 \
-fedora-43=https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/"}
+fedora-43=https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/ \
+arch=https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2"}
 
 say()  { printf '\n== %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -138,7 +139,7 @@ vm_suite() {
   # The default user differs per distro; try each until one answers.
   local user
   for _ in $(seq 60); do
-    for u in debian fedora cloud-user ubuntu; do
+    for u in debian fedora arch cloud-user ubuntu; do
       # shellcheck disable=SC2086
       if ssh $ssh_opts "$u@127.0.0.1" true 2>/dev/null; then user=$u; break 2; fi
     done
@@ -190,6 +191,13 @@ vm_teardown() {
 # InitRDTimestampMonotonic is only set when systemd runs inside the
 # initrd (dracut does this, Debian's initramfs-tools does not), so the
 # initrd phase is asserted only where the guest provides it.
+#
+# Firmware and loader stay unobservable here. They come from EFI
+# variables that only systemd-boot sets, and converting a cloud image
+# to systemd-boot does not work: the boot loader entries live on /boot,
+# which sd-boot ignores unless that partition is typed XBOOTLDR, so the
+# converted guest finds no entries and does not boot. Covering these
+# two phases needs an image built for it (mkosi), not a converted one.
 vm_boot_phases() {
   local name=$1 SSH=$2 times props
   say "$name: boot phases against the manager timestamps"
@@ -235,6 +243,20 @@ vm_boot_phases() {
   printf '   phases verified against the manager: %s\n' "$covered"
 }
 
+# Reboots the guest and waits for it to answer again.
+vm_reboot() {
+  local name=$1 SSH=$2 ssh_opts=$3 user=$4 pid=$5 back=
+  $SSH sudo systemctl reboot >/dev/null 2>&1 || true
+  sleep 5
+  for _ in $(seq 60); do
+    # shellcheck disable=SC2086
+    if ssh $ssh_opts "$user@127.0.0.1" true 2>/dev/null; then back=1; break; fi
+    kill -0 "$pid" 2>/dev/null || fail "$name: guest did not come back (qemu exited)"
+    sleep 2
+  done
+  [ -n "$back" ] || fail "$name: guest did not come back after reboot"
+}
+
 # enable means "starts at next boot". Nothing short of a reboot checks
 # that, so this is the assertion the guest exists for.
 vm_reboot_persistence() {
@@ -252,16 +274,7 @@ vm_reboot_persistence() {
   jq -e '.result.content[0].text | fromjson | .diff.unit_file_state.after == "enabled"' <<<"$plan" >/dev/null ||
     fail "$name: apply did not enable the unit: $plan"
 
-  $SSH sudo systemctl reboot >/dev/null 2>&1 || true
-  sleep 5
-  local back=
-  for _ in $(seq 60); do
-    # shellcheck disable=SC2086
-    if ssh $ssh_opts "$user@127.0.0.1" true 2>/dev/null; then back=1; break; fi
-    kill -0 "$pid" 2>/dev/null || fail "$name: guest did not come back (qemu exited)"
-    sleep 2
-  done
-  [ -n "$back" ] || fail "$name: guest did not come back after reboot"
+  vm_reboot "$name" "$SSH" "$ssh_opts" "$user" "$pid"
   [ "$($SSH sudo systemctl is-active $unit)" = active ] ||
     fail "$name: $unit did not start on the next boot; enable did not persist"
   printf '   %s active after reboot\n' "$unit"

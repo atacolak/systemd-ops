@@ -62,9 +62,19 @@ under `/etc/systemd/system`, and read the system journal.
 Three tiers, in cost order. `cargo test` needs nothing. GitHub CI runs
 the fast gates plus both suites against two live systemds on every
 push. `tests/release-check.sh` is manual and boots QEMU guests; run it
-before tagging, since it covers what the first two cannot: a non-zero
-initrd phase, enablement surviving a reboot, and the version boundary
-at systemd 258.
+before tagging, since it covers what the first two cannot: the initrd
+boot phase, enablement surviving a reboot, and three systemd versions
+that straddle the varlink boundary (Debian 257, Fedora 258, Arch 261).
+
+Two notes on the guests. Writing tests that run in one means no shell
+syntax may cross ssh: ssh rebuilds the remote command through a shell,
+and a redirect in the command string is performed by the local shell
+instead. Pass content over stdin and keep operators, globs and quotes
+out of remote commands. And the firmware and loader boot phases stay
+uncovered: they come from EFI variables only systemd-boot sets, and a
+cloud image cannot be converted to it, because its boot loader entries
+live on a /boot that sd-boot ignores unless typed XBOOTLDR. Covering
+them needs an image built for it (mkosi).
 
 ## Things that cost time to learn
 
