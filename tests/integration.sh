@@ -89,9 +89,25 @@ tool units:read unit_dependencies '{"unit":"multi-user.target"}' |
 tool units:read unit_security '{"unit":"systemd-journald.service"}' |
   jq -e '.analysis | type == "array" and length > 0' >/dev/null ||
   fail "unit_security produced no analysis rows"
-tool units:read unit_log_control '{"unit":"systemd-journald.service"}' |
-  jq -e '(.log_level | length > 0) and (.log_target | length > 0)' >/dev/null ||
-  fail "unit_log_control returned empty values"
+# unit_log_control needs a running service that declares BusName= and
+# implements LogControl1 over D-Bus (journald serves its log control
+# over varlink, which systemctl does not use here). Which such service
+# runs differs per host; probe for one.
+lc_unit=
+for u in systemd-logind.service systemd-resolved.service systemd-networkd.service systemd-timesyncd.service; do
+  if $HOST systemctl service-log-level "$u" >/dev/null 2>&1; then
+    lc_unit=$u
+    break
+  fi
+done
+if [ -n "$lc_unit" ]; then
+  tool units:read unit_log_control "{\"unit\":\"$lc_unit\"}" |
+    jq -e '(.log_level | length > 0) and (.log_target | length > 0)' >/dev/null ||
+    fail "unit_log_control returned empty values for $lc_unit"
+else
+  echo "   (no LogControl1 service on this host - asserting the clean-error path)"
+  expect_error units:read unit_log_control '{"unit":"systemd-journald.service"}' "BusName"
+fi
 
 echo "== unit_logs (canary through a transient unit)"
 $HOST systemd-run --unit=mcpd-canary.service --collect \
@@ -247,25 +263,31 @@ echo "== write path (log tuning)"
 expect_error units:write plan_change '{"action":"log-level","unit":"systemd-journald.service","value":"chatty"}' "unknown log level"
 expect_error units:write plan_change '{"action":"log-level","unit":"systemd-journald.service"}' "requires a value"
 expect_error units:write plan_change '{"action":"start","unit":"x.service","value":"debug"}' "only accepted for"
-# Tune journald to debug and read the rollback value out of the plan.
-replies=$(rpc units:write \
-  "$(call plan_change '{"action":"log-level","unit":"systemd-journald.service","value":"debug"}')" \
-  "$(call apply_plan '{"plan":1}')")
-ll_planned=$(sed -n 1p <<<"$replies" | jq -r '.result.content[0].text')
-ll_applied=$(sed -n 2p <<<"$replies" | jq -r '.result.content[0].text')
-prev_level=$(jq -r '.current.log_level' <<<"$ll_planned")
-[ -n "$prev_level" ] || fail "log-level plan recorded no current level"
-jq -e '.predicted.log_level == "debug" and .rollback.action == "log-level" and .rollback.value != null' \
-  <<<"$ll_planned" >/dev/null || fail "log-level plan malformed: $ll_planned"
-jq -e '.diff.log_level.after == "debug"' <<<"$ll_applied" >/dev/null ||
-  fail "log-level apply diff malformed: $ll_applied"
-[ "$($HOST systemctl service-log-level systemd-journald.service)" = "debug" ] ||
-  fail "journald log level not debug after apply"
-# Restore using the rollback value the plan reported.
-rpc units:write \
-  "$(call plan_change "{\"action\":\"log-level\",\"unit\":\"systemd-journald.service\",\"value\":\"$prev_level\"}")" \
-  "$(call apply_plan '{"plan":1}')" >/dev/null
-[ "$($HOST systemctl service-log-level systemd-journald.service)" = "$prev_level" ] ||
-  fail "journald log level not restored to $prev_level"
+if [ -n "$lc_unit" ]; then
+  # Tune the probed service to debug, then restore it with the
+  # rollback value the plan reported.
+  replies=$(rpc units:write \
+    "$(call plan_change "{\"action\":\"log-level\",\"unit\":\"$lc_unit\",\"value\":\"debug\"}")" \
+    "$(call apply_plan '{"plan":1}')")
+  ll_planned=$(sed -n 1p <<<"$replies" | jq -r '.result.content[0].text')
+  ll_applied=$(sed -n 2p <<<"$replies" | jq -r '.result.content[0].text')
+  prev_level=$(jq -r '.current.log_level' <<<"$ll_planned")
+  [ -n "$prev_level" ] || fail "log-level plan recorded no current level"
+  jq -e '.predicted.log_level == "debug" and .rollback.action == "log-level" and .rollback.value != null' \
+    <<<"$ll_planned" >/dev/null || fail "log-level plan malformed: $ll_planned"
+  jq -e '.diff.log_level.after == "debug"' <<<"$ll_applied" >/dev/null ||
+    fail "log-level apply diff malformed: $ll_applied"
+  [ "$($HOST systemctl service-log-level "$lc_unit")" = "debug" ] ||
+    fail "$lc_unit log level not debug after apply"
+  rpc units:write \
+    "$(call plan_change "{\"action\":\"log-level\",\"unit\":\"$lc_unit\",\"value\":\"$prev_level\"}")" \
+    "$(call apply_plan '{"plan":1}')" >/dev/null
+  [ "$($HOST systemctl service-log-level "$lc_unit")" = "$prev_level" ] ||
+    fail "$lc_unit log level not restored to $prev_level"
+else
+  # No LogControl1 service: the plan itself must surface systemd's
+  # BusName error as a tool error.
+  expect_error units:write plan_change '{"action":"log-level","unit":"systemd-journald.service","value":"debug"}' "BusName"
+fi
 
 echo "PASS: all live integration tests"

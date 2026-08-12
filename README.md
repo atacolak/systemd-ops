@@ -82,8 +82,10 @@ Arguments and behavior:
   filter is applied by the server, identically over both backends.
 - `unit_properties`, `unit_dependencies`, `unit_security`,
   `unit_log_control`: required `unit`. `unit_log_control` reads through
-  systemd's LogControl1 interface and fails for services that do not
-  implement it. Unit names are validated against the unit-name character set
+  systemd's LogControl1 interface over D-Bus; the service must declare
+  `BusName=` and implement the interface (systemd-logind and
+  systemd-resolved do, journald serves its log control over varlink
+  instead and is not reachable this way). Unit names are validated against the unit-name character set
   before they reach an argument list; malformed names are refused with
   an error naming the input.
 - `list_unit_files`: optional `state`, an enablement state (`enabled`,

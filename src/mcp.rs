@@ -173,13 +173,15 @@ const TOOLS: &[Tool] = &[
         name: "unit_log_control",
         scope: Scope::UnitsRead,
         description: "One service's runtime log level and log target, read through \
-                      systemd's LogControl1 interface. Fails for services that do not \
-                      implement the interface.",
+                      systemd's LogControl1 interface over D-Bus. The service must \
+                      declare BusName= and implement the interface (systemd-logind, \
+                      systemd-resolved, and similar do); the error names the \
+                      requirement otherwise.",
         input_schema: || {
             json!({
                 "type": "object",
                 "properties": {
-                    "unit": { "type": "string", "description": "Unit name, e.g. systemd-journald.service" }
+                    "unit": { "type": "string", "description": "Unit name, e.g. systemd-logind.service" }
                 },
                 "required": ["unit"]
             })
