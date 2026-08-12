@@ -982,8 +982,8 @@ mod tests {
         // of up to 4 from "ab". That is where backtracking bugs live,
         // and it runs in milliseconds. Deterministic, so a failure
         // reproduces.
-        let pattern_alphabet = [b'a', b'b', b'*', b'?'];
-        let name_alphabet = [b'a', b'b'];
+        let pattern_alphabet = *b"ab*?";
+        let name_alphabet = *b"ab";
         let words = |alphabet: &[u8], max: u32| {
             let mut out = vec![Vec::new()];
             let mut frontier = vec![Vec::new()];
