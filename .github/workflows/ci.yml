@@ -92,6 +92,9 @@ jobs:
           MCPD="docker exec -i sysd /usr/local/bin/systemd-mcpd" \
           HOST="docker exec sysd" bash tests/integration.sh
       - name: Backend proof and differential
+        # MCPD_NO_PATH is spelled out because a bare `env PATH=` prefix
+        # would strip PATH from docker, not from the server inside it.
         run: |
           MCPD="docker exec -i sysd /usr/local/bin/systemd-mcpd" \
+          MCPD_NO_PATH="docker exec -i -e PATH=/nonexistent sysd /usr/local/bin/systemd-mcpd" \
           HOST="docker exec sysd" bash tests/varlink-proof.sh

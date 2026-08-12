@@ -5,20 +5,40 @@
 # The fallback is not observable from the output, so a passing test on
 # a systemd >= 258 host does not show that varlink answered — the reply
 # could have come from the systemctl fallback. Each backend is made the
-# only one possible: the varlink socket is renamed to force the CLI,
-# then systemctl is removed so only the socket can answer. Needs root
-# on the target systemd, reached via $HOST.
+# only one possible:
+#
+#   CLI only      the varlink socket is renamed, so connect() fails.
+#                 Needs root on the target systemd; /run is a tmpfs, so
+#                 an interrupted run costs the socket until reboot.
+#   varlink only  the server runs with an empty PATH, so it cannot
+#                 execute systemctl. Nothing on disk is touched, which
+#                 is why this is not done by moving /usr/bin/systemctl:
+#                 an interrupted run must not leave a host without it.
 set -euo pipefail
 
 MCPD=${MCPD:?set MCPD to the server command}
-HOST=${HOST:?set HOST to the command prefix reaching the systemd host}
+# Set but empty means "run commands here"; the colonless form accepts
+# that and still catches a caller who forgot the variable entirely.
+HOST=${HOST?set HOST to the command prefix reaching the systemd host, empty for this machine}
+# The same server, run so that no executable is reachable on PATH.
+# Override where the plain prefix cannot carry the environment, e.g.
+# MCPD_NO_PATH="docker exec -i -e PATH=/nonexistent sysd /usr/local/bin/systemd-mcpd".
+MCPD_NO_PATH=${MCPD_NO_PATH:-env PATH=/nonexistent $MCPD}
 SOCKET=/run/systemd/io.systemd.Manager
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+request() { # request <tool> <args-json> -> one tools/call request line
+  printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"%s","arguments":%s}}\n' "$1" "$2"
+}
+
 call_tool() { # call_tool <scopes> <tool> <args-json> -> inner result text
-  printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"%s","arguments":%s}}\n' "$2" "$3" |
-    $MCPD --grant "$1" | jq -r '.result.content[0].text'
+  request "$2" "$3" | $MCPD --grant "$1" | jq -r '.result.content[0].text'
+}
+
+# The same call with systemctl unreachable: only varlink can answer.
+call_tool_no_path() { # call_tool_no_path <scopes> <tool> <args-json> -> raw reply
+  request "$2" "$3" | $MCPD_NO_PATH --grant "$1"
 }
 
 list_units() { call_tool units:read list_units '{}'; }
@@ -42,21 +62,23 @@ list_units | jq -e 'type == "array" and length > 0' >/dev/null ||
 $HOST rm "$SOCKET"
 $HOST mv "$SOCKET.hidden" "$SOCKET"
 
-# 2. Force the varlink backend: remove systemctl entirely. If
-#    list_units still answers, only the socket could have answered.
-$HOST mv /usr/bin/systemctl /usr/bin/systemctl.hidden
-list_units >/tmp/mcpd-varlink.json
-# boot_times must also answer — its own varlink path (Manager.Describe)
-# is the only possible source without systemctl...
-call_tool boot:read boot_times '{}' |
-  jq -e '.total_usec > 0' >/dev/null ||
+# 2. Force the varlink backend: run the server with an empty PATH, so
+#    systemctl cannot be executed. If list_units still answers, only
+#    the socket could have answered.
+call_tool_no_path units:read list_units '{}' |
+  jq -r '.result.content[0].text' >/tmp/mcpd-varlink.json
+jq -e 'type == "array" and length > 0' /tmp/mcpd-varlink.json >/dev/null ||
+  fail "list_units did not answer over varlink with systemctl unreachable"
+# boot_times must also answer — Manager.Describe is its only possible
+# source here...
+call_tool_no_path boot:read boot_times '{}' |
+  jq -e '.result.content[0].text | fromjson | .total_usec > 0' >/dev/null ||
   fail "boot_times did not answer over varlink Describe"
-# ...and a systemctl-backed tool must now fail, proving the server
-# cannot shell out behind our back.
-printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"unit_properties","arguments":{"unit":"systemd-journald.service"}}}\n' |
-  $MCPD --grant units:read | jq -e '.result.isError' >/dev/null ||
-  fail "unit_properties succeeded with systemctl removed"
-$HOST mv /usr/bin/systemctl.hidden /usr/bin/systemctl
+# ...and a systemctl-backed tool must fail, proving the server cannot
+# shell out behind our back.
+call_tool_no_path units:read unit_properties '{"unit":"systemd-journald.service"}' |
+  jq -e '.result.isError' >/dev/null ||
+  fail "unit_properties succeeded with systemctl unreachable"
 
 for f in /tmp/mcpd-cli.json /tmp/mcpd-varlink.json; do
   jq -e 'map(.unit) | index("mcpd-diff-canary.service")' "$f" >/dev/null ||
