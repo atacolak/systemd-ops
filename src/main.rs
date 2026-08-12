@@ -9,6 +9,11 @@
 //! model should be explicit at startup, enforced at every call, and
 //! impossible to widen from inside the conversation.
 
+// There is none, and a program that operates systemd on a model's
+// behalf should not be able to acquire any without the compiler
+// objecting.
+#![forbid(unsafe_code)]
+
 mod mcp;
 mod systemd;
 mod varlink;
@@ -55,13 +60,27 @@ fn main() -> ExitCode {
                 println!("systemd-mcpd {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
             }
-            "--grant" => {
-                let Some(spec) = args.next() else {
-                    eprintln!("error: --grant needs an argument\n\n{USAGE}");
-                    return ExitCode::FAILURE;
+            // Both spellings: a user who types `--grant=units:read` is
+            // not wrong, and rejecting it as an unknown argument reads
+            // like the scope was the problem.
+            _ if arg == "--grant" || arg.starts_with("--grant=") => {
+                let spec = match arg.strip_prefix("--grant=") {
+                    Some(spec) => spec.to_string(),
+                    None => match args.next() {
+                        Some(spec) => spec,
+                        None => {
+                            eprintln!("error: --grant needs an argument\n\n{USAGE}");
+                            return ExitCode::FAILURE;
+                        }
+                    },
                 };
                 match Grants::from_args(&spec) {
-                    Ok(g) => grants = Some(g),
+                    // Repeated flags add up rather than replacing. The
+                    // command line is where the authority is stated and
+                    // where an operator reads it back, so what the
+                    // process table shows and what the server enforces
+                    // have to be the same set.
+                    Ok(g) => grants.get_or_insert_with(Grants::default).extend(g),
                     Err(e) => {
                         eprintln!("error: {e}");
                         return ExitCode::FAILURE;

@@ -1,1 +1,4 @@
 /target
+.claude/
+/K3_Review.md
+__pycache__/

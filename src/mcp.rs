@@ -719,10 +719,11 @@ fn tools_list(grants: &Grants) -> Value {
 /// or the code and message of a protocol error.
 ///
 /// `structured` adds the reply as JSON in `structuredContent` beside
-/// the text block, which the modern era defines and the legacy clients
-/// this server has to keep working predate. The text block is sent
-/// either way: a tool returning structured content should also
-/// serialize it there.
+/// the text block. 2025-06-18 defines the field too, so this withholds
+/// it from two revisions that could take it; per-request era detection
+/// never stores which legacy revision was negotiated, and guessing
+/// wrong is worse than omitting an optional field. The text block is
+/// sent either way, which is what those clients read.
 fn call_tool(params: &Value, grants: &Grants, structured: bool) -> Result<Value, (i64, String)> {
     let name = params
         .get("name")

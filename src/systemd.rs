@@ -78,6 +78,16 @@ impl Grants {
         Ok(Grants(scopes))
     }
 
+    /// Adds another set, without duplicating. Repeated `--grant` flags
+    /// union rather than the last one winning.
+    pub fn extend(&mut self, other: Grants) {
+        for scope in other.0 {
+            if !self.0.contains(&scope) {
+                self.0.push(scope);
+            }
+        }
+    }
+
     pub fn allows(&self, scope: Scope) -> bool {
         self.0.contains(&scope)
     }
@@ -104,10 +114,15 @@ impl fmt::Display for BackendError {
 /// refused early. `Command` never passes through a shell, so this is not
 /// an injection defense. It exists to return a precise error instead of
 /// whatever systemctl prints for a malformed name.
+///
+/// A leading `-` is allowed: `-.mount` and `-.slice`, the root mount
+/// and the root slice, exist on every host, and refusing them called
+/// units systemd itself creates malformed. Nothing downstream can read
+/// one as an option, because every name reaches argv after `--` or
+/// inside a single `--flag=value` element.
 pub(crate) fn validate_unit_name(name: &str) -> Result<(), BackendError> {
     let ok = !name.is_empty()
         && name.len() <= 256
-        && !name.starts_with('-')
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_.@\\:".contains(c));
@@ -180,6 +195,12 @@ fn name_filter<'a>(
 fn spawn(program: &str, args: &[&str]) -> Result<std::process::Output, BackendError> {
     Command::new(program)
         .args(args)
+        // LC_ALL=C because two of these outputs are parsed as prose.
+        // systemd formats timespans itself rather than through the
+        // locale, so no translation was observed reaching the parsers,
+        // but pinning the locale removes the question rather than
+        // answering it per release.
+        .env("LC_ALL", "C")
         .env("SYSTEMD_PAGER", "cat")
         .env("SYSTEMD_COLORS", "false")
         .output()
@@ -250,6 +271,24 @@ fn run_key_values(
             Some((key.to_string(), Value::String(value.to_string())))
         })
         .collect())
+}
+
+/// Errors unless the manager knows the unit.
+///
+/// `systemctl show` does not fail for a name nobody has heard of: it
+/// synthesizes the unit and prints a full property set with
+/// `LoadState=not-found` and exit 0. Every caller that wanted "no such
+/// unit" has to ask for that field and look at it. Masked units report
+/// `masked` rather than `not-found`, so unmasking one still works.
+pub(crate) fn ensure_unit_known(name: &str) -> Result<(), BackendError> {
+    let props = run_key_values(
+        "systemctl",
+        &["show", "--no-pager", "--property=LoadState", "--", name],
+    )?;
+    match props.get("LoadState").and_then(Value::as_str) {
+        Some("not-found") => Err(BackendError(format!("no such unit: {name}"))),
+        _ => Ok(()),
+    }
 }
 
 /// The active and sub state of one unit, for the plan/apply path.
@@ -564,7 +603,10 @@ pub fn unit_properties(name: &str, select: &[String]) -> Result<Value, BackendEr
     validate_unit_name(name)?;
     let props = run_key_values("systemctl", &["show", "--no-pager", "--", name])?;
 
-    if props.is_empty() {
+    // A name nobody knows comes back as a synthesized property set
+    // rather than as an error or an empty one, so the field is what
+    // decides, not the count.
+    if props.get("LoadState").and_then(Value::as_str) == Some("not-found") {
         return Err(BackendError(format!("no such unit: {name}")));
     }
     if select.is_empty() {
@@ -584,10 +626,6 @@ pub fn unit_properties(name: &str, select: &[String]) -> Result<Value, BackendEr
     Ok(json!({ "unit": name, "properties": selected }))
 }
 
-/// `unit_logs`: the last `lines` journal entries for one unit.
-///
-/// journalctl emits one JSON object per line with dozens of metadata
-/// fields; four are kept, to bound output size.
 /// Filters accepted by `unit_logs` beyond the unit itself.
 #[derive(Default)]
 pub struct LogFilter<'a> {
@@ -731,7 +769,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// `boot_times`: how long the last boot took, split by phase.
 ///
 /// The same manager timestamps `systemd-analyze time` reads, preferably
-/// over varlink (`io.systemd.Manager.Describe`, systemd ≥ 257), else via
+/// over varlink (`io.systemd.Manager.Describe`, systemd >= 258), else via
 /// the stable `Key=Value` output of `systemctl show`. Structured data at
 /// the source either way, never systemd-analyze's prose summary.
 pub fn boot_times() -> Result<Value, BackendError> {
@@ -928,7 +966,11 @@ mod tests {
         assert!(validate_unit_name("user@1000.service").is_ok());
         assert!(validate_unit_name("dev-disk-by\\x2duuid.device").is_ok());
         assert!(validate_unit_name("").is_err());
-        assert!(validate_unit_name("-rf").is_err());
+        // The root mount and root slice start with '-' and are real.
+        // Every call site places a name after `--` or inside
+        // `--flag=value`, so nothing reads one as an option.
+        assert!(validate_unit_name("-.mount").is_ok());
+        assert!(validate_unit_name("-.slice").is_ok());
         assert!(validate_unit_name("a b").is_err());
         assert!(validate_unit_name("x;reboot").is_err());
         assert!(validate_unit_name(&"x".repeat(300)).is_err());

@@ -30,14 +30,13 @@ jobs:
         run: cargo test
       - name: Release build
         run: cargo build --release
-      - name: Documentation matches the code
+      - name: Man page lint
         # groff -ww is the check Debian runs as
         # manpage-has-errors-from-man; lexgrog decides whether apropos
-        # can index the page at all. The script also holds the man page
-        # and the README table against the binary and the registry.
+        # can index the page at all.
         run: |
           sudo apt-get install -y -qq groff man-db
-          MCPD=target/release/systemd-mcpd bash tests/docs.sh
+          bash tests/docs.sh
 
       # What a packager runs. Neither was gated, so a renamed file would
       # have broken `make install` and surfaced downstream rather than

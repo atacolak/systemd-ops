@@ -6,6 +6,19 @@ is what a downstream package has to care about.
 
 ## 0.6.0, 2026-08-12
 
+On disk: `systemd-mcpd.service` is replaced by `systemd-mcpd.socket` and
+`systemd-mcpd@.service`. The old unit started a stdio program with no
+client on the other end of standard input, so it read EOF and exited 0
+having done nothing. The socket unit sets `Accept=yes` and mode 0600,
+and instantiates the template per connection. Packages install both and
+should enable neither.
+
+Wire: `unit_properties` and `plan_change` now report "no such unit" for
+a name the manager does not know. `systemctl show` synthesizes such a
+unit with `LoadState=not-found` and exit 0, so both previously answered
+as though it existed. Unit names may now begin with `-`, which
+`-.mount` and `-.slice` require.
+
 - Speaks MCP revision 2026-07-28 alongside the `initialize` handshake
   era. A request declaring `io.modelcontextprotocol/protocolVersion` in
   `_meta` is served under the new revision; one without it is served as

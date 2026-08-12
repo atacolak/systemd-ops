@@ -204,6 +204,11 @@ fn rollback_json(action: Action, observed: &str) -> Value {
 
 pub fn plan(action: Action, unit: &str, value: Option<&str>) -> Result<Value, BackendError> {
     systemd::validate_unit_name(unit)?;
+    // Refuse here rather than at apply time. Nothing downstream
+    // notices a name the manager has never heard of: `systemctl show`
+    // synthesizes one, so a plan against a typo would record
+    // "inactive/dead" and read as a valid plan until the apply failed.
+    systemd::ensure_unit_known(unit)?;
     let (observed, sub) = observe(action, unit)?;
     let key = action.state_key();
     let mut current = json!({ key: observed });

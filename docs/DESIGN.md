@@ -82,6 +82,31 @@ code path reaches it.
   anything but apply only what polkit permits; the refusal is
   systemctl's, passed through as a tool error.
 
+## Known limits
+
+Stated because the alternative is that someone finds them by being bitten.
+
+- **Child process runtime is unguarded.** `systemctl` and `journalctl`
+  are spawned without a deadline, and the serve loop is single
+  threaded, so a wedged manager (a D-Bus stall during a reexec) hangs
+  the session with no error until the client gives up. The MCP
+  specification puts tool-call timeouts on the client, and a stdio
+  client can kill the process it spawned; reporting a timeout here
+  would claim systemd answered when it did not. The varlink path's
+  five second budget answers a different question, which is how long
+  to wait before falling back to the CLI.
+- **Request lines are unbounded.** One line is buffered whole before
+  parsing, so a client that sends a gigabyte grows the process by a
+  gigabyte. Over stdio that client owns the process anyway. Over the
+  socket unit, reaching it means opening a mode 0600 root-owned
+  socket.
+- **The plan precondition is a check, not a lock.** See the write path
+  above: the window between the re-check and the systemctl invocation
+  is unguarded, as it is for any other systemctl caller.
+- **No response size caps.** An unfiltered `list_units` is one line of
+  roughly 100 KB, and `unit_logs` will return 1000 entries if asked.
+  The filters exist so a caller does not have to.
+
 ## Error channels
 
 Failures travel on two channels, split by whether the model can fix

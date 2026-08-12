@@ -84,9 +84,17 @@ group. The shipped unit file arranges this and runs the server under
 .BR DynamicUser= .
 .SH FILES
 .TP
-.I /usr/lib/systemd/system/systemd\-mcpd.service
-Sample hardened unit. Not required when an MCP client spawns the server
+.I /usr/lib/systemd/system/systemd\-mcpd.socket
+Socket unit, \fBAccept=yes\fR, mode 0600. The unit to enable if you want
+a supervised instance. Not required when an MCP client spawns the server
 directly, which is the usual case.
+.TP
+.I /usr/lib/systemd/system/systemd\-mcpd@.service
+Hardened template, instantiated per connection by the socket unit.
+.TP
+.I /run/systemd\-mcpd.sock
+Where the socket unit listens. Anything that can open it gets the scopes
+the service grants.
 .TP
 .I /run/systemd/io.systemd.Manager
 PID 1's varlink socket, used where present.

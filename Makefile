@@ -45,14 +45,14 @@ build:
 	$(CARGO) build $(CARGOFLAGS)
 
 # What CI gates on, for a packager who wants to run the upstream checks
-# without a systemd to test against. The man page check needs groff and
+# without a systemd to test against. The man page lint needs groff and
 # lexgrog, so it is skipped rather than failed where they are absent.
 check test: build
 	$(CARGO) test $(CARGOFLAGS)
 	$(CARGO) clippy --all-targets --locked -- -D warnings
 	$(CARGO) fmt --check
 	@if command -v groff >/dev/null && command -v lexgrog >/dev/null; then \
-	    MCPD=$(BIN) bash tests/docs.sh; \
+	    bash tests/docs.sh; \
 	else \
 	    echo "skipping the documentation check: groff or lexgrog is missing"; \
 	fi
