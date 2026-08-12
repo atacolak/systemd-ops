@@ -130,9 +130,16 @@ cleanup() {
   $HOST systemctl daemon-reload >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
-$HOST systemd-run --unit="$CANARY_UNIT" --collect \
-  /bin/sh -c "echo $CANARY_MARKER" >/dev/null 2>/tmp/mcpd-canary.err ||
-  fail "could not start canary unit: $(cat /tmp/mcpd-canary.err)"
+# stderr is captured into a variable, not a file: with HOST as an ssh
+# prefix the redirect would happen on this machine rather than in the
+# guest, and a fixed path collides across users and runs.
+# /bin/echo with the marker as an argument, not /bin/sh -c "echo ...":
+# ssh rebuilds the remote command through a shell, which would drop the
+# quoting and echo nothing.
+if ! canary_err=$($HOST systemd-run --unit="$CANARY_UNIT" --collect \
+    /bin/echo "$CANARY_MARKER" 2>&1 >/dev/null); then
+  fail "could not start canary unit: $canary_err"
+fi
 found=
 for _ in $(seq 15); do
   if tool journal:read unit_logs "{\"unit\":\"$CANARY_UNIT\"}" |
@@ -219,7 +226,11 @@ expect_error units:write apply_plan '{"plan":424242}' "unknown plan"
 
 # A disposable unit to operate on, with an [Install] section so the
 # enablement actions have something to work with.
-$HOST bash -c 'printf "[Unit]\nDescription=systemd-mcpd write-path test unit\n[Service]\nExecStart=/bin/sleep 300\n[Install]\nWantedBy=multi-user.target\n" > /etc/systemd/system/mcpd-write-test.service && systemctl daemon-reload'
+# Content goes over stdin: a redirect inside the command would be
+# performed by whichever shell ssh hands the string to, not in the guest.
+printf '[Unit]\nDescription=systemd-mcpd write-path test unit\n[Service]\nExecStart=/bin/sleep 300\n[Install]\nWantedBy=multi-user.target\n' |
+  $HOST tee "$WRITE_UNIT" >/dev/null
+$HOST systemctl daemon-reload
 
 # Plan and apply in one session (plans are per-session; the first id is 1).
 replies=$(rpc units:write \
@@ -285,7 +296,8 @@ kill "$SRV2_PID" 2>/dev/null || true
 $HOST systemctl disable mcpd-write-test.service >/dev/null 2>&1 ||
   fail "cleanup disable failed"
 
-$HOST bash -c 'rm -f /etc/systemd/system/mcpd-write-test.service && systemctl daemon-reload'
+$HOST rm -f "$WRITE_UNIT"
+$HOST systemctl daemon-reload
 
 echo "== write path (log tuning)"
 # Bad values are protocol errors before anything runs.

@@ -28,9 +28,11 @@ TAG=
 # Guests to boot, as name=url. Each distro release pins a systemd
 # version; pick releases that straddle 258, where PID 1 starts serving
 # the varlink socket.
+# A URL ending in / is a directory: the newest qcow2 in it is used, so
+# a distro respinning a point release does not break this check.
 IMAGES=${IMAGES:-"\
 debian-13=https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2 \
-fedora-43=https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.4.x86_64.qcow2"}
+fedora-43=https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/"}
 
 say()  { printf '\n== %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -40,9 +42,15 @@ preflight() {
   for c in qemu-system-x86_64 qemu-img genisoimage ssh ssh-keygen curl jq; do
     command -v "$c" >/dev/null || missing+=("$c")
   done
-  OVMF=$(ls /usr/share/OVMF/OVMF_CODE.fd /usr/share/ovmf/OVMF.fd \
-             /usr/share/OVMF/OVMF_CODE_4M.fd 2>/dev/null | head -1 || true)
-  [ -n "$OVMF" ] || missing+=("ovmf")
+  # Modern builds split the firmware into a read-only CODE half and a
+  # writable VARS half, which must be attached as paired pflash drives;
+  # older unified builds take -bios. Prefer the split pair.
+  OVMF_CODE=$(ls /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd \
+                 /usr/share/edk2/ovmf/OVMF_CODE.fd 2>/dev/null | head -1 || true)
+  OVMF_VARS=$(ls /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd \
+                 /usr/share/edk2/ovmf/OVMF_VARS.fd 2>/dev/null | head -1 || true)
+  OVMF_UNIFIED=$(ls /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd 2>/dev/null | head -1 || true)
+  [ -n "$OVMF_CODE$OVMF_UNIFIED" ] || missing+=("ovmf")
   [ -e /dev/kvm ] || fail "/dev/kvm is absent; this check needs hardware virtualization"
   if [ ${#missing[@]} -gt 0 ]; then
     fail "missing: ${missing[*]}
@@ -85,7 +93,14 @@ vm_suite() {
   local base="$CACHE/$name.qcow2"
   [ -s "$base" ] || {
     say "$name: downloading image"
-    curl -fL --retry 3 -o "$base.part" "$url" || fail "$name: download"
+    if [ "${url%/}" != "$url" ]; then
+      local file
+      file=$(curl -fsL "$url" | grep -oE '[A-Za-z0-9._-]+\.qcow2' | sort -Vu | tail -1) ||
+        fail "$name: could not list $url"
+      [ -n "$file" ] || fail "$name: no qcow2 found at $url"
+      url="$url$file"
+    fi
+    curl -fL --no-progress-meter --retry 3 -o "$base.part" "$url" || fail "$name: download"
     mv "$base.part" "$base"
   }
 
@@ -99,8 +114,17 @@ vm_suite() {
   genisoimage -quiet -output "$work/seed.iso" -volid cidata -joliet -rock \
     "$work/user-data" "$work/meta-data"
 
-  qemu-system-x86_64 -enable-kvm -m 2048 -smp 2 -nographic -no-reboot \
-    -bios "$OVMF" \
+  # No -no-reboot: the persistence test reboots the guest on purpose.
+  local firmware=()
+  if [ -n "$OVMF_CODE" ] && [ -n "$OVMF_VARS" ]; then
+    cp "$OVMF_VARS" "$work/vars.fd"
+    firmware=(-drive "if=pflash,format=raw,unit=0,readonly=on,file=$OVMF_CODE"
+              -drive "if=pflash,format=raw,unit=1,file=$work/vars.fd")
+  else
+    firmware=(-bios "$OVMF_UNIFIED")
+  fi
+  qemu-system-x86_64 -enable-kvm -m 2048 -smp 2 -nographic \
+    "${firmware[@]}" \
     -drive file="$work/disk.qcow2",if=virtio \
     -drive file="$work/seed.iso",if=virtio,format=raw,readonly=on \
     -netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$port"-:22 \
@@ -127,17 +151,26 @@ vm_suite() {
   $SSH sudo systemctl is-system-running --wait >/dev/null 2>&1 || true
   say "$name: guest is $($SSH systemctl --version | head -1)"
 
-  # shellcheck disable=SC2086
-  scp $ssh_opts "$REPO/target/x86_64-unknown-linux-musl/release/systemd-mcpd" \
-    "$user@127.0.0.1:/tmp/systemd-mcpd" >/dev/null || fail "$name: scp"
+  # Piped rather than scp'd: scp spells the port -P where ssh spells it
+  # -p, and -p to scp means something else entirely.
+  $SSH "cat > /tmp/systemd-mcpd" \
+    <"$REPO/target/x86_64-unknown-linux-musl/release/systemd-mcpd" || fail "$name: copy binary"
   $SSH sudo install -m755 /tmp/systemd-mcpd /usr/local/bin/systemd-mcpd
 
   say "$name: live suites in guest"
   MCPD="$SSH sudo /usr/local/bin/systemd-mcpd" HOST="$SSH sudo" \
     bash "$REPO/tests/integration.sh" || fail "$name: integration.sh"
-  MCPD="$SSH sudo /usr/local/bin/systemd-mcpd" HOST="$SSH sudo" \
-    MCPD_NO_PATH="$SSH sudo env PATH=/nonexistent /usr/local/bin/systemd-mcpd" \
-    bash "$REPO/tests/varlink-proof.sh" || vm_note "$name: varlink-proof skipped or failed (needs systemd >= 258)"
+
+  # The proof needs PID 1 to serve the socket. Skip it where the guest
+  # predates that rather than running it and swallowing the failure;
+  # the fallback path is covered by integration.sh above.
+  if $SSH sudo test -S /run/systemd/io.systemd.Manager; then
+    MCPD="$SSH sudo /usr/local/bin/systemd-mcpd" HOST="$SSH sudo" \
+      MCPD_NO_PATH="$SSH sudo env PATH=/nonexistent /usr/local/bin/systemd-mcpd" \
+      bash "$REPO/tests/varlink-proof.sh" || fail "$name: varlink-proof.sh"
+  else
+    vm_note "$name: no varlink socket, so this guest exercises the CLI fallback only"
+  fi
 
   vm_boot_phases "$name" "$SSH"
   vm_reboot_persistence "$name" "$SSH" "$ssh_opts" "$user" "$pid"
@@ -151,26 +184,55 @@ vm_teardown() {
   rm -rf "$work"
 }
 
-# A guest boots with an initrd, so the phase is non-zero here and the
-# totals must match what systemd-analyze reports.
+# Checks the phase arithmetic against the manager's own timestamps on a
+# real boot, and reports which phases the guest actually exercised.
+#
+# InitRDTimestampMonotonic is only set when systemd runs inside the
+# initrd (dracut does this, Debian's initramfs-tools does not), so the
+# initrd phase is asserted only where the guest provides it.
 vm_boot_phases() {
-  local name=$1 SSH=$2 times analyze
-  say "$name: boot phases against systemd-analyze"
+  local name=$1 SSH=$2 times props
+  say "$name: boot phases against the manager timestamps"
   times=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"boot_times","arguments":{}}}\n' |
     $SSH sudo /usr/local/bin/systemd-mcpd --grant boot:read |
     jq -r '.result.content[0].text')
-  jq -e '.initrd_usec > 0' <<<"$times" >/dev/null ||
-    fail "$name: initrd phase is zero in a guest that booted with an initrd: $times"
-  jq -e '.kernel_usec > 0 and .userspace_usec > 0 and .total_usec > 0' <<<"$times" >/dev/null ||
-    fail "$name: implausible boot_times: $times"
-  # systemd-analyze prints microseconds with --json=short in >= 256; on
-  # older guests fall back to comparing against the manager property.
-  analyze=$($SSH sudo systemctl show --property=FinishTimestampMonotonic --value)
-  [ "$(jq -r '.total_usec' <<<"$times")" -ge "$analyze" ] ||
-    fail "$name: total_usec below FinishTimestampMonotonic ($times vs $analyze)"
-  printf '   initrd=%s kernel=%s userspace=%s total=%s\n' \
-    "$(jq -r .initrd_usec <<<"$times")" "$(jq -r .kernel_usec <<<"$times")" \
-    "$(jq -r .userspace_usec <<<"$times")" "$(jq -r .total_usec <<<"$times")"
+  props=$($SSH sudo systemctl show --no-pager \
+    --property=FirmwareTimestampMonotonic,LoaderTimestampMonotonic,InitRDTimestampMonotonic,UserspaceTimestampMonotonic,FinishTimestampMonotonic)
+  local fw ld ir us fi
+  fw=$(sed -n 's/^FirmwareTimestampMonotonic=//p' <<<"$props")
+  ld=$(sed -n 's/^LoaderTimestampMonotonic=//p' <<<"$props")
+  ir=$(sed -n 's/^InitRDTimestampMonotonic=//p' <<<"$props")
+  us=$(sed -n 's/^UserspaceTimestampMonotonic=//p' <<<"$props")
+  fi=$(sed -n 's/^FinishTimestampMonotonic=//p' <<<"$props")
+
+  [ "$fi" -gt 0 ] || fail "$name: guest reports an unfinished boot"
+  # The same arithmetic compute_boot_times performs, done independently
+  # from the raw properties.
+  local want_kernel want_userspace want_total
+  if [ "$ir" -gt 0 ]; then want_kernel=$ir; else want_kernel=$us; fi
+  want_userspace=$((fi - us))
+  want_total=$(( (fw > ld ? fw : ld) + fi ))
+  [ "$(jq -r .kernel_usec <<<"$times")" = "$want_kernel" ] ||
+    fail "$name: kernel_usec disagrees with the manager: $times vs $want_kernel"
+  [ "$(jq -r .userspace_usec <<<"$times")" = "$want_userspace" ] ||
+    fail "$name: userspace_usec disagrees: $times vs $want_userspace"
+  [ "$(jq -r .total_usec <<<"$times")" = "$want_total" ] ||
+    fail "$name: total_usec disagrees: $times vs $want_total"
+
+  local covered="kernel userspace total"
+  if [ "$ir" -gt 0 ]; then
+    jq -e '.initrd_usec > 0' <<<"$times" >/dev/null ||
+      fail "$name: guest sets InitRDTimestampMonotonic but initrd_usec is absent: $times"
+    covered="$covered initrd"
+  else
+    vm_note "$name: systemd did not run in the initrd, so the initrd phase is unset here"
+  fi
+  if [ "$ld" -gt 0 ]; then
+    jq -e '.loader_usec > 0' <<<"$times" >/dev/null ||
+      fail "$name: guest sets LoaderTimestampMonotonic but loader_usec is absent: $times"
+    covered="$covered loader"
+  fi
+  printf '   phases verified against the manager: %s\n' "$covered"
 }
 
 # enable means "starts at next boot". Nothing short of a reboot checks
@@ -178,7 +240,11 @@ vm_boot_phases() {
 vm_reboot_persistence() {
   local name=$1 SSH=$2 ssh_opts=$3 user=$4 pid=$5 unit=mcpd-persist.service
   say "$name: enablement survives a reboot"
-  $SSH sudo bash -c "printf '[Unit]\nDescription=mcpd reboot persistence\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/$unit && systemctl daemon-reload"
+  # Over stdin: a redirect in the command string is performed by the
+  # local shell, before sudo applies in the guest.
+  printf '[Unit]\nDescription=mcpd reboot persistence\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n' |
+    $SSH sudo tee "/etc/systemd/system/$unit" >/dev/null
+  $SSH sudo systemctl daemon-reload
   # Enable it through the server's own write path, not systemctl.
   local plan
   plan=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"plan_change","arguments":{"action":"enable","unit":"%s"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"apply_plan","arguments":{"plan":1}}}\n' "$unit" |
