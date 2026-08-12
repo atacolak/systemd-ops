@@ -24,6 +24,14 @@ jobs:
         run: cargo test
       - name: Release build
         run: cargo build --release
+      - name: Man page
+        # groff -ww is the check Debian runs as
+        # manpage-has-errors-from-man; lexgrog decides whether apropos
+        # can index the page at all. The script also compares the
+        # documented scopes and flags against the built binary.
+        run: |
+          sudo apt-get install -y -qq groff man-db
+          MCPD=target/release/systemd-mcpd bash tests/manpage.sh
 
   # The declared MSRV is a promise to downstream packagers, so it is
   # checked in both directions: the floor must build, and the version

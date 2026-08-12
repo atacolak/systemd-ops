@@ -39,7 +39,7 @@ make CARGOFLAGS="--release --locked --offline"
 | Path | Contents |
 |---|---|
 | `$(bindir)/systemd-mcpd` | the binary |
-| `$(man1dir)/systemd-mcpd.1` | the man page |
+| `$(man1dir)/systemd-mcpd.1` | the man page, with the version substituted into its `.TH` line |
 | `$(unitdir)/systemd-mcpd.service` | sample hardened unit |
 | `$(docdir)/` | README and the docs directory |
 | `$(licensedir)/LICENSE` | the license |
@@ -80,6 +80,12 @@ the package. It grants read scopes only.
 ```
 make check
 ```
+
+That includes the man page check: `groff -mandoc -ww -z` (Debian's
+`manpage-has-errors-from-man`), `lexgrog` for the whatis entry, and a
+comparison of the documented scopes and flags against the built
+binary. It skips itself if groff or lexgrog is missing, so it will not
+break a minimal build chroot.
 
 The live suites under `tests/` need root, a running systemd, and the
 ability to create transient units and write to `/etc/systemd/system`.

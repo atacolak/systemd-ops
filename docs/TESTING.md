@@ -14,7 +14,20 @@ Three tiers, in cost order, plus the conformance suite.
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+MCPD=target/release/systemd-mcpd bash tests/manpage.sh
 ```
+
+`make check` runs all of them.
+
+The man page check is three things: `groff -mandoc -ww -z`, which is
+what Debian runs as `manpage-has-errors-from-man`; `lexgrog`, which
+decides whether `apropos` can index the page; and a comparison of the
+scopes and long options in the page against the ones the built binary
+reports in `--help`, in both directions. The last is the point. Bad
+roff is loud, but a page that documents a flag the binary dropped is
+silent, and the person who finds out is a user or a packager. It needs
+groff and lexgrog, and skips itself under `make check` if they are
+absent.
 
 ## Live suites
 
