@@ -1,8 +1,8 @@
 # systemd-mcpd
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server that
-exposes systemd to language-model agents. Written in Rust. Depends on
-serde and serde_json, nothing else.
+exposes systemd to language-model agents. Written in Rust; the
+dependencies are serde and serde_json.
 
 Three rules, enforced in code:
 
@@ -11,12 +11,12 @@ Three rules, enforced in code:
    command line, where it is visible in the process table.
 2. Scopes gate both visibility and execution. Tools outside the granted
    scopes are not advertised in `tools/list` and are refused in
-   `tools/call`. Hiding a tool is presentation; refusing the call is the
-   control.
-3. Writes go through plan/apply or not at all. No tool mutates directly:
-   a change is first planned — a read-only step returning current state,
-   predicted state, rollback action, and a plan id — then applied by id.
-   Apply re-checks the state the plan was made against and refuses stale
+   `tools/call`; an unadvertised tool must also fail when called
+   directly.
+3. All writes go through plan/apply. No tool mutates directly: a change
+   is first planned (a read-only step returning current state, predicted
+   state, rollback action, and a plan id), then applied by id. Apply
+   re-checks the state the plan was made against and refuses stale
    plans.
 
 ## Invocation
@@ -38,9 +38,8 @@ unknown scope is an error, not a warning.
 | `boot:read`    | boot phase timings, critical chain, blame                |
 | `units:write`  | unit state changes (start, stop, restart, reload), only through plan/apply |
 
-Scopes are independent. Grant the subset you mean; grant `units:write`
-only where the agent is supposed to operate the machine rather than
-inspect it.
+Scopes are independent. Grant `units:write` only where the agent is
+expected to operate the machine rather than inspect it.
 
 MCP client configuration (any MCP client; Claude Desktop shown):
 
@@ -111,7 +110,7 @@ have started so far; that too mirrors systemd-analyze.
 
 ## Write path
 
-The write path is deliberately narrow.
+The write path covers unit state changes only.
 
 - Only unit state changes: start, stop, restart, reload. Enablement
   changes (enable, disable, mask) modify the filesystem and are not
@@ -130,8 +129,8 @@ The write path is deliberately narrow.
 - Privileges are the invoking user's. An unprivileged user can plan
   anything but apply only what polkit permits; the refusal is
   systemctl's, passed through as a tool error.
-- The one mutating process invocation in the program sits at the end of
-  the apply path; nothing else reaches it.
+- The program contains one mutating process invocation, at the end of
+  the apply path; no other code path reaches it.
 
 ## Errors
 
@@ -146,8 +145,7 @@ Failures travel on two channels, and the distinction is deliberate:
 
 ## Permissions
 
-The server holds no privileges of its own; it sees exactly what the
-invoking user can see.
+The server runs with the invoking user's privileges and no others.
 
 - `units:read`, `boot:read`: PID 1's varlink socket is
   world-connectable and systemctl works unprivileged. No setup needed.
@@ -174,7 +172,7 @@ normalized to the same output shape and the caller cannot tell which
 one answered; the state filter is applied after either backend so the
 filter semantics cannot diverge.
 
-Journal reads stay on journalctl deliberately. The varlink journal API
+Journal reads stay on journalctl. The varlink journal API
 (`io.systemd.JournalAccess`, systemd 260) is served by executing
 journalctl, not by a bound socket, so calling it would spawn the same
 process for a less capable interface.
@@ -188,7 +186,8 @@ it reads dependency edges from unit properties instead of scraping the
 `list-dependencies` tree rendering.
 
 There is no async runtime. The stdio transport is a pipe read in a
-blocking loop; an executor would add binary size and nothing else.
+blocking loop; an executor would add binary size without adding
+capability.
 
 ## Building
 
