@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Live integration test: drives systemd-mcpd over stdio against a real,
+# Live integration test: drives systemd-ops-mcp over stdio against a real,
 # running systemd and asserts on the JSON replies with jq.
 #
 # Environment:
 #   MCPD  command that runs the server binary
-#         (default: target/release/systemd-mcpd)
+#         (default: target/release/systemd-ops-mcp)
 #   HOST  command prefix that executes commands on the same systemd the
 #         server talks to; empty means "right here"
 #         (e.g. "docker exec -i sysd" when the server runs in a
@@ -15,8 +15,9 @@
 # transient units (root, or a root docker exec into a container).
 set -euo pipefail
 
-MCPD=${MCPD:-target/release/systemd-mcpd}
+MCPD=${MCPD:-target/release/systemd-ops-mcp}
 HOST=${HOST:-}
+
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -58,12 +59,11 @@ expect_error units:read unit_properties '{"unit":"x;bad"}' "not a valid unit nam
 echo "== protocol eras (2026-07-28 and initialize-based)"
 # A modern request declares its version and the client's capabilities in
 # _meta; there is no handshake. The reply must carry the era's fields.
-META='"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}'
 discover=$(rpc units:read "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{$META}}")
 jq -e '.result.resultType == "complete"
        and (.result.supportedVersions | index("2026-07-28"))
        and (.result.ttlMs >= 0) and (.result.cacheScope == "public")
-       and (.result._meta["io.modelcontextprotocol/serverInfo"].name == "systemd-mcpd")' \
+       and (.result._meta["io.modelcontextprotocol/serverInfo"].name == "systemd-ops-mcp")' \
   <<<"$discover" >/dev/null || fail "server/discover malformed: $discover"
 # A probe that has not picked a version yet is still answered.
 rpc units:read '{"jsonrpc":"2.0","id":1,"method":"server/discover"}' |
@@ -87,7 +87,7 @@ rpc units:read '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":
   fail "missing clientCapabilities was not rejected"
 # ...and the handshake era still works, unchanged.
 rpc units:read '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}' |
-  jq -e '.result.protocolVersion == "2025-11-25" and .result.serverInfo.name == "systemd-mcpd"
+  jq -e '.result.protocolVersion == "2025-11-25" and .result.serverInfo.name == "systemd-ops-mcp"
          and (.result | has("resultType") | not)' >/dev/null ||
   fail "legacy initialize reply wrong"
 rpc units:read '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' |
@@ -303,11 +303,11 @@ else
   # test would legitimately change: where the binary is, and where the
   # socket lives.
   sed -e "s|ListenStream=.*|ListenStream=$SOCKET_PATH|" \
-      -e 's|^Documentation=.*||' tests/../systemd-mcpd.socket |
+      -e 's|^Documentation=.*||' tests/../systemd-ops-mcp.socket |
     $HOST tee "$SOCKET_UNIT" >/dev/null
   $HOST cp "${MCPD##* }" "$SOCKET_BIN"
   sed -e "s|^ExecStart=.*|ExecStart=$SOCKET_BIN --grant units:read|" \
-      -e 's|^Documentation=.*||' tests/../systemd-mcpd@.service |
+      -e 's|^Documentation=.*||' tests/../systemd-ops-mcp@.service |
     $HOST tee "$SERVICE_UNIT" >/dev/null
   $HOST test -s "$SOCKET_UNIT" || fail "socket unit is empty: does HOST forward stdin?"
   $HOST systemctl daemon-reload
@@ -382,80 +382,77 @@ fi
 echo "== write path (plan/apply)"
 wnames=$(rpc units:write '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' |
   jq -r '.result.tools | map(.name) | join(",")')
-[ "$wnames" = "plan_change,apply_plan" ] ||
+[ "$wnames" = "plan_change,plan_create_operation,plan_update_operation,plan_retire_operation,apply_plan" ] ||
   fail "tools/list under units:write advertised: $wnames"
 expect_error units:read plan_change '{"action":"start","unit":"x.service"}' "units:write"
-expect_error units:write apply_plan '{"plan":424242}' "unknown plan"
+expect_error units:write apply_plan '{"plan_token":"not-a-token"}' "invalid plan token"
 
 # A disposable unit to operate on, with an [Install] section so the
 # enablement actions have something to work with.
 # Content goes over stdin: a redirect inside the command would be
 # performed by whichever shell ssh hands the string to, not in the guest.
-printf '[Unit]\nDescription=systemd-mcpd write-path test unit\n[Service]\nExecStart=/bin/sleep 300\n[Install]\nWantedBy=multi-user.target\n' |
+printf '[Unit]\nDescription=systemd-ops write-path test unit\n[Service]\nExecStart=/bin/sleep 300\n[Install]\nWantedBy=multi-user.target\n' |
   $HOST tee "$WRITE_UNIT" >/dev/null
-# systemd reads a zero-length unit file as masked, which surfaces much
-# later as a confusing "is masked" failure. Catch it here instead.
 $HOST test -s "$WRITE_UNIT" ||
   fail "unit file is empty: does HOST forward stdin? (docker exec needs -i)"
 $HOST systemctl daemon-reload
 
-# Plan and apply in one session (plans are per-session; the first id is 1).
-replies=$(rpc units:write \
-  "$(call plan_change '{"action":"start","unit":"mcpd-write-test.service"}')" \
-  "$(call apply_plan '{"plan":1}')")
-planned=$(sed -n 1p <<<"$replies" | jq -r '.result.content[0].text')
-applied=$(sed -n 2p <<<"$replies" | jq -r '.result.content[0].text')
-jq -e '.plan == 1 and .current.active == "inactive" and .rollback.action == "stop"' \
+write_rpc() {
+  printf '%s\n' "$@" | $MCPD --grant units:write --write-prefix '*'
+}
+
+planned=$(write_rpc "$(call plan_change '{"action":"start","unit":"mcpd-write-test.service"}')" |
+  jq -r '.result.content[0].text')
+jq -e '.plan_token and .current.active == "inactive" and .rollback.action == "stop"' \
   <<<"$planned" >/dev/null || fail "plan_change reply malformed: $planned"
+token=$(jq -r '.plan_token' <<<"$planned")
+applied=$(write_rpc "$(call apply_plan "{\"plan_token\":\"$token\"}")" |
+  jq -r '.result.content[0].text')
 jq -e '.applied == true and .diff.active.before == "inactive" and .diff.active.after == "active"' \
   <<<"$applied" >/dev/null || fail "apply_plan diff malformed: $applied"
-# The world must have actually changed, per an independent witness.
 [ "$($HOST systemctl is-active mcpd-write-test.service)" = "active" ] ||
   fail "unit not active after apply"
 
+
 # Stale plans are refused: plan against a state, change that state
-# out-of-band, apply must refuse. Needs one long-lived session.
-coproc SRV { $MCPD --grant units:write; }
+# out-of-band, apply must refuse.
+coproc SRV { $MCPD --grant units:write --write-prefix '*'; }
 printf '%s\n' "$(call plan_change '{"action":"stop","unit":"mcpd-write-test.service"}')" >&"${SRV[1]}"
 read -t 30 -r planned2 <&"${SRV[0]}" || fail "no reply from server (plan)"
-plan_id=$(jq -r '.result.content[0].text | fromjson | .plan' <<<"$planned2")
+token2=$(jq -r '.result.content[0].text | fromjson | .plan_token' <<<"$planned2")
 $HOST systemctl stop mcpd-write-test.service || fail "out-of-band stop failed"
-printf '%s\n' "$(call apply_plan "{\"plan\":$plan_id}")" >&"${SRV[1]}"
+printf '%s\n' "$(call apply_plan "{\"plan_token\":\"$token2\"}")" >&"${SRV[1]}"
 read -t 30 -r stale <&"${SRV[0]}" || fail "no reply from server (apply)"
 jq -r '.result.content[0].text' <<<"$stale" | grep -qF "stale" ||
   fail "stale plan was not refused: $stale"
 kill "$SRV_PID" 2>/dev/null || true
 
+
 echo "== write path (enablement)"
-replies=$(rpc units:write \
-  "$(call plan_change '{"action":"enable","unit":"mcpd-write-test.service"}')" \
-  "$(call apply_plan '{"plan":1}')")
-en_planned=$(sed -n 1p <<<"$replies" | jq -r '.result.content[0].text')
-en_applied=$(sed -n 2p <<<"$replies" | jq -r '.result.content[0].text')
+en_planned=$(write_rpc "$(call plan_change '{"action":"enable","unit":"mcpd-write-test.service"}')" |
+  jq -r '.result.content[0].text')
+en_token=$(jq -r '.plan_token' <<<"$en_planned")
+en_applied=$(write_rpc "$(call apply_plan "{\"plan_token\":\"$en_token\"}")" |
+  jq -r '.result.content[0].text')
 jq -e '.current.unit_file_state == "disabled" and .predicted.unit_file_state == "enabled" and .rollback.action == "disable"' \
   <<<"$en_planned" >/dev/null || fail "enable plan malformed: $en_planned"
 jq -e '.diff.unit_file_state.before == "disabled" and .diff.unit_file_state.after == "enabled" and (.changes | length > 0)' \
   <<<"$en_applied" >/dev/null || fail "enable apply diff malformed: $en_applied"
 [ "$($HOST systemctl is-enabled mcpd-write-test.service)" = "enabled" ] ||
   fail "unit not enabled after apply"
-# ...and back, exercising the reported rollback action.
-rpc units:write \
-  "$(call plan_change '{"action":"disable","unit":"mcpd-write-test.service"}')" \
-  "$(call apply_plan '{"plan":1}')" >/dev/null
+dis_planned=$(write_rpc "$(call plan_change '{"action":"disable","unit":"mcpd-write-test.service"}')" |
+  jq -r '.result.content[0].text')
+dis_token=$(jq -r '.plan_token' <<<"$dis_planned")
+write_rpc "$(call apply_plan "{\"plan_token\":\"$dis_token\"}")" >/dev/null
 [ "$($HOST systemctl is-enabled mcpd-write-test.service)" = "disabled" ] ||
   fail "unit not disabled after rollback apply"
-# Stale enablement plan: plan mask (recording unit_file_state
-# "disabled"), enable the unit out-of-band, apply must refuse. The
-# out-of-band change is enable rather than mask because mask fails for
-# units whose fragment lives in /etc/systemd/system, because masking wants to
-# place its /dev/null symlink at that exact path.
-coproc SRV2 { $MCPD --grant units:write; }
+coproc SRV2 { $MCPD --grant units:write --write-prefix '*'; }
 printf '%s\n' "$(call plan_change '{"action":"mask","unit":"mcpd-write-test.service"}')" >&"${SRV2[1]}"
 read -t 30 -r m_planned <&"${SRV2[0]}" || fail "no reply from server (mask plan)"
-m_id=$(jq -r '.result.content[0].text | fromjson | .plan' <<<"$m_planned")
+m_token=$(jq -r '.result.content[0].text | fromjson | .plan_token' <<<"$m_planned")
 $HOST systemctl enable mcpd-write-test.service >/dev/null 2>&1 ||
   fail "out-of-band enable failed"
-printf '%s\n' "$(call apply_plan "{\"plan\":$m_id}")" >&"${SRV2[1]}"
+printf '%s\n' "$(call apply_plan "{\"plan_token\":\"$m_token\"}")" >&"${SRV2[1]}"
 read -t 30 -r m_stale <&"${SRV2[0]}" || fail "no reply from server (mask apply)"
 jq -r '.result.content[0].text' <<<"$m_stale" | grep -qF "stale" ||
   fail "stale enablement plan was not refused: $m_stale"
@@ -467,18 +464,15 @@ $HOST rm -f "$WRITE_UNIT"
 $HOST systemctl daemon-reload
 
 echo "== write path (log tuning)"
-# Bad values are protocol errors before anything runs.
 expect_error units:write plan_change '{"action":"log-level","unit":"systemd-journald.service","value":"chatty"}' "unknown log level"
 expect_error units:write plan_change '{"action":"log-level","unit":"systemd-journald.service"}' "requires a value"
 expect_error units:write plan_change '{"action":"start","unit":"x.service","value":"debug"}' "only accepted for"
 if [ -n "$lc_unit" ]; then
-  # Tune the probed service to debug, then restore it with the
-  # rollback value the plan reported.
-  replies=$(rpc units:write \
-    "$(call plan_change "{\"action\":\"log-level\",\"unit\":\"$lc_unit\",\"value\":\"debug\"}")" \
-    "$(call apply_plan '{"plan":1}')")
-  ll_planned=$(sed -n 1p <<<"$replies" | jq -r '.result.content[0].text')
-  ll_applied=$(sed -n 2p <<<"$replies" | jq -r '.result.content[0].text')
+  ll_planned=$(write_rpc "$(call plan_change "{\"action\":\"log-level\",\"unit\":\"$lc_unit\",\"value\":\"debug\"}")" |
+    jq -r '.result.content[0].text')
+  ll_token=$(jq -r '.plan_token' <<<"$ll_planned")
+  ll_applied=$(write_rpc "$(call apply_plan "{\"plan_token\":\"$ll_token\"}")" |
+    jq -r '.result.content[0].text')
   prev_level=$(jq -r '.current.log_level' <<<"$ll_planned")
   [ -n "$prev_level" ] || fail "log-level plan recorded no current level"
   jq -e '.predicted.log_level == "debug" and .rollback.action == "log-level" and .rollback.value != null' \
@@ -487,14 +481,13 @@ if [ -n "$lc_unit" ]; then
     fail "log-level apply diff malformed: $ll_applied"
   [ "$($HOST systemctl service-log-level "$lc_unit")" = "debug" ] ||
     fail "$lc_unit log level not debug after apply"
-  rpc units:write \
-    "$(call plan_change "{\"action\":\"log-level\",\"unit\":\"$lc_unit\",\"value\":\"$prev_level\"}")" \
-    "$(call apply_plan '{"plan":1}')" >/dev/null
+  restore=$(write_rpc "$(call plan_change "{\"action\":\"log-level\",\"unit\":\"$lc_unit\",\"value\":\"$prev_level\"}")" |
+    jq -r '.result.content[0].text')
+  restore_token=$(jq -r '.plan_token' <<<"$restore")
+  write_rpc "$(call apply_plan "{\"plan_token\":\"$restore_token\"}")" >/dev/null
   [ "$($HOST systemctl service-log-level "$lc_unit")" = "$prev_level" ] ||
     fail "$lc_unit log level not restored to $prev_level"
 else
-  # No LogControl1 service: the plan itself must surface systemd's
-  # BusName error as a tool error.
   expect_error units:write plan_change '{"action":"log-level","unit":"systemd-journald.service","value":"debug"}' "BusName"
 fi
 

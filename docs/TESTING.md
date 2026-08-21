@@ -61,8 +61,8 @@ create transient units, write a unit file, and read the system journal:
 
 ```
 cargo build --release
-MCPD=$PWD/target/release/systemd-mcpd HOST= sudo bash tests/integration.sh
-MCPD=$PWD/target/release/systemd-mcpd HOST= sudo bash tests/varlink-proof.sh
+MCPD=$PWD/target/release/systemd-ops-mcp HOST= sudo bash tests/integration.sh
+MCPD=$PWD/target/release/systemd-ops-mcp HOST= sudo bash tests/varlink-proof.sh
 ```
 
 `varlink-proof.sh` also needs a systemd new enough to serve the socket,
@@ -90,12 +90,12 @@ tests servers over HTTP only, and this one is stdio only.
 `tests/http-shim.py` bridges the two for testing and ships with
 nothing: it writes the request body to the server's stdin unchanged and
 returns the reply line unchanged, so the suite judges the bytes
-systemd-mcpd produces rather than a bridge's re-serialization. Note the
+systemd-ops-mcp produces rather than a bridge's re-serialization. Note the
 version: `latest` on npm carries no 2026-07-28 server scenarios yet.
 
 ```
 python3 tests/http-shim.py --port 3000 -- \
-  ./target/release/systemd-mcpd --grant units:read,journal:read,boot:read,units:write &
+  ./target/release/systemd-ops-mcp --grant units:read,journal:read,boot:read,units:write &
 npx @modelcontextprotocol/conformance@0.2.0-alpha.11 server \
   --url http://127.0.0.1:3000/mcp --scenario tools-list --spec-version 2026-07-28
 ```

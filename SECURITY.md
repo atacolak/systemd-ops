@@ -24,8 +24,10 @@ The claims this project makes, and therefore the ones worth breaking:
 - **No shell, ever.** Arguments are argv elements. A unit name reaches
   a command line only after `--` or inside a single `--flag=value`,
   and only after validation.
-- **The server acquires no privilege.** It runs as whoever spawned it,
-  is not setuid, and reads no configuration from the environment.
+- **The server acquires no privilege.** It runs as whoever spawned it
+  and is not setuid. Optional config (`--config`,
+  `$XDG_CONFIG_HOME/systemd-ops/config.toml`, `SYSTEMD_OPS_*`) can
+  set manager, write-prefix, and plan TTL. It cannot widen MCP grants.
 
 A way around any of those is a vulnerability. So is anything that makes
 the socket unit reachable by a user the operator did not intend.

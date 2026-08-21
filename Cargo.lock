@@ -87,8 +87,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "systemd-mcpd"
-version = "0.6.0"
+name = "systemd-ops"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",

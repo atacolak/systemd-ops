@@ -1,19 +1,19 @@
-# systemd-mcpd: one hardened server per connection.
+# systemd-ops-mcp: one hardened server per connection.
 #
-# A template, instantiated by systemd-mcpd.socket for each connection.
+# A template, instantiated by systemd-ops-mcp.socket for each connection.
 # An MCP client that spawns the binary itself needs none of this; the
 # file is here for the case where an instance is supervised instead,
 # and for the hardening, which is worth copying either way.
 
 [Unit]
 Description=Model Context Protocol server for systemd (read-only grants)
-Documentation=man:systemd-mcpd(1)
+Documentation=man:systemd-ops-mcp(1)
 
 [Service]
 # Read scopes only. units:write is not granted here; add it only when
 # this instance is expected to operate the machine rather than inspect
 # it.
-ExecStart=/usr/local/bin/systemd-mcpd --grant units:read,journal:read,boot:read
+ExecStart=/usr/local/bin/systemd-ops-mcp --grant units:read,journal:read,boot:read
 DynamicUser=yes
 SupplementaryGroups=systemd-journal
 
@@ -64,5 +64,5 @@ ProcSubset=pid
 # It creates no files. If a future version does, they are its own.
 UMask=0077
 
-# No [Install]: instances are started by systemd-mcpd.socket, which is
+# No [Install]: instances are started by systemd-ops-mcp.socket, which is
 # the unit to enable.

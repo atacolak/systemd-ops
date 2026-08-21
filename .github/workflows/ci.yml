@@ -44,19 +44,19 @@ jobs:
       - name: Staged install
         run: |
           make DESTDIR=/tmp/stage prefix=/usr install
-          for f in /tmp/stage/usr/bin/systemd-mcpd \
-                   /tmp/stage/usr/share/man/man1/systemd-mcpd.1 \
-                   /tmp/stage/usr/lib/systemd/system/systemd-mcpd.socket \
-                   /tmp/stage/usr/lib/systemd/system/systemd-mcpd@.service \
-                   /tmp/stage/usr/share/licenses/systemd-mcpd/LICENSE; do
+          for f in /tmp/stage/usr/bin/systemd-ops \
+                   /tmp/stage/usr/bin/systemd-ops-mcp \
+                   /tmp/stage/usr/share/man/man1/systemd-ops-mcp.1 \
+                   /tmp/stage/usr/lib/systemd/system/systemd-ops-mcp.socket \
+                   /tmp/stage/usr/lib/systemd/system/systemd-ops-mcp@.service \
+                   /tmp/stage/usr/share/licenses/systemd-ops/LICENSE; do
             [ -e "$f" ] || { echo "::error::make install did not produce $f"; exit 1; }
           done
-          # The ExecStart rewrite is the part with no other check.
-          grep -q '^ExecStart=/usr/bin/systemd-mcpd ' \
-            /tmp/stage/usr/lib/systemd/system/systemd-mcpd@.service ||
+          grep -q '^ExecStart=/usr/bin/systemd-ops-mcp ' \
+            /tmp/stage/usr/lib/systemd/system/systemd-ops-mcp@.service ||
             { echo "::error::install did not rewrite ExecStart to bindir"; exit 1; }
           make DESTDIR=/tmp/stage prefix=/usr uninstall
-          ! find /tmp/stage -name 'systemd-mcpd*' | grep -q . ||
+          ! find /tmp/stage -name 'systemd-ops*' | grep -q . ||
             { echo "::error::uninstall left files behind"; exit 1; }
       - name: Crate packages
         # Publishing is not automated, but a crate that cannot be built
@@ -128,9 +128,9 @@ jobs:
         # ExecStart= and follows Documentation=, and reports a missing
         # either as a failure.
         run: |
-          sudo cp target/release/systemd-mcpd /usr/local/bin/
-          sudo install -D -m 0644 systemd-mcpd.1 /usr/share/man/man1/systemd-mcpd.1
-          systemd-analyze verify ./systemd-mcpd.socket ./systemd-mcpd@.service
+          sudo cp target/release/systemd-ops-mcp /usr/local/bin/
+          sudo install -D -m 0644 systemd-ops-mcp.1 /usr/share/man/man1/systemd-ops-mcp.1
+          systemd-analyze verify ./systemd-ops-mcp.socket ./systemd-ops-mcp@.service
       - name: Live integration tests
         # Root, so the transient canary unit and the system journal are
         # reachable without group membership setup.
@@ -161,7 +161,7 @@ jobs:
         run: |
           docker run -d --name sysd --privileged --cgroupns=host \
             --tmpfs /run --tmpfs /tmp -e container=docker \
-            -v "$PWD/target/x86_64-unknown-linux-musl/release/systemd-mcpd:/usr/local/bin/systemd-mcpd:ro" \
+            -v "$PWD/target/x86_64-unknown-linux-musl/release/systemd-ops-mcp:/usr/local/bin/systemd-ops-mcp:ro" \
             fedora:latest \
             bash -c 'dnf -y install systemd || dnf -y install systemd || dnf -y install systemd; exec /usr/lib/systemd/systemd'
           ready=
@@ -178,12 +178,12 @@ jobs:
           docker exec sysd systemctl --version | head -1
       - name: Live integration tests (varlink host)
         run: |
-          MCPD="docker exec -i sysd /usr/local/bin/systemd-mcpd" \
+          MCPD="docker exec -i sysd /usr/local/bin/systemd-ops-mcp" \
           HOST="docker exec -i sysd" bash tests/integration.sh
       - name: Backend proof and differential
         # MCPD_NO_PATH is spelled out because a bare `env PATH=` prefix
         # would strip PATH from docker, not from the server inside it.
         run: |
-          MCPD="docker exec -i sysd /usr/local/bin/systemd-mcpd" \
-          MCPD_NO_PATH="docker exec -i -e PATH=/nonexistent sysd /usr/local/bin/systemd-mcpd" \
+          MCPD="docker exec -i sysd /usr/local/bin/systemd-ops-mcp" \
+          MCPD_NO_PATH="docker exec -i -e PATH=/nonexistent sysd /usr/local/bin/systemd-ops-mcp" \
           HOST="docker exec -i sysd" bash tests/varlink-proof.sh

@@ -46,7 +46,7 @@ jobs:
 
       - name: Source tarball
         run: |
-          name=systemd-mcpd-${GITHUB_REF_NAME#v}
+          name=systemd-ops-${GITHUB_REF_NAME#v}
           git archive --format=tar --prefix="$name/" HEAD | gzip -9n > "$name.tar.gz"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
 
@@ -54,7 +54,7 @@ jobs:
       # Includes the config cargo needs to use it.
       - name: Vendor tarball
         run: |
-          name=systemd-mcpd-${GITHUB_REF_NAME#v}
+          name=systemd-ops-${GITHUB_REF_NAME#v}
           cargo vendor --locked vendor > vendor-config.toml
           tar -czf "$name-vendor.tar.gz" vendor vendor-config.toml
           sha256sum "$name-vendor.tar.gz" > "$name-vendor.tar.gz.sha256"
@@ -66,4 +66,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --notes "See CHANGELOG.md for what changed." \
-            systemd-mcpd-*.tar.gz systemd-mcpd-*.tar.gz.sha256
+            systemd-ops-*.tar.gz systemd-ops-*.tar.gz.sha256

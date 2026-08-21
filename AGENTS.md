@@ -4,21 +4,30 @@ Working notes for coding agents. Conventions and gotchas that are not
 evident from the source.
 
 ## What this is
-
-An MCP server exposing systemd to language-model clients. Line-delimited
-JSON-RPC 2.0 on stdin/stdout, no async runtime, no libsystemd linkage.
-Dependencies are serde and serde_json; adding a third needs a reason
-that survives review.
+A systemd operations engine with a direct CLI and an optional MCP
+frontend. Line-delimited JSON-RPC 2.0 on stdin/stdout for MCP; JSON
+envelope on stdout for `systemd-ops --json`. No async runtime, no
+libsystemd linkage. Dependencies are serde and serde_json; adding a
+third needs a reason that survives review.
 
 ## Layout
 
-| File             | Holds                                                    |
-|------------------|----------------------------------------------------------|
-| `src/main.rs`    | argument parsing, `--grant`, usage text                  |
-| `src/mcp.rs`     | protocol, tool registry, scope gating                    |
-| `src/systemd.rs` | backend: process invocation, parsers, scope definitions  |
-| `src/varlink.rs` | varlink client for PID 1's socket                        |
-| `src/write.rs`   | plan/apply state machine                                 |
+| File                    | Holds                                                    |
+|-------------------------|----------------------------------------------------------|
+| `src/lib.rs`            | crate root                                               |
+| `src/bin/systemd_ops.rs`    | direct CLI (`inspect`/`control`/`author`)            |
+| `src/bin/systemd_ops_mcp.rs`| optional MCP frontend                                |
+| `src/mcp.rs`            | protocol, tool registry, scope gating                    |
+| `src/operations.rs`     | OperationSpec, OperationView, authoring plans            |
+| `src/sha256.rs`         | spec/file digest and HMAC-SHA256                         |
+| `src/token.rs`          | sealed plan tokens                                       |
+| `src/config.rs`         | local config, write-prefix, HMAC key                     |
+| `src/json.rs`           | `--json` envelope                                        |
+| `src/systemd.rs`        | backend: process invocation, parsers, scope definitions  |
+| `src/varlink.rs`        | varlink client for PID 1's socket                        |
+| `src/write.rs`          | plan/apply (lifecycle + authoring)                       |
+| `omp/systemd.ts`        | OMP custom tools spawning `systemd-ops --json`           |
+
 
 Actions are pinned by major tag and kept current by
 `.github/dependabot.yml`, not pinned by commit SHA. A SHA pin is
@@ -27,8 +36,8 @@ version. Do not convert them without also deciding who does the
 bumping.
 
 Packaging surface, kept in step with the code: `Makefile` (install
-targets), `systemd-mcpd.1` (man page), `systemd-mcpd.socket` and
-`systemd-mcpd@.service` (the socket-activated pair), `CHANGELOG.md`,
+targets), `systemd-ops-mcp.1` (man page), `systemd-ops-mcp.socket` and
+`systemd-ops-mcp@.service` (the socket-activated pair), `CHANGELOG.md`,
 and `docs/PACKAGING.md`. A new flag or scope
 means updating the man page and the changelog too. `rust-version` in
 `Cargo.toml` is a promise to packagers and CI checks it in both
@@ -75,8 +84,8 @@ for this machine):
 
 ```
 cargo build --release
-MCPD=$PWD/target/release/systemd-mcpd HOST= sudo bash tests/integration.sh
-MCPD=$PWD/target/release/systemd-mcpd HOST= sudo bash tests/varlink-proof.sh
+MCPD=$PWD/target/release/systemd-ops-mcp HOST= sudo bash tests/integration.sh
+MCPD=$PWD/target/release/systemd-ops-mcp HOST= sudo bash tests/varlink-proof.sh
 ```
 
 Root is required: the suites create transient units, write a unit file

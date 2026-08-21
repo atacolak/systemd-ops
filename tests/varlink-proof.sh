@@ -22,7 +22,7 @@ MCPD=${MCPD:?set MCPD to the server command}
 HOST=${HOST?set HOST to the command prefix reaching the systemd host, empty for this machine}
 # The same server, run so that no executable is reachable on PATH.
 # Override where the plain prefix cannot carry the environment, e.g.
-# MCPD_NO_PATH="docker exec -i -e PATH=/nonexistent sysd /usr/local/bin/systemd-mcpd".
+# MCPD_NO_PATH="docker exec -i -e PATH=/nonexistent sysd /usr/local/bin/systemd-ops-mcp".
 MCPD_NO_PATH=${MCPD_NO_PATH:-env PATH=/nonexistent $MCPD}
 SOCKET=/run/systemd/io.systemd.Manager
 

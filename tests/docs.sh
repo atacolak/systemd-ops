@@ -14,7 +14,7 @@
 #   bash tests/docs.sh
 set -euo pipefail
 
-PAGE=${PAGE:-systemd-mcpd.1}
+PAGE=${PAGE:-systemd-ops-mcp.1}
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 

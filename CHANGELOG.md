@@ -4,6 +4,23 @@ Versions are the crate versions in `Cargo.toml`. Dates are the release
 dates; entries describe what changed on the wire or on disk, since that
 is what a downstream package has to care about.
 
+## unreleased (not published)
+
+The crate is `systemd-ops`. Direct CLI `systemd-ops` is the default
+frontend. Optional `systemd-ops-mcp` still speaks MCP over stdio.
+Process-local numeric plan ids are gone; plan/apply uses HMAC-sealed
+`plan_token` values with short expiry and stale/precondition checks.
+No nonce ledger. Writes without a configured write-prefix are refused.
+There is no implied unit namespace. New authored units carry
+`# managed: systemd-ops 1`. Packaging files are `systemd-ops-mcp.1`,
+`systemd-ops-mcp.socket`, and `systemd-ops-mcp@.service`. OperationView
+exposes exec/cwd/schedule, timer enablement, and never-run as
+`last_result: null`. CLI default manager is user. MCP default manager
+without config is still system.
+
+
+
+
 ## 0.6.0, 2026-08-12
 
 On disk: `systemd-mcpd.service` is replaced by `systemd-mcpd.socket` and

@@ -2,21 +2,19 @@
 //!
 //! A change is made in two steps. `plan` reads the unit's current state
 //! and returns it with the predicted state, the rollback action, and a
-//! plan id, executing nothing. `apply` takes the id, re-reads the
-//! state, refuses if it no longer matches what the plan was made
-//! against, executes, and returns a before/after diff. Plans are
-//! single-use and live only as long as the server process; a stale or
-//! unknown plan produces an error directing the client to re-plan.
+//! sealed plan token, executing nothing. `apply` takes the token,
+//! re-reads the state, refuses if it no longer matches what the plan
+//! was made against, executes, and returns a before/after diff.
+//! Tokens are HMAC-sealed, expire, and are not a replay ledger.
 //!
 //! The one mutating process invocation in the program is here, at the
 //! end of `apply`, reachable through no other path.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-
 use serde_json::{json, Value};
 
+use crate::config;
 use crate::systemd::{self, BackendError};
+use crate::token::{self, PlanClass};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -26,6 +24,7 @@ pub enum Action {
     Reload,
     Enable,
     Disable,
+    ResetFailed,
     Mask,
     Unmask,
     LogLevel,
@@ -65,6 +64,7 @@ impl Action {
             "reload" => Some(Action::Reload),
             "enable" => Some(Action::Enable),
             "disable" => Some(Action::Disable),
+            "reset-failed" => Some(Action::ResetFailed),
             "mask" => Some(Action::Mask),
             "unmask" => Some(Action::Unmask),
             "log-level" => Some(Action::LogLevel),
@@ -74,7 +74,7 @@ impl Action {
     }
 
     /// The wire name, as accepted by plan_change.
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Action::LogLevel => "log-level",
             Action::LogTarget => "log-target",
@@ -83,7 +83,7 @@ impl Action {
     }
 
     /// The systemctl verb. The names are systemd's own.
-    fn verb(self) -> &'static str {
+    pub fn verb(self) -> &'static str {
         match self {
             Action::Start => "start",
             Action::Stop => "stop",
@@ -91,6 +91,7 @@ impl Action {
             Action::Reload => "reload",
             Action::Enable => "enable",
             Action::Disable => "disable",
+            Action::ResetFailed => "reset-failed",
             Action::Mask => "mask",
             Action::Unmask => "unmask",
             Action::LogLevel => "service-log-level",
@@ -100,7 +101,11 @@ impl Action {
 
     fn kind(self) -> Kind {
         match self {
-            Action::Start | Action::Stop | Action::Restart | Action::Reload => Kind::UnitState,
+            Action::Start
+            | Action::Stop
+            | Action::Restart
+            | Action::Reload
+            | Action::ResetFailed => Kind::UnitState,
             Action::Enable | Action::Disable | Action::Mask | Action::Unmask => Kind::FileState,
             Action::LogLevel | Action::LogTarget => Kind::LogControl,
         }
@@ -118,7 +123,7 @@ impl Action {
         match self {
             Action::Start => Some(Action::Stop),
             Action::Stop => Some(Action::Start),
-            Action::Restart | Action::Reload => None,
+            Action::Restart | Action::Reload | Action::ResetFailed => None,
             Action::Enable => Some(Action::Disable),
             Action::Disable => Some(Action::Enable),
             Action::Mask => Some(Action::Unmask),
@@ -128,24 +133,20 @@ impl Action {
         }
     }
 
-    /// The state the unit is expected to be in afterwards. None for
-    /// unmask, whose outcome depends on the unit's install
-    /// configuration; log-control predictions come from the requested
-    /// value instead.
-    fn predicted(self) -> Option<&'static str> {
+    pub fn predicted(self) -> Option<&'static str> {
         match self {
             Action::Start | Action::Restart | Action::Reload => Some("active"),
             Action::Stop => Some("inactive"),
             Action::Enable => Some("enabled"),
             Action::Disable => Some("disabled"),
             Action::Mask => Some("masked"),
-            Action::Unmask | Action::LogLevel | Action::LogTarget => None,
+            Action::ResetFailed | Action::Unmask | Action::LogLevel | Action::LogTarget => None,
         }
     }
 
     /// The JSON key for this action's state dimension, used in the
     /// `current`, `predicted`, and `diff` objects.
-    fn state_key(self) -> &'static str {
+    pub fn state_key(self) -> &'static str {
         match self {
             Action::LogLevel => "log_level",
             Action::LogTarget => "log_target",
@@ -156,30 +157,71 @@ impl Action {
             },
         }
     }
+
+    /// Compact surface hides mask/unmask and log-control. Full surface
+    /// keeps the upstream set plus reset-failed.
+    pub fn visible_on_surface(self) -> bool {
+        match systemd::surface() {
+            systemd::Surface::Full => true,
+            systemd::Surface::Compact => matches!(
+                self,
+                Action::Start
+                    | Action::Stop
+                    | Action::Restart
+                    | Action::Reload
+                    | Action::Enable
+                    | Action::Disable
+                    | Action::ResetFailed
+            ),
+        }
+    }
 }
 
-struct Plan {
-    id: u64,
-    unit: String,
-    action: Action,
-    /// The observed value of the action's state dimension at plan time.
-    observed: String,
-    /// SubState at plan time; empty for non-lifecycle actions.
-    sub: String,
-    /// The requested value, for actions that take one.
-    value: Option<String>,
+pub fn action_visible(action: Action) -> bool {
+    action.visible_on_surface()
 }
 
-/// The stdio loop is single-threaded, so the Mutex is uncontended; it
-/// exists to make the static Sync. The cap bounds memory against a
-/// client that plans without applying; oldest plans are evicted first.
-static PLANS: Mutex<Vec<Plan>> = Mutex::new(Vec::new());
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-const MAX_PLANS: usize = 32;
+#[derive(Clone, Debug)]
+pub struct FileSnapshot {
+    pub path: String,
+    pub sha256: Option<String>,
+}
 
-/// Reads the state dimension the action's precondition uses:
-/// (observed value, SubState or empty).
-fn observe(action: Action, unit: &str) -> Result<(String, String), BackendError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthoringVerb {
+    Create,
+    Update,
+    Retire,
+}
+
+impl AuthoringVerb {
+    pub fn parse(s: &str) -> Result<Self, BackendError> {
+        match s {
+            "create" => Ok(AuthoringVerb::Create),
+            "update" => Ok(AuthoringVerb::Update),
+            "retire" => Ok(AuthoringVerb::Retire),
+            other => Err(BackendError(format!("unknown authoring verb '{other}'"))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthoringVerb::Create => "create",
+            AuthoringVerb::Update => "update",
+            AuthoringVerb::Retire => "retire",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AuthoringWork {
+    pub verb: AuthoringVerb,
+    pub spec: Option<crate::operations::NormalizedSpec>,
+    pub snapshots: Vec<FileSnapshot>,
+    pub origin_cwd: Option<String>,
+}
+
+pub fn observe(action: Action, unit: &str) -> Result<(String, String), BackendError> {
     match action.kind() {
         Kind::UnitState => systemd::unit_state(unit),
         Kind::FileState => Ok((systemd::unit_file_state(unit)?, String::new())),
@@ -190,9 +232,7 @@ fn observe(action: Action, unit: &str) -> Result<(String, String), BackendError>
     }
 }
 
-/// The rollback description: the inverse action, carrying the
-/// previously observed value where the inverse needs one.
-fn rollback_json(action: Action, observed: &str) -> Value {
+pub fn rollback_json(action: Action, observed: &str) -> Value {
     match action.inverse() {
         None => Value::Null,
         Some(inverse) if inverse.takes_value() => {
@@ -204,10 +244,7 @@ fn rollback_json(action: Action, observed: &str) -> Value {
 
 pub fn plan(action: Action, unit: &str, value: Option<&str>) -> Result<Value, BackendError> {
     systemd::validate_unit_name(unit)?;
-    // Refuse here rather than at apply time. Nothing downstream
-    // notices a name the manager has never heard of: `systemctl show`
-    // synthesizes one, so a plan against a typo would record
-    // "inactive/dead" and read as a valid plan until the apply failed.
+    systemd::require_write_unit(unit)?;
     systemd::ensure_unit_known(unit)?;
     let (observed, sub) = observe(action, unit)?;
     let key = action.state_key();
@@ -215,76 +252,191 @@ pub fn plan(action: Action, unit: &str, value: Option<&str>) -> Result<Value, Ba
     if action.kind() == Kind::UnitState {
         current["sub"] = json!(sub);
     }
-    // Log-control predictions are the requested value; everything else
-    // predicts from the action.
     let predicted = value
         .map(Value::from)
         .unwrap_or_else(|| action.predicted().map(Value::from).unwrap_or(Value::Null));
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let mut plans = PLANS.lock().unwrap();
-    if plans.len() >= MAX_PLANS {
-        plans.remove(0);
-    }
-    plans.push(Plan {
-        id,
-        unit: unit.to_string(),
-        action,
-        observed: observed.clone(),
-        sub,
-        value: value.map(String::from),
-    });
+    let cfg = config::current_or_load()?;
+    let (token, sealed) = token::mint(
+        &cfg,
+        PlanClass::Control,
+        unit,
+        None,
+        json!({
+            "action": action.name(),
+            "observed": observed,
+            "sub": sub,
+            "value": value,
+        }),
+    )?;
     Ok(json!({
-        "plan": id,
+        "plan_token": token,
+        "class": "control",
         "unit": unit,
         "action": action.name(),
         "value": value,
+        "issued_at": config::unix_to_rfc3339(sealed.issued_at),
+        "expires_at": config::unix_to_rfc3339(sealed.expires_at),
         "current": current,
         "predicted": { key: predicted },
         "rollback": rollback_json(action, &observed),
-        "note": "nothing has been executed; apply with apply_plan",
+        "note": "nothing has been executed; apply with the plan_token",
     }))
 }
 
-pub fn apply(id: u64) -> Result<Value, BackendError> {
-    let plan = {
-        let mut plans = PLANS.lock().unwrap();
-        let index = plans.iter().position(|p| p.id == id).ok_or_else(|| {
-            BackendError(format!(
-                "unknown plan {id}: plans are single-use and per-session; re-plan"
-            ))
-        })?;
-        plans.remove(index)
-    };
+pub fn plan_authoring(work: AuthoringWork, extra: Value) -> Result<Value, BackendError> {
+    let cfg = config::current_or_load()?;
+    let unit = work
+        .spec
+        .as_ref()
+        .map(|s| s.unit.clone())
+        .or_else(|| {
+            extra
+                .get("unit")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let payload = json!({
+        "verb": work.verb.as_str(),
+        "spec": work.spec.as_ref().map(|s| s.to_json()),
+        "snapshots": work.snapshots.iter().map(|s| json!({
+            "path": s.path,
+            "sha256": s.sha256,
+        })).collect::<Vec<_>>(),
+        "origin_cwd": work.origin_cwd,
+    });
+    let (token, sealed) = token::mint(
+        &cfg,
+        PlanClass::Author,
+        &unit,
+        work.origin_cwd.clone(),
+        payload,
+    )?;
+    let mut out = extra;
+    out["plan_token"] = json!(token);
+    out["class"] = json!("author");
+    out["unit"] = json!(unit);
+    out["action"] = json!(work.verb.as_str());
+    out["issued_at"] = json!(config::unix_to_rfc3339(sealed.issued_at));
+    out["expires_at"] = json!(config::unix_to_rfc3339(sealed.expires_at));
+    out["files"] = json!(work
+        .snapshots
+        .iter()
+        .map(|s| json!({
+            "path": s.path,
+            "sha256": s.sha256,
+        }))
+        .collect::<Vec<_>>());
+    out["note"] = json!("nothing has been executed; apply with the plan_token");
+    Ok(out)
+}
 
-    let (observed_now, _) = observe(plan.action, &plan.unit)?;
-    if observed_now != plan.observed {
+pub fn apply(token: &str) -> Result<Value, BackendError> {
+    apply_with_context(token, None)
+}
+
+pub fn apply_with_context(token: &str, cwd: Option<&str>) -> Result<Value, BackendError> {
+    let cfg = config::current_or_load()?;
+    let plan = token::parse(&cfg, token)?;
+    match plan.class {
+        PlanClass::Control => apply_control(&plan, cwd),
+        PlanClass::Author => apply_author(&plan, cwd),
+    }
+}
+
+fn apply_control(plan: &token::SealedPlan, _cwd: Option<&str>) -> Result<Value, BackendError> {
+    let action_name = plan
+        .payload
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("invalid plan token".into()))?;
+    let action = Action::parse(action_name)
+        .ok_or_else(|| BackendError(format!("unknown action '{action_name}'")))?;
+    systemd::require_write_unit(&plan.unit)?;
+    let observed = plan
+        .payload
+        .get("observed")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let sub = plan
+        .payload
+        .get("sub")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let value = plan
+        .payload
+        .get("value")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let (observed_now, _) = observe(action, &plan.unit)?;
+    if observed_now != observed {
         return Err(BackendError(format!(
-            "plan {id} is stale: '{}' was {} at plan time but is {} now; re-plan",
-            plan.unit, plan.observed, observed_now
+            "plan is stale: '{}' was {observed} at plan time but is {observed_now} now; re-plan",
+            plan.unit
         )));
     }
-
-    let changes = systemd::apply_verb(plan.action.verb(), &plan.unit, plan.value.as_deref())?;
-    let (observed_after, sub_after) = observe(plan.action, &plan.unit)?;
-    let key = plan.action.state_key();
+    let changes = systemd::apply_verb(action.verb(), &plan.unit, value.as_deref())?;
+    let (observed_after, sub_after) = observe(action, &plan.unit)?;
+    let key = action.state_key();
     let mut diff = json!({
-        key: { "before": plan.observed, "after": observed_after },
+        key: { "before": observed, "after": observed_after },
     });
-    if plan.action.kind() == Kind::UnitState {
-        diff["sub"] = json!({ "before": plan.sub, "after": sub_after });
+    if action.kind() == Kind::UnitState {
+        diff["sub"] = json!({ "before": sub, "after": sub_after });
     }
     Ok(json!({
-        "plan": id,
+        "class": "control",
         "unit": plan.unit,
-        "action": plan.action.name(),
+        "action": action.name(),
         "applied": true,
         "diff": diff,
-        // Filesystem changes as systemd reported them (symlink
-        // creations and removals for enablement actions; usually empty
-        // otherwise).
         "changes": changes,
-        "rollback": rollback_json(plan.action, &plan.observed),
+        "rollback": rollback_json(action, &observed),
     }))
+}
+
+fn apply_author(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, BackendError> {
+    token::require_class(plan, PlanClass::Author)?;
+    let verb = AuthoringVerb::parse(
+        plan.payload
+            .get("verb")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    )?;
+    let snapshots = snapshots_from_json(plan.payload.get("snapshots"))?;
+    let spec = match plan.payload.get("spec") {
+        Some(Value::Null) | None => None,
+        Some(v) => Some(crate::operations::NormalizedSpec::from_json(v)?),
+    };
+    let work = AuthoringWork {
+        verb,
+        spec,
+        snapshots,
+        origin_cwd: plan.origin_cwd.clone(),
+    };
+    crate::operations::apply_authoring(&plan.unit, work, cwd)
+}
+
+fn snapshots_from_json(v: Option<&Value>) -> Result<Vec<FileSnapshot>, BackendError> {
+    let Some(arr) = v.and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        let path = item
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BackendError("invalid plan token".into()))?
+            .to_string();
+        let sha256 = item
+            .get("sha256")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        out.push(FileSnapshot { path, sha256 });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -294,6 +446,7 @@ mod tests {
     #[test]
     fn actions() {
         assert_eq!(Action::parse("start"), Some(Action::Start));
+        assert_eq!(Action::parse("reset-failed"), Some(Action::ResetFailed));
         assert_eq!(Action::parse("enable"), Some(Action::Enable));
         assert_eq!(Action::parse("isolate"), None);
         assert_eq!(Action::Start.inverse(), Some(Action::Stop));
@@ -339,7 +492,10 @@ mod tests {
 
     #[test]
     fn unknown_plans_are_refused() {
-        let err = apply(987_654_321).unwrap_err();
-        assert!(err.0.contains("unknown plan"), "got: {err}");
+        let err = apply("not-a-token").unwrap_err();
+        assert!(
+            err.0.contains("invalid plan token") || err.0.contains("expired"),
+            "got: {err}"
+        );
     }
 }

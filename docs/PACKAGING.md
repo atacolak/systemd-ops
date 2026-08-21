@@ -14,8 +14,8 @@ wrong or missing for your distribution, that is a bug: please file it.
 | Runtime requirements | systemd. `systemctl`, `journalctl` and `systemd-analyze` on `PATH` |
 | Architecture | any that rustc targets. No architecture-specific code |
 | Network at build time | none, given a vendored or pre-fetched registry |
-| Configuration files | none |
-| Daemons started | none. The binary is a stdio child of an MCP client |
+| Configuration files | none required. optional `$XDG_CONFIG_HOME/systemd-ops/config.toml` |
+| Daemons started | none. The CLI is a one-shot; MCP is a stdio child |
 | License | MIT, one file, `LICENSE` |
 
 ## Building and installing
@@ -38,10 +38,11 @@ make CARGOFLAGS="--release --locked --offline"
 
 | Path | Contents |
 |---|---|
-| `$(bindir)/systemd-mcpd` | the binary |
-| `$(man1dir)/systemd-mcpd.1` | the man page, with the version substituted into its `.TH` line |
-| `$(unitdir)/systemd-mcpd.socket` | socket unit, `Accept=yes`, mode 0600 |
-| `$(unitdir)/systemd-mcpd@.service` | hardened per-connection template |
+| `$(bindir)/systemd-ops` | direct CLI |
+| `$(bindir)/systemd-ops-mcp` | optional MCP frontend |
+| `$(man1dir)/systemd-ops-mcp.1` | the man page, with the version substituted into its `.TH` line |
+| `$(unitdir)/systemd-ops-mcp.socket` | socket unit, `Accept=yes`, mode 0600 |
+| `$(unitdir)/systemd-ops-mcp@.service` | hardened per-connection template |
 | `$(docdir)/` | README and the docs directory |
 | `$(licensedir)/LICENSE` | the license |
 
@@ -49,7 +50,7 @@ make CARGOFLAGS="--release --locked --offline"
 reports, and to `$(prefix)/lib/systemd/system` when pkg-config or the
 systemd development files are absent.
 
-The unit file in the repository has `ExecStart=/usr/local/bin/systemd-mcpd`,
+The unit file in the repository has `ExecStart=/usr/local/bin/systemd-ops-mcp`,
 which is right for a manual install. `make install` rewrites it to the
 `bindir` being installed into, so there is nothing to patch.
 
@@ -72,12 +73,12 @@ The usual deployment is an MCP client spawning the binary as a child
 process over stdio, which needs no unit, no service, and no enablement.
 The socket unit is for operators who want a supervised instance
 instead, and the package should not enable it: it listens on
-`/run/systemd-mcpd.sock`, and anything that can open that socket gets
+`/run/systemd-ops-mcp.sock`, and anything that can open that socket gets
 the scopes the service grants. It grants read scopes only, and the
 socket is mode 0600.
 
 Do not add `%post` enablement, and do not widen `SocketMode=`.
-`systemd-mcpd@.service` is a template; `systemd-mcpd.socket`
+`systemd-ops-mcp@.service` is a template; `systemd-ops-mcp.socket`
 instantiates it per connection, so the socket is the unit an operator
 enables.
 
@@ -106,10 +107,11 @@ against an installed package.
   belongs to the distribution, and an upstream copy goes stale without
   anyone noticing.
 - **No bundled dependencies:** two crates, both packaged everywhere.
-- **No setuid, no capabilities, no `/etc` file, no state directory:**
-  the binary runs with the privileges of whoever spawns it and stores
-  nothing.
-- **No shell completions:** there are three flags.
+- **No setuid, no capabilities, no `/etc` file:** the binary runs with
+  the privileges of whoever spawns it. An HMAC key for plan tokens is
+  created under `$XDG_STATE_HOME/systemd-ops/` on first plan.
+- **No shell completions.**
+
 
 ## Reporting
 

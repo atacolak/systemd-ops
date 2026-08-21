@@ -21,7 +21,7 @@
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/systemd-mcpd-vm
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/systemd-ops-vm
 TAG=
 [ "${1:-}" = "--tag" ] && TAG=${2:?--tag needs a version}
 
@@ -73,9 +73,9 @@ gates() {
 
 host_suites() {
   say "live suites on this host"
-  MCPD=$REPO/target/release/systemd-mcpd HOST= \
+  MCPD=$REPO/target/release/systemd-ops-mcp HOST= \
     sudo /usr/bin/bash "$REPO/tests/integration.sh" || fail "integration.sh (host)"
-  MCPD=$REPO/target/release/systemd-mcpd HOST= \
+  MCPD=$REPO/target/release/systemd-ops-mcp HOST= \
     sudo /usr/bin/bash "$REPO/tests/varlink-proof.sh" || fail "varlink-proof.sh (host)"
 }
 
@@ -154,20 +154,20 @@ vm_suite() {
 
   # Piped rather than scp'd: scp spells the port -P where ssh spells it
   # -p, and -p to scp means something else entirely.
-  $SSH "cat > /tmp/systemd-mcpd" \
-    <"$REPO/target/x86_64-unknown-linux-musl/release/systemd-mcpd" || fail "$name: copy binary"
-  $SSH sudo install -m755 /tmp/systemd-mcpd /usr/local/bin/systemd-mcpd
+  $SSH "cat > /tmp/systemd-ops-mcp" \
+    <"$REPO/target/x86_64-unknown-linux-musl/release/systemd-ops-mcp" || fail "$name: copy binary"
+  $SSH sudo install -m755 /tmp/systemd-ops-mcp /usr/local/bin/systemd-ops-mcp
 
   say "$name: live suites in guest"
-  MCPD="$SSH sudo /usr/local/bin/systemd-mcpd" HOST="$SSH sudo" \
+  MCPD="$SSH sudo /usr/local/bin/systemd-ops-mcp" HOST="$SSH sudo" \
     bash "$REPO/tests/integration.sh" || fail "$name: integration.sh"
 
   # The proof needs PID 1 to serve the socket. Skip it where the guest
   # predates that rather than running it and swallowing the failure;
   # the fallback path is covered by integration.sh above.
   if $SSH sudo test -S /run/systemd/io.systemd.Manager; then
-    MCPD="$SSH sudo /usr/local/bin/systemd-mcpd" HOST="$SSH sudo" \
-      MCPD_NO_PATH="$SSH sudo env PATH=/nonexistent /usr/local/bin/systemd-mcpd" \
+    MCPD="$SSH sudo /usr/local/bin/systemd-ops-mcp" HOST="$SSH sudo" \
+      MCPD_NO_PATH="$SSH sudo env PATH=/nonexistent /usr/local/bin/systemd-ops-mcp" \
       bash "$REPO/tests/varlink-proof.sh" || fail "$name: varlink-proof.sh"
   else
     vm_note "$name: no varlink socket, so this guest exercises the CLI fallback only"
@@ -202,7 +202,7 @@ vm_boot_phases() {
   local name=$1 SSH=$2 times props
   say "$name: boot phases against the manager timestamps"
   times=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"boot_times","arguments":{}}}\n' |
-    $SSH sudo /usr/local/bin/systemd-mcpd --grant boot:read |
+    $SSH sudo /usr/local/bin/systemd-ops-mcp --grant boot:read |
     jq -r '.result.content[0].text')
   props=$($SSH sudo systemctl show --no-pager \
     --property=FirmwareTimestampMonotonic,LoaderTimestampMonotonic,InitRDTimestampMonotonic,UserspaceTimestampMonotonic,FinishTimestampMonotonic)
@@ -260,19 +260,25 @@ vm_reboot() {
 # enable means "starts at next boot". Nothing short of a reboot checks
 # that, so this is the assertion the guest exists for.
 vm_reboot_persistence() {
-  local name=$1 SSH=$2 ssh_opts=$3 user=$4 pid=$5 unit=mcpd-persist.service
+  local name=$1 SSH=$2 ssh_opts=$3 user=$4 pid=$5 unit=ops-persist.service
   say "$name: enablement survives a reboot"
   # Over stdin: a redirect in the command string is performed by the
   # local shell, before sudo applies in the guest.
-  printf '[Unit]\nDescription=mcpd reboot persistence\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n' |
+  printf '[Unit]\nDescription=ops reboot persistence\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n' |
     $SSH sudo tee "/etc/systemd/system/$unit" >/dev/null
   $SSH sudo systemctl daemon-reload
   # Enable it through the server's own write path, not systemctl.
   local plan
-  plan=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"plan_change","arguments":{"action":"enable","unit":"%s"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"apply_plan","arguments":{"plan":1}}}\n' "$unit" |
-    $SSH sudo /usr/local/bin/systemd-mcpd --grant units:write | tail -1)
-  jq -e '.result.content[0].text | fromjson | .diff.unit_file_state.after == "enabled"' <<<"$plan" >/dev/null ||
-    fail "$name: apply did not enable the unit: $plan"
+  planned=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"plan_change","arguments":{"action":"enable","unit":"%s"}}}\n' "$unit" |
+    $SSH sudo /usr/local/bin/systemd-ops-mcp --grant units:write --write-prefix '*' |
+    jq -r '.result.content[0].text')
+  token=$(jq -r '.plan_token' <<<"$planned")
+  [ -n "$token" ] && [ "$token" != "null" ] || fail "$name: plan_change returned no token: $planned"
+  applied=$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"apply_plan","arguments":{"plan_token":"%s"}}}\n' "$token" |
+    $SSH sudo /usr/local/bin/systemd-ops-mcp --grant units:write --write-prefix '*' |
+    jq -r '.result.content[0].text')
+  jq -e '.diff.unit_file_state.after == "enabled"' <<<"$applied" >/dev/null ||
+    fail "$name: apply did not enable the unit: $applied"
 
   vm_reboot "$name" "$SSH" "$ssh_opts" "$user" "$pid"
   [ "$($SSH sudo systemctl is-active $unit)" = active ] ||

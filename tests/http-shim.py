@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Expose a stdio systemd-mcpd over HTTP, for the MCP conformance suite.
+"""Expose a stdio systemd-ops-mcp over HTTP, for the MCP conformance suite.
 
 The suite's server mode speaks HTTP only (`--url`), and this server is
 stdio only. This shim bridges the two for testing and is not part of the
@@ -7,7 +7,7 @@ product: nothing here is shipped, and the binary grows no HTTP transport.
 
 It is deliberately dumb. The request body is written to the server's
 stdin unchanged and the reply line is returned as the response body
-unchanged, so the suite judges the bytes systemd-mcpd actually produces.
+unchanged, so the suite judges the bytes systemd-ops-mcp actually produces.
 A bridge built on an MCP SDK would re-serialize both directions and hide
 exactly the mistakes this is meant to find.
 
@@ -23,7 +23,7 @@ Origin and Host checks below are what keeps this from being a way for a
 web page to operate systemd. Run it with read scopes, stop it when the
 suite finishes, and do not leave it running with units:write.
 
-    python3 tests/http-shim.py --port 3000 -- ./systemd-mcpd --grant units:read
+    python3 tests/http-shim.py --port 3000 -- ./systemd-ops-mcp --grant units:read
 """
 
 import argparse

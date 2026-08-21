@@ -54,6 +54,12 @@ naming the input.
   matches nothing rather than erroring. The `pattern` glob matches the
   unit file name.
 - **`unit_dependencies`**, **`unit_security`**: required `unit`.
+- **`list_operations`**: optional `pattern` glob over the operation stem
+  (`managed-test-*`). Aggregates unit files matching `--write-prefix` into
+  one row per stem. A service+timer pair is one operation. Hand-written and
+  MCP-managed units both appear. Missing metadata is null, not invented.
+  Without `--write-prefix`, a pattern is required.
+- **`get_operation`**: required `unit`, a stem or constituent name.
 - **`unit_log_control`**: required `unit`. Reads through systemd's
   LogControl1 interface over D-Bus, so the service must declare
   `BusName=` and implement the interface. systemd-logind and
@@ -112,7 +118,19 @@ have started so far; that too mirrors systemd-analyze.
   (levels `emerg`..`debug`; targets `console`, `kmsg`, `journal`,
   `journal-or-kmsg`, `auto`, `null`); other actions reject it. Reads
   state and records a plan; executes nothing.
-- **`apply_plan`**: required `plan`, an id from `plan_change`.
+- **`plan_create_operation`**: required `spec` (OperationSpec v1),
+  optional `context.cwd`. Plans a new write-prefix stem. Refuses if either
+  constituent file already exists. Writes nothing.
+- **`plan_update_operation`**: required `spec`, optional `context.cwd`.
+  Plans a rewrite of a managed stem. Refuses files without
+  `# managed: systemd-ops 1`.
+  A differing `context.cwd` is a warning, not a block.
+- **`plan_retire_operation`**: required `unit` (stem), optional
+  `context.cwd`. Plans disable + unlink of marked files only.
+- **`apply_plan`**: required `plan_token` from any plan_* tool.
+  Optional `context` is provenance only. Re-checks stale state, the
+  `--write-prefix` globs, the managed marker for update/retire, and
+  executable existence for create/update.
 
 Lifecycle actions (start, stop, restart, reload) operate on the unit's
 active state; enablement actions (enable, disable, mask, unmask) on its

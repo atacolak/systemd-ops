@@ -11,10 +11,157 @@
 //! plan/apply path in `crate::write`. Argument lists are built from
 //! vetted values only.
 
+use serde_json::{json, Value};
+use std::cell::{Cell, RefCell};
 use std::fmt;
+use std::path::PathBuf;
 use std::process::Command;
 
-use serde_json::{json, Value};
+/// Which systemd manager the CLI backends address.
+///
+/// `System` is PID 1 (the default, matching upstream). `User` is the
+/// calling user's `systemd --user` instance. systemd 255 has no user
+/// manager varlink socket, so user mode never takes the varlink path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Manager {
+    System,
+    User,
+}
+
+impl Manager {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "system" => Some(Manager::System),
+            "user" => Some(Manager::User),
+            _ => None,
+        }
+    }
+}
+
+/// Which tools are advertised.
+///
+/// `Full` is the upstream set. `Compact` is the operational subset this
+/// deployment actually uses: unit/timer/file/log/dependency reads plus
+/// plan/apply. Boot analysis, sockets, security scoring, and log-control
+/// stay in Full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    Full,
+    Compact,
+}
+
+impl Surface {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "full" => Some(Surface::Full),
+            "compact" => Some(Surface::Compact),
+            _ => None,
+        }
+    }
+}
+
+thread_local! {
+    static MANAGER: Cell<Manager> = const { Cell::new(Manager::System) };
+    static SURFACE: Cell<Surface> = const { Cell::new(Surface::Full) };
+    static WRITE_PREFIX: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+pub fn set_manager(manager: Manager) {
+    MANAGER.with(|c| c.set(manager));
+}
+
+pub fn manager() -> Manager {
+    MANAGER.with(Cell::get)
+}
+
+pub fn set_surface(surface: Surface) {
+    SURFACE.with(|c| c.set(surface));
+}
+
+pub fn surface() -> Surface {
+    SURFACE.with(Cell::get)
+}
+
+pub fn parse_write_prefix(spec: &str) -> Result<Vec<String>, String> {
+    let mut globs = Vec::new();
+    for part in spec.split(',') {
+        let g = part.trim();
+        if g.is_empty() || g.len() > 128 {
+            return Err("--write-prefix glob must be 1..128 characters".into());
+        }
+        globs.push(g.to_string());
+    }
+    if globs.is_empty() {
+        return Err("--write-prefix needs at least one glob".into());
+    }
+    Ok(globs)
+}
+
+pub fn set_write_prefix(prefix: Option<String>) {
+    let parsed = prefix.map(|s| parse_write_prefix(&s).unwrap_or_else(|e| panic!("{e}")));
+    WRITE_PREFIX.with(|c| *c.borrow_mut() = parsed);
+}
+
+pub fn write_prefix() -> Option<Vec<String>> {
+    WRITE_PREFIX.with(|c| c.borrow().clone())
+}
+
+fn write_prefix_display() -> String {
+    write_prefix().map(|g| g.join(",")).unwrap_or_default()
+}
+
+/// Whether `name` is allowed as a write target under `--write-prefix`.
+/// No prefix means writes are refused. Prefixes are never implied.
+pub fn write_unit_allowed(name: &str) -> bool {
+    match write_prefix() {
+        None => false,
+        Some(globs) => globs.iter().any(|g| glob_match(g, name)),
+    }
+}
+
+pub fn require_write_unit(name: &str) -> Result<(), BackendError> {
+    if write_unit_allowed(name) {
+        Ok(())
+    } else {
+        match write_prefix() {
+            None => Err(BackendError(format!(
+                "writes are disabled until a write-prefix is configured; refused '{name}'"
+            ))),
+            Some(_) => {
+                let pattern = write_prefix_display();
+                Err(BackendError(format!(
+                    "writes are restricted to units matching '{pattern}'; refused '{name}'"
+                )))
+            }
+        }
+    }
+}
+
+/// Compact-surface tool names. tools/list and tools/call both read this
+/// so an unadvertised tool cannot be reached by a direct call.
+pub fn compact_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "list_units"
+            | "failed_units"
+            | "get_unit"
+            | "list_operations"
+            | "get_operation"
+            | "list_timers"
+            | "list_unit_files"
+            | "unit_dependencies"
+            | "unit_logs"
+            | "plan_change"
+            | "plan_create_operation"
+            | "plan_update_operation"
+            | "plan_retire_operation"
+            | "apply_plan"
+    )
+}
+
+pub fn tool_visible(name: &str) -> bool {
+    surface() == Surface::Full || compact_tool(name)
+}
 
 /// Capability scopes. A tool is only advertised and callable if its scope
 /// was granted on the command line: authority handed to an agent is
@@ -140,7 +287,7 @@ pub(crate) fn validate_unit_name(name: &str) -> Result<(), BackendError> {
 /// Linear scan with one backtrack point: on a mismatch the match
 /// restarts one character further into the name, with the last `*`
 /// absorbing the difference.
-fn glob_match(pattern: &str, name: &str) -> bool {
+pub fn glob_match(pattern: &str, name: &str) -> bool {
     let (p, n) = (pattern.as_bytes(), name.as_bytes());
     let (mut pi, mut ni) = (0, 0);
     let mut star: Option<usize> = None;
@@ -188,13 +335,18 @@ fn name_filter<'a>(
     })
 }
 
-/// Spawns a command and returns its output whatever the exit status.
-/// Every process this server spawns goes through here: one place to
-/// audit, one place that pins the environment (no pager, no color, since we
-/// are parsing this output, not reading it).
 fn spawn(program: &str, args: &[&str]) -> Result<std::process::Output, BackendError> {
-    Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    // User-manager mode: systemctl/journalctl/systemd-analyze all take
+    // `--user` as a global option before the verb. systemd 255 has no
+    // user-manager varlink socket, so this is the only user path.
+    // `systemd-detect-virt` is host-wide and is never prefixed.
+    if manager() == Manager::User
+        && matches!(program, "systemctl" | "journalctl" | "systemd-analyze")
+    {
+        cmd.arg("--user");
+    }
+    cmd.args(args)
         // LC_ALL=C because two of these outputs are parsed as prose.
         // systemd formats timespans itself rather than through the
         // locale, so no translation was observed reaching the parsers,
@@ -280,7 +432,7 @@ fn run_key_values(
 /// `LoadState=not-found` and exit 0. Every caller that wanted "no such
 /// unit" has to ask for that field and look at it. Masked units report
 /// `masked` rather than `not-found`, so unmasking one still works.
-pub(crate) fn ensure_unit_known(name: &str) -> Result<(), BackendError> {
+pub fn ensure_unit_known(name: &str) -> Result<(), BackendError> {
     let props = run_key_values(
         "systemctl",
         &["show", "--no-pager", "--property=LoadState", "--", name],
@@ -359,7 +511,7 @@ pub(crate) fn unit_file_state(name: &str) -> Result<String, BackendError> {
 /// applied plan. `value` carries the positional argument log-control
 /// verbs take. Returns the non-empty output lines; systemctl reports
 /// enablement symlink creations and removals on stderr.
-pub(crate) fn apply_verb(
+pub fn apply_verb(
     verb: &str,
     unit: &str,
     value: Option<&str>,
@@ -382,6 +534,46 @@ pub(crate) fn apply_verb(
     Ok(changes)
 }
 
+/// User or system unit-file directory this process writes into.
+pub(crate) fn unit_file_dir() -> PathBuf {
+    match manager() {
+        Manager::User => {
+            if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+                PathBuf::from(xdg).join("systemd/user")
+            } else if let Some(home) = std::env::var_os("HOME") {
+                PathBuf::from(home).join(".config/systemd/user")
+            } else {
+                PathBuf::from("/tmp/systemd-user")
+            }
+        }
+        Manager::System => PathBuf::from("/etc/systemd/system"),
+    }
+}
+
+/// Reloads unit files. Mutating; reachable only from the apply path.
+pub(crate) fn daemon_reload() -> Result<Vec<String>, BackendError> {
+    let output = run_output("systemctl", &["daemon-reload", "--no-pager"])?;
+    let lines = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect::<Vec<_>>()
+    };
+    let mut changes = lines(&output.stdout);
+    changes.extend(lines(&output.stderr));
+    Ok(changes)
+}
+
+/// Disable, treating "already disabled" as success.
+pub(crate) fn try_disable(unit: &str) -> Result<Vec<String>, BackendError> {
+    match apply_verb("disable", unit, None) {
+        Ok(lines) => Ok(lines),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
 /// Unit states accepted by the `list_units` filter. Also the schema enum
 /// advertised in `tools/list`. One list, so the contract cannot drift from
 /// the check.
@@ -390,13 +582,10 @@ pub const STATES: &[&str] = &["active", "inactive", "failed", "activating", "dea
 /// `list_units`: all currently loaded units, optionally filtered by
 /// state and by a glob on the unit name.
 ///
-/// Prefers PID 1's native varlink socket (systemd ≥ 258) and falls back to
-/// systemctl on any failure. Same JSON shape either way, so the caller
-/// cannot tell which backend answered. Both filters are applied here,
-/// once, after either backend, so their semantics cannot differ between
-/// backends. Filtering matters: an ordinary host has several hundred
-/// loaded units, and the unfiltered reply is the largest this server
-/// produces.
+/// On the system manager, prefers PID 1's native varlink socket
+/// (systemd >= 258) and falls back to systemctl on any failure. The
+/// user manager on systemd 255 has no equivalent socket, so user mode
+/// goes to `systemctl --user` directly. Same JSON shape either way.
 pub fn list_units(state: Option<&str>, pattern: Option<&str>) -> Result<Value, BackendError> {
     if let Some(state) = state {
         if !STATES.contains(&state) {
@@ -408,19 +597,13 @@ pub fn list_units(state: Option<&str>, pattern: Option<&str>) -> Result<Value, B
     }
     let matches_name = name_filter("unit", pattern)?;
 
-    let units = match crate::varlink::list_units() {
-        Ok(units) => units,
-        Err(_) => match run_json(
-            "systemctl",
-            &["list-units", "--all", "--output=json", "--no-pager"],
-        )? {
-            Value::Array(units) => units,
-            _ => {
-                return Err(BackendError(
-                    "systemctl list-units did not produce a JSON array".into(),
-                ))
-            }
-        },
+    let units = if manager() == Manager::User {
+        list_units_cli()?
+    } else {
+        match crate::varlink::list_units() {
+            Ok(units) => units,
+            Err(_) => list_units_cli()?,
+        }
     };
 
     Ok(Value::Array(
@@ -430,6 +613,18 @@ pub fn list_units(state: Option<&str>, pattern: Option<&str>) -> Result<Value, B
             .map(|u| unit_row(&u))
             .collect(),
     ))
+}
+
+fn list_units_cli() -> Result<Vec<Value>, BackendError> {
+    match run_json(
+        "systemctl",
+        &["list-units", "--all", "--output=json", "--no-pager"],
+    )? {
+        Value::Array(units) => Ok(units),
+        _ => Err(BackendError(
+            "systemctl list-units did not produce a JSON array".into(),
+        )),
+    }
 }
 
 /// The row shape `list_units` emits, defined once for both backends.
@@ -629,6 +824,78 @@ pub fn unit_properties(name: &str, select: &[String]) -> Result<Value, BackendEr
     Ok(json!({ "unit": name, "properties": selected }))
 }
 
+/// Properties `get_unit` always returns. Named once so the schema and
+/// the projection cannot drift.
+const GET_UNIT_PROPS: &[&str] = &[
+    "Description",
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "UnitFileState",
+    "FragmentPath",
+    "MainPID",
+    "NRestarts",
+    "MemoryCurrent",
+    "CPUUsageNSec",
+    "Result",
+    "ExecMainStatus",
+    "ExecMainCode",
+    "ActiveEnterTimestamp",
+    "InactiveEnterTimestamp",
+    "ExecMainStartTimestamp",
+    "StateChangeTimestamp",
+];
+
+fn parse_u64_prop(props: &serde_json::Map<String, Value>, key: &str) -> Value {
+    match props.get(key).and_then(Value::as_str) {
+        Some(s) if s.is_empty() || s == "[not set]" || s == "n/a" => Value::Null,
+        Some(s) => s
+            .parse::<u64>()
+            .map(Value::from)
+            .unwrap_or(Value::String(s.to_string())),
+        None => Value::Null,
+    }
+}
+
+fn parse_string_prop(props: &serde_json::Map<String, Value>, key: &str) -> Value {
+    match props.get(key).and_then(Value::as_str) {
+        Some(s) if s.is_empty() || s == "[not set]" || s == "n/a" => Value::Null,
+        Some(s) => Value::String(s.to_string()),
+        None => Value::Null,
+    }
+}
+
+/// `get_unit`: a compact, typed view of one unit. Not the ~200-property
+/// dump `unit_properties` produces. Used by the compact surface.
+pub fn get_unit(name: &str) -> Result<Value, BackendError> {
+    validate_unit_name(name)?;
+    let prop_arg = format!("--property={}", GET_UNIT_PROPS.join(","));
+    let props = run_key_values("systemctl", &["show", "--no-pager", &prop_arg, "--", name])?;
+    if props.get("LoadState").and_then(Value::as_str) == Some("not-found") {
+        return Err(BackendError(format!("no such unit: {name}")));
+    }
+    Ok(json!({
+        "unit": name,
+        "description": parse_string_prop(&props, "Description"),
+        "load": parse_string_prop(&props, "LoadState"),
+        "active": parse_string_prop(&props, "ActiveState"),
+        "sub": parse_string_prop(&props, "SubState"),
+        "enabled": parse_string_prop(&props, "UnitFileState"),
+        "unit_file": parse_string_prop(&props, "FragmentPath"),
+        "pid": parse_u64_prop(&props, "MainPID"),
+        "restarts": parse_u64_prop(&props, "NRestarts"),
+        "memory_bytes": parse_u64_prop(&props, "MemoryCurrent"),
+        "cpu_nsec": parse_u64_prop(&props, "CPUUsageNSec"),
+        "result": parse_string_prop(&props, "Result"),
+        "exit_status": parse_u64_prop(&props, "ExecMainStatus"),
+        "exit_code": parse_u64_prop(&props, "ExecMainCode"),
+        "active_enter": parse_string_prop(&props, "ActiveEnterTimestamp"),
+        "inactive_enter": parse_string_prop(&props, "InactiveEnterTimestamp"),
+        "exec_start": parse_string_prop(&props, "ExecMainStartTimestamp"),
+        "state_change": parse_string_prop(&props, "StateChangeTimestamp"),
+    }))
+}
+
 /// Filters accepted by `unit_logs` beyond the unit itself.
 #[derive(Default)]
 pub struct LogFilter<'a> {
@@ -754,7 +1021,7 @@ pub fn unit_logs(name: &str, filter: &LogFilter) -> Result<Value, BackendError> 
 /// Implemented locally: one output format in one direction does not
 /// justify a chrono dependency. The days-to-civil conversion is the
 /// standard Gregorian-cycle algorithm (146097 days per 400 years).
-fn usec_to_rfc3339(usec: u64) -> String {
+pub fn usec_to_rfc3339(usec: u64) -> String {
     let secs = (usec / 1_000_000) as i64;
     let micros = usec % 1_000_000;
     let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
@@ -785,13 +1052,17 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 /// `boot_times`: how long the last boot took, split by phase.
 ///
-/// The same manager timestamps `systemd-analyze time` reads, preferably
-/// over varlink (`io.systemd.Manager.Describe`, systemd >= 258), else via
-/// the stable `Key=Value` output of `systemctl show`. Structured data at
-/// the source either way, never systemd-analyze's prose summary.
+/// The same manager timestamps `systemd-analyze time` reads. On the
+/// system manager, prefers varlink (`io.systemd.Manager.Describe`,
+/// systemd >= 258), else `systemctl show`. The user manager has no
+/// such socket, so user mode uses the CLI only.
 pub fn boot_times() -> Result<Value, BackendError> {
-    let [firmware, loader, initrd, userspace, finish] =
-        crate::varlink::boot_timestamps().or_else(|_| cli_boot_timestamps())?;
+    let stamps = if manager() == Manager::User {
+        cli_boot_timestamps()
+    } else {
+        crate::varlink::boot_timestamps().or_else(|_| cli_boot_timestamps())
+    }?;
+    let [firmware, loader, initrd, userspace, finish] = stamps;
     compute_boot_times(firmware, loader, initrd, userspace, finish, in_container())
 }
 
@@ -1306,5 +1577,56 @@ graphical.target @1min 30.5s
         assert_eq!(blame[2]["unit"], json!("user@1000.service"));
         // Prose (no trailing unit-name shape) parses to nothing.
         assert!(parse_blame("Bootup is not yet finished. Please try again later.\n").is_empty());
+    }
+
+    #[test]
+    fn write_prefix_matches_managed_glob() {
+        set_write_prefix(Some("managed-*".into()));
+        assert!(write_unit_allowed("managed-test-demo.service"));
+        assert!(write_unit_allowed("managed-mail-check.timer"));
+        assert!(!write_unit_allowed("bluetooth.service"));
+        assert!(!write_unit_allowed("syncthing.service"));
+        set_write_prefix(None);
+        assert!(!write_unit_allowed("bluetooth.service"));
+    }
+
+    #[test]
+    fn write_prefix_managed_only() {
+        set_write_prefix(Some("managed-*".into()));
+        assert!(write_unit_allowed("managed-mail-check.service"));
+        assert!(!write_unit_allowed("other-x.service"));
+        assert!(!write_unit_allowed("bluetooth.service"));
+        set_write_prefix(None);
+    }
+
+    #[test]
+    fn write_prefix_dual_families() {
+        set_write_prefix(Some("managed-*,tmp-*".into()));
+        assert!(write_unit_allowed("managed-mail-check.service"));
+        assert!(write_unit_allowed("tmp-x.service"));
+        assert!(!write_unit_allowed("bluetooth.service"));
+        set_write_prefix(None);
+    }
+
+    #[test]
+    fn write_prefix_parse_rejects_empty_glob() {
+        assert!(parse_write_prefix("").is_err());
+        assert!(parse_write_prefix("managed-*,").is_err());
+        assert_eq!(
+            parse_write_prefix(" managed-* , tmp-* ").unwrap(),
+            vec!["managed-*".to_string(), "tmp-*".to_string()]
+        );
+    }
+
+    #[test]
+    fn manager_and_surface_parse() {
+        assert_eq!(Manager::parse("user"), Some(Manager::User));
+        assert_eq!(Manager::parse("system"), Some(Manager::System));
+        assert_eq!(Manager::parse("pid1"), None);
+        assert_eq!(Surface::parse("compact"), Some(Surface::Compact));
+        assert_eq!(Surface::parse("full"), Some(Surface::Full));
+        assert!(compact_tool("get_unit"));
+        assert!(!compact_tool("unit_security"));
+        assert!(!compact_tool("boot_times"));
     }
 }
