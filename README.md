@@ -1,13 +1,12 @@
 # systemd-ops
 
+*A derivative of [systemd-mcpd](https://github.com/rhaist/systemd-mcpd).*
+
 Inspect, control, and author systemd operations. Direct CLI by default;
 optional MCP frontend. Writes exist only through plan/apply.
 
 Written in Rust, with serde and serde_json as its only dependencies: no
 libsystemd linkage, no D-Bus library, no async runtime.
-
-This is a derivative of [systemd-mcpd](https://github.com/rhaist/systemd-mcpd)
-(MIT, Robert Haist). The MIT notice is preserved in [LICENSE](LICENSE).
 
 **Rules, enforced in code:**
 
