@@ -174,6 +174,20 @@ v1 is read-only: navigate, select, filter, refresh, inspect details,
 inspect logs. No start/stop/restart/enable/disable, no create/edit/
 retire, no OperationSpec forms, no plan dialogs.
 
+The console is built for a herdr split, not a 200-column monitor:
+
+- one-line header: scope id, health, op count, failing count
+- ops list on top (health glyph, title, countdown). Failed ops sort
+  first. Empty WATCHING is omitted
+- detail under the list: purpose, a bright NEXT countdown (`4m 12s`,
+  ticking every frame), last, exec, state. `d` expands provenance
+- logs take the bottom quarter. Hide below 24 rows until `l`
+- log lines use local clock time. Tracebacks and failure lines are red
+- systemd state refreshes every 3s; the countdown redraws every 250ms
+
+Keys: `q` quit, `j`/`k` move, `/` filter, `r` refresh, `d` details,
+`l` logs, Enter reload logs.
+
 Human mutation via the TUI is deliberately undecided and not built.
 
 ## Deferred

@@ -119,8 +119,10 @@ systemd-ops tui
 
 `scope show --json` and `tui` consume the same derived ScopeView. Agents
 are the first-class author/control interface; the TUI is read-only
-operational awareness. Authoring without `--cwd` uses the process
-working directory for provenance and scope discovery. Details:
+operational awareness. The TUI list uses relative times, unwraps journal
+entries, and hides empty WATCHING. Keys: `j`/`k` `/` `r` `d` `l` `q`.
+Authoring without `--cwd` uses the process working directory for
+provenance and scope discovery. Details:
 [docs/SCOPES.md](docs/SCOPES.md).
 
 `get_operation` returns `editable_spec` for systemd-ops-managed stems so

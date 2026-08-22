@@ -6,6 +6,12 @@ is what a downstream package has to care about.
 
 ## unreleased (not published)
 
+TUI: unwrap `unit_logs` entries instead of dumping the JSON envelope;
+ops list on top, detail underneath, logs at the bottom quarter; NEXT
+is a live `4m 12s` countdown redrawn every frame; hide empty WATCHING;
+pin failed ops first; compact detail; hide logs below 24 rows until
+asked; systemd state refreshes every 3s.
+
 Responsibility scopes: nearest `.systemd-ops.toml` walking up from cwd.
 `systemd-ops scope show` / `scope validate` / `tui` consume one derived
 ScopeView (owned, watching, health, attention). TUI is read-only and
