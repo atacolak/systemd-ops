@@ -384,6 +384,15 @@ fn with_cwd(mut args: Value, cwd: Option<&str>) -> Value {
     args
 }
 
+fn process_cwd(explicit: Option<String>) -> Result<String, BackendError> {
+    if let Some(c) = explicit {
+        return Ok(c);
+    }
+    std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|e| BackendError(format!("cannot resolve cwd: {e}")))
+}
+
 fn run_inspect(cmd: &str, args: &mut Vec<String>) -> Result<Value, BackendError> {
     match cmd {
         "list-units" => {
@@ -627,7 +636,11 @@ fn main() -> ExitCode {
         );
     }
     let group = rest.remove(0);
-    let cwd_ref = cwd.as_deref();
+    let cwd = match process_cwd(cwd) {
+        Ok(c) => c,
+        Err(e) => return fail(json_mode, "error", &e.0),
+    };
+    let cwd_ref = Some(cwd.as_str());
     if group == "tui" {
         remaining_flags(&rest).ok();
         return match tui::run(cwd_ref) {
@@ -653,5 +666,25 @@ fn main() -> ExitCode {
             "invalid_argument",
             &format!("unknown command '{other}' (inspect, control, author, scope, tui)"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_cwd_explicit_overrides() {
+        assert_eq!(
+            process_cwd(Some("/project/personal".into())).unwrap(),
+            "/project/personal"
+        );
+    }
+
+    #[test]
+    fn process_cwd_defaults_to_current_dir() {
+        let got = process_cwd(None).unwrap();
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(got, here.to_string_lossy());
     }
 }

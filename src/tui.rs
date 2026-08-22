@@ -25,13 +25,19 @@ use crate::systemd::{self, BackendError, LogFilter};
 
 struct App {
     view: ScopeView,
-    rows: Vec<Row>,
+    rows: Vec<ListRow>,
     list: ListState,
     filter: String,
     filtering: bool,
     logs: Vec<String>,
     last_error: Option<String>,
     last_refresh: Instant,
+}
+
+#[derive(Clone)]
+enum ListRow {
+    Header(&'static str),
+    Op(Box<Row>),
 }
 
 #[derive(Clone)]
@@ -59,6 +65,27 @@ struct Row {
     activation: String,
 }
 
+pub(crate) fn logs_unit(stem: &str) -> String {
+    format!("{stem}.service")
+}
+
+fn sectioned_rows(owned: Vec<Row>, watching: Vec<Row>) -> Vec<ListRow> {
+    let mut rows = Vec::new();
+    rows.push(ListRow::Header("OWNED"));
+    if owned.is_empty() {
+        rows.push(ListRow::Header("(none)"));
+    } else {
+        rows.extend(owned.into_iter().map(|r| ListRow::Op(Box::new(r))));
+    }
+    rows.push(ListRow::Header("WATCHING"));
+    if watching.is_empty() {
+        rows.push(ListRow::Header("(none)"));
+    } else {
+        rows.extend(watching.into_iter().map(|r| ListRow::Op(Box::new(r))));
+    }
+    rows
+}
+
 impl App {
     fn load(cwd: Option<&str>) -> Result<Self, BackendError> {
         let view = scope::show(cwd)?;
@@ -73,45 +100,46 @@ impl App {
             last_refresh: Instant::now(),
         };
         app.rebuild_rows();
-        if !app.rows.is_empty() {
-            app.list.select(Some(0));
-            app.reload_logs();
-        }
+        app.reload_logs();
         Ok(app)
     }
 
     fn rebuild_rows(&mut self) {
-        let mut rows = Vec::new();
+        let mut owned = Vec::new();
         for v in &self.view.owned {
             if let Some(r) = row_from_view(v, "owned") {
                 if self.filter_matches(&r) {
-                    rows.push(r);
+                    owned.push(r);
                 }
             }
         }
+        let mut watching = Vec::new();
         for v in &self.view.watching {
             if let Some(r) = row_from_view(v, "watching") {
                 if self.filter_matches(&r) {
-                    rows.push(r);
+                    watching.push(r);
                 }
             }
         }
-        let keep = self
-            .list
-            .selected()
-            .and_then(|i| self.rows.get(i).map(|r| r.unit.clone()));
-        self.rows = rows;
+        let keep = self.selected().map(|r| r.unit.clone());
+        self.rows = sectioned_rows(owned, watching);
         if let Some(unit) = keep {
-            if let Some(i) = self.rows.iter().position(|r| r.unit == unit) {
+            if let Some(i) = self.rows.iter().position(|r| match r {
+                ListRow::Op(op) => op.unit == unit,
+                ListRow::Header(_) => false,
+            }) {
                 self.list.select(Some(i));
-            } else if !self.rows.is_empty() {
-                self.list.select(Some(0));
             } else {
-                self.list.select(None);
+                self.select_first_op();
             }
-        } else if self.list.selected().is_none() && !self.rows.is_empty() {
-            self.list.select(Some(0));
+        } else {
+            self.select_first_op();
         }
+    }
+
+    fn select_first_op(&mut self) {
+        let i = self.rows.iter().position(|r| matches!(r, ListRow::Op(_)));
+        self.list.select(i);
     }
 
     fn filter_matches(&self, row: &Row) -> bool {
@@ -124,9 +152,28 @@ impl App {
             || row.purpose.to_ascii_lowercase().contains(&q)
             || row.tags.to_ascii_lowercase().contains(&q)
     }
-
     fn selected(&self) -> Option<&Row> {
-        self.list.selected().and_then(|i| self.rows.get(i))
+        self.list.selected().and_then(|i| match self.rows.get(i) {
+            Some(ListRow::Op(r)) => Some(r.as_ref()),
+            _ => None,
+        })
+    }
+
+    fn move_sel(&mut self, dir: i32) {
+        let cur = self.list.selected().unwrap_or(0) as i32;
+        let len = self.rows.len() as i32;
+        if len == 0 {
+            return;
+        }
+        let mut i = cur;
+        for _ in 0..len {
+            i = (i + dir).rem_euclid(len);
+            if matches!(self.rows.get(i as usize), Some(ListRow::Op(_))) {
+                self.list.select(Some(i as usize));
+                self.reload_logs();
+                return;
+            }
+        }
     }
 
     fn reload_logs(&mut self) {
@@ -134,11 +181,7 @@ impl App {
             self.logs.clear();
             return;
         };
-        let unit = if row.activation == "timer" {
-            format!("{}.timer", row.unit)
-        } else {
-            format!("{}.service", row.unit)
-        };
+        let unit = logs_unit(&row.unit);
         let filter = LogFilter {
             lines: 40,
             priority: None,
@@ -355,20 +398,8 @@ fn event_loop(
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
             KeyCode::Char('r') => app.refresh(cwd),
             KeyCode::Char('/') => app.filtering = true,
-            KeyCode::Down | KeyCode::Char('j') => {
-                let i = app.list.selected().unwrap_or(0);
-                if i + 1 < app.rows.len() {
-                    app.list.select(Some(i + 1));
-                    app.reload_logs();
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                let i = app.list.selected().unwrap_or(0);
-                if i > 0 {
-                    app.list.select(Some(i - 1));
-                    app.reload_logs();
-                }
-            }
+            KeyCode::Down | KeyCode::Char('j') => app.move_sel(1),
+            KeyCode::Up | KeyCode::Char('k') => app.move_sel(-1),
             KeyCode::Char('l') | KeyCode::Enter => app.reload_logs(),
             _ => {}
         }
@@ -426,23 +457,27 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = app
         .rows
         .iter()
-        .map(|r| {
-            let rel = if r.relationship == "watching" {
-                "  watch"
-            } else if r.critical {
-                "  crit"
-            } else {
-                ""
-            };
-            let next = if r.next.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", r.next)
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{} ", mark(&r.health)), health_style(&r.health)),
-                Span::raw(format!("{:<24} {:<8}{rel}{next}", r.title, r.health)),
-            ]))
+        .map(|r| match r {
+            ListRow::Header(h) => {
+                let style = if *h == "(none)" {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().add_modifier(Modifier::BOLD)
+                };
+                ListItem::new(Line::from(Span::styled(*h, style)))
+            }
+            ListRow::Op(r) => {
+                let crit = if r.critical { "  crit" } else { "" };
+                let next = if r.next.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", r.next)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{} ", mark(&r.health)), health_style(&r.health)),
+                    Span::raw(format!("{:<24} {:<8}{crit}{next}", r.title, r.health)),
+                ]))
+            }
         })
         .collect();
     let title = if app.filtering {
@@ -530,8 +565,75 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
 
 fn empty(s: &str) -> &str {
     if s.is_empty() {
-        "—"
+        "\u{2014}"
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy(unit: &str, relationship: &'static str) -> Row {
+        Row {
+            unit: unit.into(),
+            title: unit.into(),
+            health: "unknown".into(),
+            relationship,
+            critical: false,
+            next: String::new(),
+            kind: "oneshot".into(),
+            management: String::new(),
+            purpose: String::new(),
+            tags: String::new(),
+            origin: String::new(),
+            origin_scope: String::new(),
+            state: String::new(),
+            sub: String::new(),
+            last_result: String::new(),
+            last: String::new(),
+            exec: String::new(),
+            cwd: String::new(),
+            fragments: String::new(),
+            health_basis: String::new(),
+            activation: "timer".into(),
+        }
+    }
+
+    #[test]
+    fn logs_default_to_service_unit() {
+        assert_eq!(
+            logs_unit("managed-speech-tts"),
+            "managed-speech-tts.service"
+        );
+        assert_eq!(
+            logs_unit("managed-proxy-health"),
+            "managed-proxy-health.service"
+        );
+    }
+
+    #[test]
+    fn list_has_owned_and_watching_headers() {
+        let rows = sectioned_rows(
+            vec![dummy("managed-speech-tts", "owned")],
+            vec![dummy("managed-proxy-health", "watching")],
+        );
+        let labels: Vec<&str> = rows
+            .iter()
+            .map(|r| match r {
+                ListRow::Header(h) => *h,
+                ListRow::Op(op) => op.unit.as_str(),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "OWNED",
+                "managed-speech-tts",
+                "WATCHING",
+                "managed-proxy-health"
+            ]
+        );
     }
 }

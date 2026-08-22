@@ -8,7 +8,14 @@ is what a downstream package has to care about.
 
 Responsibility scopes: nearest `.systemd-ops.toml` walking up from cwd.
 `systemd-ops scope show` / `scope validate` / `tui` consume one derived
-ScopeView (owned, watching, health, attention). TUI is read-only.
+ScopeView (owned, watching, health, attention). TUI is read-only and
+lists OWNED then WATCHING. Operation logs in the TUI are the service
+unit. Scheduled oneshot health is `healthy` only when last success,
+timer enabled, and a next trigger exist. Manifest schema is deny-unknown;
+`critical` lives only under `[scope]`. Direct CLI authoring uses process
+cwd when `--cwd` is omitted. OMP inspect passes session cwd through
+`--cwd`.
+
 Managed operations expose `editable_spec` reconstructed from unit files;
 `start_now` is omitted (apply intent, not durable). New managed units
 record `origin_scope` / `origin_scope_root` when a manifest is

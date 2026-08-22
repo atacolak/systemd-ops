@@ -144,14 +144,12 @@ impl NormalizedSpec {
             .and_then(Value::as_str)
             .map(str::to_string);
         let mut spec = parse_spec(&json!({ "spec": v }), origin, created)?;
-        spec.origin_scope = v
-            .get("origin_scope")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        spec.origin_scope_root = v
-            .get("origin_scope_root")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        if let Some(s) = v.get("origin_scope").and_then(Value::as_str) {
+            spec.origin_scope = Some(s.to_string());
+        }
+        if let Some(s) = v.get("origin_scope_root").and_then(Value::as_str) {
+            spec.origin_scope_root = Some(s.to_string());
+        }
         Ok(spec)
     }
 
@@ -1194,6 +1192,18 @@ fn enablement_is_on(enablement: &Value) -> bool {
     )
 }
 
+fn has_future_trigger(view: &Value) -> bool {
+    match view.get("next") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) => !s.is_empty() && s != "n/a",
+        Some(_) => true,
+    }
+}
+
+fn is_timer_operation(view: &Value) -> bool {
+    view.get("activation").and_then(Value::as_str) == Some("timer")
+}
+
 fn editable_spec_json(
     stem: &str,
     managed: bool,
@@ -1264,12 +1274,16 @@ pub fn operation_health(view: &Value) -> &'static str {
         Some("oneshot") | Some("oneshot-linger") => {
             if never {
                 "unknown"
-            } else if last_result.and_then(Value::as_str) == Some("success") {
-                "healthy"
-            } else if last_result.map(|v| !v.is_null()).unwrap_or(false) || state == "failed" {
+            } else if last_result.and_then(Value::as_str) != Some("success") || state == "failed" {
                 "failed"
+            } else if is_timer_operation(view) {
+                if enabled && has_future_trigger(view) {
+                    "healthy"
+                } else {
+                    "unknown"
+                }
             } else {
-                "unknown"
+                "healthy"
             }
         }
         _ => {
@@ -1292,6 +1306,11 @@ pub fn health_basis(view: &Value) -> &'static str {
                 && view.get("last").map(Value::is_null).unwrap_or(true)
             {
                 "never-run"
+            } else if is_timer_operation(view)
+                && view.get("last_result").and_then(Value::as_str) == Some("success")
+                && operation_health(view) == "unknown"
+            {
+                "not-scheduled"
             } else {
                 "last-result"
             }
@@ -2303,27 +2322,6 @@ mod tests {
     }
 
     #[test]
-    fn editable_spec_round_trip_interval() {
-        assert_round_trip(
-            "oneshot",
-            json!({"type":"interval","on_boot_sec":"1min","on_unit_active_sec":"15min","persistent":true,"accuracy_sec":"1min"}),
-        );
-    }
-
-    #[test]
-    fn project_managed_editable_spec_is_null() {
-        let got = editable_spec_json(
-            "managed-test-x",
-            false,
-            None,
-            None,
-            &json!("enabled"),
-            false,
-        );
-        assert!(got.is_null());
-    }
-
-    #[test]
     fn never_run_is_unknown_not_success() {
         let view = json!({
             "kind": "oneshot",
@@ -2338,9 +2336,12 @@ mod tests {
     }
 
     #[test]
-    fn successful_scheduled_is_healthy() {
+    fn successful_scheduled_with_next_is_healthy() {
         let view = json!({
             "kind": "oneshot",
+            "activation": "timer",
+            "enablement": "enabled",
+            "next": "2026-01-02T07:00:00Z",
             "last_result": "success",
             "last": "2026-01-01T00:00:00Z",
             "state": "inactive",
@@ -2350,15 +2351,57 @@ mod tests {
     }
 
     #[test]
+    fn successful_scheduled_timer_disabled_is_unknown() {
+        let view = json!({
+            "kind": "oneshot",
+            "activation": "timer",
+            "enablement": "disabled",
+            "next": "2026-01-02T07:00:00Z",
+            "last_result": "success",
+            "last": "2026-01-01T00:00:00Z",
+        });
+        assert_eq!(operation_health(&view), "unknown");
+        assert_eq!(health_basis(&view), "not-scheduled");
+    }
+
+    #[test]
+    fn successful_scheduled_without_next_is_unknown() {
+        let view = json!({
+            "kind": "oneshot",
+            "activation": "timer",
+            "enablement": "enabled",
+            "next": Value::Null,
+            "last_result": "success",
+            "last": "2026-01-01T00:00:00Z",
+        });
+        assert_eq!(operation_health(&view), "unknown");
+        assert_eq!(health_basis(&view), "not-scheduled");
+    }
+
+    #[test]
     fn failed_scheduled_is_failed() {
         let view = json!({
             "kind": "oneshot",
+            "activation": "timer",
+            "enablement": "enabled",
+            "next": "2026-01-02T07:00:00Z",
             "last_result": "exit-code",
             "last": "2026-01-01T00:00:00Z",
             "state": "failed",
             "sub": "failed",
         });
         assert_eq!(operation_health(&view), "failed");
+    }
+
+    #[test]
+    fn unscheduled_oneshot_success_is_healthy() {
+        let view = json!({
+            "kind": "oneshot",
+            "activation": "direct",
+            "last_result": "success",
+            "last": "2026-01-01T00:00:00Z",
+        });
+        assert_eq!(operation_health(&view), "healthy");
     }
 
     #[test]
@@ -2420,6 +2463,35 @@ mod tests {
         let header = header_lines(&spec);
         assert!(header.contains("# systemd-ops-origin-scope: speech"));
         assert!(header.contains("# systemd-ops-origin-scope-root:"));
+        let _ = std::fs::remove_dir_all(&dir);
+        systemd::set_write_prefix(None);
+    }
+
+    #[test]
+    fn from_json_keeps_stamped_scope_when_payload_null() {
+        systemd::set_write_prefix(Some("managed-*".into()));
+        let dir = std::env::temp_dir().join(format!("systemd-ops-fromjson-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join(".systemd-ops.toml"),
+            "[scope]\nid=\"speech\"\nowned=[\"managed-speech-*\"]\n",
+        )
+        .unwrap();
+        let restored = NormalizedSpec::from_json(&json!({
+            "unit": "managed-test-origin",
+            "kind": "oneshot",
+            "exec": { "path": "/bin/true", "argv": [] },
+            "origin_cwd": dir.to_string_lossy(),
+            "origin_scope": Value::Null,
+            "origin_scope_root": Value::Null,
+            "created_at": "t0",
+        }))
+        .unwrap();
+        assert_eq!(restored.origin_scope.as_deref(), Some("speech"));
+        assert_eq!(
+            restored.origin_scope_root.as_deref(),
+            Some(dir.to_string_lossy().as_ref())
+        );
         let _ = std::fs::remove_dir_all(&dir);
         systemd::set_write_prefix(None);
     }

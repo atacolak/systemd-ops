@@ -95,13 +95,14 @@ impl ScopeView {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct RawFile {
     scope: Option<RawScope>,
-    critical: Option<Vec<String>>,
     watch: Option<Vec<RawWatch>>,
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct RawScope {
     id: Option<String>,
     owned: Option<Vec<String>>,
@@ -109,6 +110,7 @@ struct RawScope {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct RawWatch {
     operation: Option<String>,
 }
@@ -177,10 +179,7 @@ pub fn parse_manifest(text: &str, root: PathBuf) -> Result<ScopeManifest, Backen
     for g in &owned {
         validate_owned_glob(g)?;
     }
-    let mut critical = raw.critical.unwrap_or_default();
-    if let Some(extra) = scope.critical {
-        critical.extend(extra);
-    }
+    let mut critical = scope.critical.unwrap_or_default();
     critical.sort();
     critical.dedup();
     for stem in &critical {
@@ -450,7 +449,6 @@ mod tests {
 [scope]
 id = "speech"
 owned = ["managed-speech-*"]
-
 critical = [
   "managed-speech-asr",
   "managed-speech-tts",
@@ -509,6 +507,26 @@ operation = "managed-proxy-health"
         let err = parse_manifest("[scope]\nid=\"x\"\nowned=[\"a,b\"]\n", PathBuf::from("/x"))
             .unwrap_err();
         assert!(err.0.contains("malformed owned glob"), "got {}", err.0);
+    }
+
+    #[test]
+    fn unknown_field_is_rejected() {
+        let err = parse_manifest(
+            "[scope]\nid=\"speech\"\nowned=[\"managed-speech-*\"]\ncritcal=[\"managed-speech-asr\"]\n",
+            PathBuf::from("/x"),
+        )
+        .unwrap_err();
+        assert!(err.0.contains("malformed"), "got {}", err.0);
+    }
+
+    #[test]
+    fn top_level_critical_is_rejected() {
+        let err = parse_manifest(
+            "critical=[\"managed-speech-asr\"]\n[scope]\nid=\"speech\"\nowned=[\"managed-speech-*\"]\n",
+            PathBuf::from("/x"),
+        )
+        .unwrap_err();
+        assert!(err.0.contains("malformed"), "got {}", err.0);
     }
 
     #[test]
@@ -571,7 +589,7 @@ operation = "managed-proxy-health"
             ],
             vec![op(
                 "managed-proxy-health",
-                json!({"kind":"oneshot","activation":"timer","last_result":"success","last":"2026-01-01T00:00:00Z"}),
+                json!({"kind":"oneshot","activation":"timer","enablement":"enabled","next":"2026-01-02T07:00:00Z","last_result":"success","last":"2026-01-01T00:00:00Z"}),
             )],
         );
         assert_eq!(view.health, ScopeHealth::Healthy);

@@ -42,7 +42,6 @@ file is the scope root.
 [scope]
 id = "speech"
 owned = ["managed-speech-*"]
-
 critical = [
   "managed-speech-asr",
   "managed-speech-tts",
@@ -56,8 +55,9 @@ Rules:
 
 - `scope.id` is required, 1..64 characters, `[a-z][a-z0-9-]*`.
 - `owned` is one or more globs (`*` and `?`, same matcher as write-prefix).
-- `critical` is explicit stems, not globs. Each must match an owned glob.
+- `critical` is under `[scope]`, explicit stems, not globs. Each must match an owned glob.
 - `watch` entries are explicit stems. A stem must not be both owned and watched.
+- unknown keys are refused. There is no top-level `critical`.
 - no `owner_agent`, `hcom_agent`, `omp_profile`, `lead`, or `manager` fields.
 
 Once the file exists it is canonical. Agents may infer a first id and
@@ -121,7 +121,9 @@ HTTP checks, or incident state.
 Operation: `healthy` | `failed` | `unknown`.
 
 - Scheduled oneshot: never-run is `unknown`, never success. Last
-  actual result success → `healthy`; failure → `failed`.
+  actual result failure → `failed`. Last success is `healthy` only if
+  the timer is enabled and a future trigger exists; otherwise
+  `unknown` (`health_basis=not-scheduled`).
 - Long-running (`simple`) expected active: `active`/`running` →
   `healthy`; `failed` state → `failed`; enabled but inactive →
   `failed`; disabled and inactive → `unknown`.

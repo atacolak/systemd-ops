@@ -72,7 +72,7 @@ function textResult(text: string, extra?: { isError?: boolean; details?: unknown
 	};
 }
 
-function sessionCwd(ctx: SessionLike | undefined, fallback: string | undefined): string | undefined {
+export function sessionCwd(ctx: SessionLike | undefined, fallback: string | undefined): string | undefined {
 	if (typeof ctx?.cwd === "string" && ctx.cwd.length > 0) return ctx.cwd;
 	if (typeof fallback === "string" && fallback.length > 0) return fallback;
 	return undefined;
@@ -90,7 +90,7 @@ function opsBin(): string {
 	return process.env.SYSTEMD_OPS_BIN?.trim() || DEFAULT_BIN;
 }
 
-function inspectArgv(action: string, args: Json): string[] {
+export function inspectArgv(action: string, args: Json): string[] {
 	const argv: string[] = [];
 	switch (action) {
 		case "list_operations":
@@ -141,9 +141,13 @@ function inspectArgv(action: string, args: Json): string[] {
 	return argv;
 }
 
+export function opsCliArgv(argv: string[], cwd?: string): string[] {
+	return ["--json", "--manager", "user", ...(cwd ? ["--cwd", cwd] : []), ...argv];
+}
+
 function runOps(argv: string[], cwd?: string): Promise<Json> {
 	const { promise, resolve, reject } = Promise.withResolvers<Json>();
-	const child = spawn(opsBin(), ["--json", "--manager", "user", ...(cwd ? ["--cwd", cwd] : []), ...argv], {
+	const child = spawn(opsBin(), opsCliArgv(argv, cwd), {
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 	let stdout = "";
@@ -234,7 +238,7 @@ export default function systemdTools(pi: { cwd?: string }) {
 					boot: { type: "integer", description: "unit_logs boot offset (0 current, -1 previous)" },
 				},
 			},
-			async execute(_id: string, params: Json) {
+			async execute(_id: string, params: Json, _onUpdate?: unknown, ctx?: SessionLike) {
 				const action = String(params?.action ?? "");
 				if (!(INSPECT_ACTIONS as readonly string[]).includes(action)) {
 					return textResult("systemd_inspect requires a read action.", { isError: true });
@@ -250,8 +254,9 @@ export default function systemdTools(pi: { cwd?: string }) {
 					"grep",
 					"boot",
 				]);
+				const cwd = sessionCwd(ctx, factoryCwd);
 				try {
-					return envelopeResult(await runOps(inspectArgv(action, args)));
+					return envelopeResult(await runOps(inspectArgv(action, args), cwd));
 				} catch (e) {
 					return textResult(e instanceof Error ? e.message : String(e), { isError: true });
 				}
