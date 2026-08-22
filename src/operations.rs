@@ -324,8 +324,16 @@ fn validate_ident(label: &str, s: &str) -> Result<(), BackendError> {
 }
 
 fn quote_word(s: &str) -> String {
-    let special = s.is_empty()
-        || s.bytes().any(|b| {
+    // systemd ExecStart is not a shell. It splits on whitespace, honors
+    // quotes, expands $VAR/${VAR}, and expands % specifiers. `|`, `&`,
+    // `;`, `>`, `<`, and backticks are ordinary characters.
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('%', "%%");
+    let needs_quotes = escaped.is_empty()
+        || escaped.bytes().any(|b| {
             b <= b' '
                 || matches!(
                     b,
@@ -351,14 +359,10 @@ fn quote_word(s: &str) -> String {
                         | b'='
                 )
         });
-    if special {
-        let escaped = s
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('$', "\\$");
+    if needs_quotes {
         format!("\"{escaped}\"")
     } else {
-        s.to_string()
+        escaped
     }
 }
 
@@ -514,7 +518,7 @@ fn parse_schedule(v: Option<&Value>, kind: Kind) -> Result<Option<Schedule>, Bac
     }
 }
 
-fn spec_object<'a>(args: &'a Value) -> Result<&'a Value, BackendError> {
+fn spec_object(args: &Value) -> Result<&Value, BackendError> {
     args.get("spec")
         .ok_or_else(|| BackendError("missing required argument: spec".into()))
 }
@@ -552,18 +556,9 @@ pub fn parse_spec(
     validate_abs_path("spec.exec.path", exec_path, true)?;
     let exec_argv = parse_string_list("spec.exec.argv", exec.get("argv"))?;
     for arg in &exec_argv {
-        if arg.contains('\n')
-            || arg.contains('\0')
-            || arg.contains('$')
-            || arg.contains('|')
-            || arg.contains('>')
-            || arg.contains('<')
-            || arg.contains(';')
-            || arg.contains('&')
-            || arg.contains('`')
-        {
+        if arg.contains('\n') || arg.contains('\0') {
             return Err(BackendError(
-                "spec.exec.argv entries cannot contain shell metacharacters".into(),
+                "spec.exec.argv entries cannot contain newlines or NUL".into(),
             ));
         }
     }
@@ -1773,17 +1768,48 @@ mod tests {
     }
 
     #[test]
-    fn argv_rejects_shell_metacharacters() {
+    fn argv_rejects_newlines_and_nul() {
         systemd::set_write_prefix(Some("managed-*".into()));
         let args = json!({
             "spec": {
                 "unit": "managed-test-shell",
                 "kind": "oneshot",
-                "exec": { "path": "/bin/true", "argv": ["a;b"] }
+                "exec": { "path": "/bin/true", "argv": ["a\nb"] }
             }
         });
         assert!(parse_spec(&args, None, None).is_err());
         systemd::set_write_prefix(None);
+    }
+
+    #[test]
+    fn argv_allows_urls_query_and_regex() {
+        systemd::set_write_prefix(Some("managed-*".into()));
+        let args = json!({
+            "spec": {
+                "unit": "managed-test-url",
+                "kind": "oneshot",
+                "exec": {
+                    "path": "/bin/true",
+                    "argv": [
+                        "https://example.com/x?a=1&b=2",
+                        "^foo|bar$",
+                        "a;b"
+                    ]
+                }
+            }
+        });
+        let spec = parse_spec(&args, None, Some("t0".into())).unwrap();
+        let line = exec_line(&spec.exec_path, &spec.exec_argv);
+        assert!(line.contains("https://example.com/x?a=1&b=2"));
+        assert!(line.contains("^foo|bar\\$"));
+        systemd::set_write_prefix(None);
+    }
+
+    #[test]
+    fn quote_word_escapes_dollar_and_percent() {
+        assert_eq!(quote_word("$HOME"), "\"\\$HOME\"");
+        assert_eq!(quote_word("%n"), "%%n");
+        assert_eq!(quote_word("ok"), "ok");
     }
 
     #[test]

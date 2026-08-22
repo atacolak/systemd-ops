@@ -16,8 +16,7 @@ Usage:
   systemd-ops-mcp --grant <scope>[,<scope>...] [options]
   systemd-ops-mcp --help | --version
 
-Options:
-  --manager user|system     systemd manager (default: user via config, else system)
+  --manager user|system     systemd manager (default: user)
   --surface full|compact    advertised tool set (default: full)
   --write-prefix <glob[,glob...]>  restrict writes to matching unit names
   --config <path>           config file (default: $XDG_CONFIG_HOME/systemd-ops/config.toml)
@@ -146,11 +145,10 @@ fn main() -> ExitCode {
         eprintln!("error: no scopes granted; pass --grant (see --help)");
         return ExitCode::FAILURE;
     };
-    let cfg = match OpsConfig::load_with_default(
+    let cfg = match OpsConfig::load(
         manager,
         write_prefix,
         config_path.as_deref().map(std::path::Path::new),
-        Manager::System,
     ) {
         Ok(c) => c,
         Err(e) => {

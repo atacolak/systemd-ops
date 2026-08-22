@@ -15,8 +15,8 @@ libsystemd linkage, no D-Bus library, no async runtime.
    There is no implied operator namespace.
 2. **All writes go through plan/apply.** Nothing mutates directly. A
    change is planned first, then applied with a sealed `plan_token`.
-   Apply is refused if the token is stale, expired, tampered, or the
-   wrong class (control vs author).
+   Apply is refused if the token is stale, expired, tampered, the
+   wrong class (control vs author), or bound to the other manager.
 3. **The MCP frontend grants nothing by default.** `systemd-ops-mcp`
    refuses to start without `--grant`. Tools outside the granted scopes
    are not advertised and are refused.
@@ -43,17 +43,18 @@ or
 ```
 
 The CLI default manager is the user instance (`systemctl --user`).
-Pass `--manager system` for PID 1.
+Pass `--manager system` for PID 1. `systemd-ops-mcp` uses the same
+default. Live PID-1 suites pass `--manager system` explicitly.
 
 ## MCP frontend
 
-```
-systemd-ops-mcp --grant units:read,journal:read --write-prefix 'managed-*'
-```
+Optional. Direct CLI is the default agent surface. The MCP binary is
+`systemd-ops-mcp`; it is the same engine behind a JSON-RPC stdio
+transport.
 
 It speaks MCP (line-delimited JSON-RPC 2.0) on stdin/stdout. Without
-`--manager`, and without config/env, it still defaults to the system
-manager so existing live suites hit PID 1. Writes still need a prefix.
+`--manager`, and without config/env, it defaults to the user manager.
+Writes still need a prefix.
 
 ```json
 {
@@ -123,4 +124,4 @@ The socket is mode 0600. The package should not enable it.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). Ancestry: [NOTICE](NOTICE).

@@ -36,6 +36,8 @@ fn classify(message: &str) -> &'static str {
         "stale_plan"
     } else if m.contains("expired") {
         "expired_plan"
+    } else if m.contains("for the") && m.contains("manager") {
+        "manager_mismatch"
     } else if m.contains("tamper") || m.contains("invalid plan token") || m.contains("bad mac") {
         "invalid_token"
     } else if m.contains("not mcp-authored")
@@ -64,5 +66,13 @@ mod tests {
         assert_eq!(v["schema_version"], json!(1));
         assert_eq!(v["ok"], json!(true));
         assert_eq!(v["data"]["x"], json!(1));
+    }
+
+    #[test]
+    fn classify_manager_mismatch() {
+        assert_eq!(
+            classify("plan token is for the user manager; current manager is system"),
+            "manager_mismatch"
+        );
     }
 }

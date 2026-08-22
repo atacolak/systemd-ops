@@ -25,7 +25,8 @@ rpc() { # rpc <scopes> <request-lines...> -> raw replies, one per line
   local scopes=$1
   shift
   # $MCPD is left unquoted: it may carry a command prefix.
-  printf '%s\n' "$@" | $MCPD --grant "$scopes"
+  # --manager system: this suite talks to PID 1; the binary defaults to user.
+  printf '%s\n' "$@" | $MCPD --manager system --grant "$scopes"
 }
 
 call() { # call <tool> <args-json> -> one tools/call request line
@@ -306,7 +307,7 @@ else
       -e 's|^Documentation=.*||' tests/../systemd-ops-mcp.socket |
     $HOST tee "$SOCKET_UNIT" >/dev/null
   $HOST cp "${MCPD##* }" "$SOCKET_BIN"
-  sed -e "s|^ExecStart=.*|ExecStart=$SOCKET_BIN --grant units:read|" \
+  sed -e "s|^ExecStart=.*|ExecStart=$SOCKET_BIN --manager system --grant units:read|" \
       -e 's|^Documentation=.*||' tests/../systemd-ops-mcp@.service |
     $HOST tee "$SERVICE_UNIT" >/dev/null
   $HOST test -s "$SOCKET_UNIT" || fail "socket unit is empty: does HOST forward stdin?"
@@ -398,7 +399,7 @@ $HOST test -s "$WRITE_UNIT" ||
 $HOST systemctl daemon-reload
 
 write_rpc() {
-  printf '%s\n' "$@" | $MCPD --grant units:write --write-prefix '*'
+  printf '%s\n' "$@" | $MCPD --manager system --grant units:write --write-prefix '*'
 }
 
 planned=$(write_rpc "$(call plan_change '{"action":"start","unit":"mcpd-write-test.service"}')" |
@@ -416,7 +417,7 @@ jq -e '.applied == true and .diff.active.before == "inactive" and .diff.active.a
 
 # Stale plans are refused: plan against a state, change that state
 # out-of-band, apply must refuse.
-coproc SRV { $MCPD --grant units:write --write-prefix '*'; }
+coproc SRV { $MCPD --manager system --grant units:write --write-prefix '*'; }
 printf '%s\n' "$(call plan_change '{"action":"stop","unit":"mcpd-write-test.service"}')" >&"${SRV[1]}"
 read -t 30 -r planned2 <&"${SRV[0]}" || fail "no reply from server (plan)"
 token2=$(jq -r '.result.content[0].text | fromjson | .plan_token' <<<"$planned2")
@@ -446,7 +447,7 @@ dis_token=$(jq -r '.plan_token' <<<"$dis_planned")
 write_rpc "$(call apply_plan "{\"plan_token\":\"$dis_token\"}")" >/dev/null
 [ "$($HOST systemctl is-enabled mcpd-write-test.service)" = "disabled" ] ||
   fail "unit not disabled after rollback apply"
-coproc SRV2 { $MCPD --grant units:write --write-prefix '*'; }
+coproc SRV2 { $MCPD --manager system --grant units:write --write-prefix '*'; }
 printf '%s\n' "$(call plan_change '{"action":"mask","unit":"mcpd-write-test.service"}')" >&"${SRV2[1]}"
 read -t 30 -r m_planned <&"${SRV2[0]}" || fail "no reply from server (mask plan)"
 m_token=$(jq -r '.result.content[0].text | fromjson | .plan_token' <<<"$m_planned")

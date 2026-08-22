@@ -49,7 +49,8 @@ jobs:
                    /tmp/stage/usr/share/man/man1/systemd-ops-mcp.1 \
                    /tmp/stage/usr/lib/systemd/system/systemd-ops-mcp.socket \
                    /tmp/stage/usr/lib/systemd/system/systemd-ops-mcp@.service \
-                   /tmp/stage/usr/share/licenses/systemd-ops/LICENSE; do
+                   /tmp/stage/usr/share/licenses/systemd-ops/LICENSE \
+                   /tmp/stage/usr/share/licenses/systemd-ops/NOTICE; do
             [ -e "$f" ] || { echo "::error::make install did not produce $f"; exit 1; }
           done
           grep -q '^ExecStart=/usr/bin/systemd-ops-mcp ' \

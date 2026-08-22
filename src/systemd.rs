@@ -19,9 +19,9 @@ use std::process::Command;
 
 /// Which systemd manager the CLI backends address.
 ///
-/// `System` is PID 1 (the default, matching upstream). `User` is the
-/// calling user's `systemd --user` instance. systemd 255 has no user
-/// manager varlink socket, so user mode never takes the varlink path.
+/// `User` is the calling user's `systemd --user` instance (product
+/// default). `System` is PID 1. systemd 255 has no user manager
+/// varlink socket, so user mode never takes the varlink path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Manager {
     System,
@@ -34,6 +34,13 @@ impl Manager {
             "system" => Some(Manager::System),
             "user" => Some(Manager::User),
             _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Manager::System => "system",
+            Manager::User => "user",
         }
     }
 }

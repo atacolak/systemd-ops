@@ -1,8 +1,9 @@
 # Design
 
-How the server talks to systemd, how it talks to MCP clients, and what
-the write path does and does not guarantee. For arguments and reply
-shapes see [TOOLS.md](TOOLS.md); for how any of this is verified see
+How systemd-ops talks to systemd, how the write path works, and what
+the optional MCP frontend does. The primary interface is the
+`systemd-ops` CLI. MCP is optional. For arguments and reply shapes see
+[TOOLS.md](TOOLS.md); for how any of this is verified see
 [TESTING.md](TESTING.md).
 
 ## Backends
@@ -70,17 +71,20 @@ Nothing mutates without a plan, and the program contains exactly one
 mutating process invocation, at the end of the apply path. No other
 code path reaches it.
 
-- Nothing executes at plan time. `plan_change` performs reads only.
-- `apply_plan` compares the current state against the state recorded at
-  plan time. On mismatch the plan is discarded with an error directing
-  the client to re-plan. This is a precondition check, not a lock: the
-  window between the check and the systemctl invocation is unguarded,
-  as it is for any other systemctl caller.
-- Plans are single-use, exist only in server memory for the lifetime of
-  the process, and are capped at 32 with oldest-first eviction.
+- Nothing executes at plan time. `plan` / `plan_change` perform reads
+  only and return a sealed `plan_token`.
+- The token is HMAC-SHA256 over canonical JSON, including the systemd
+  manager (`user` or `system`) the plan was made against, the unit,
+  class (control vs author), expiry, and the observed precondition.
+  Apply rejects a bad MAC, an expired token, a class mismatch, a
+  manager mismatch, and a stale observed state.
+- Tokens are stateless. There is no process-local plan table and no
+  replay ledger. The same token can be presented twice; the second
+  apply fails if the recorded state no longer matches. That is a
+  stale-state check, not single-use.
 - Privileges are the invoking user's. An unprivileged user can plan
-  anything but apply only what polkit permits; the refusal is
-  systemctl's, passed through as a tool error.
+  anything matching the write-prefix but apply only what polkit
+  permits; the refusal is systemctl's, passed through as an error.
 
 ## Known limits
 
@@ -215,19 +219,16 @@ learns nothing from a refusal. A request that carries client
 capabilities but no version is refused instead: capabilities are a
 modern field, so the request has already declared its era.
 
-Not implemented, because this server exposes tools and nothing else:
-resources, prompts, completion, pagination, subscriptions, tasks, MCP
-Apps, and the client features (sampling, roots, elicitation). Roots,
-sampling and logging are deprecated as of 2026-07-28 in any case. There
+Not implemented, because the MCP frontend exposes tools and nothing
+else: resources, prompts, completion, pagination, subscriptions, tasks,
+MCP Apps, and the client features (sampling, roots, elicitation). There
 is no HTTP transport and therefore no authorization: stdio takes its
 credentials from the process that spawned it.
 
-Statelessness has one consequence for the write path. Plan ids follow
-the pattern the specification recommends for state, an explicit handle
-minted by the server and passed back as an ordinary argument, but they
-live in the process's memory. A client that restarts the server
-between `plan_change` and `apply_plan` gets "unknown plan" and has to
-plan again.
+Plan tokens do not live in server memory. A client can restart the
+process between plan and apply; the token still works until it expires
+or the recorded state drifts. OMP does not speak MCP: `omp/systemd.ts`
+shells `systemd-ops --json` per call.
 
 ## Roadmap
 

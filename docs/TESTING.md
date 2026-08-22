@@ -56,8 +56,10 @@ CI runs the binary against two live systemds on every push:
   canary unit the run started itself.
 
 Both suites take `MCPD` (how to run the server) and `HOST` (how to
-reach the target systemd, empty for this machine). They need root to
-create transient units, write a unit file, and read the system journal:
+reach the target systemd, empty for this machine). They pass
+`--manager system` themselves: the binary defaults to the user
+manager. They need root to create transient units, write a unit file,
+and read the system journal:
 
 ```
 cargo build --release

@@ -1,8 +1,9 @@
-//! Sealed plan tokens. Process-local plan ids are gone.
+//! Sealed plan tokens.
 //!
 //! Integrity: HMAC-SHA256 over canonical JSON. Token form `v1.<payload>.<mac>`.
-//! Payload is base64url JSON. Short expiry + stale/precondition checks.
-//! No nonce ledger: a fully stateless token cannot honestly be one-time.
+//! Payload is base64url JSON including the systemd manager the plan was
+//! made against. Short expiry + stale/precondition checks. No nonce
+//! ledger: a fully stateless token cannot honestly be one-time.
 
 use serde_json::{json, Value};
 
@@ -38,6 +39,7 @@ impl PlanClass {
 #[derive(Clone, Debug)]
 pub struct SealedPlan {
     pub class: PlanClass,
+    pub manager: crate::systemd::Manager,
     pub unit: String,
     pub issued_at: u64,
     pub expires_at: u64,
@@ -48,6 +50,7 @@ pub struct SealedPlan {
 pub fn issue(cfg: &OpsConfig, plan: &SealedPlan) -> Result<String, BackendError> {
     let body = json!({
         "class": plan.class.as_str(),
+        "manager": plan.manager.as_str(),
         "unit": plan.unit,
         "issued_at": plan.issued_at,
         "expires_at": plan.expires_at,
@@ -73,6 +76,7 @@ pub fn mint(
     let now = config::now_unix();
     let plan = SealedPlan {
         class,
+        manager: cfg.manager,
         unit: unit.to_string(),
         issued_at: now,
         expires_at: now + cfg.plan_ttl_secs,
@@ -106,6 +110,16 @@ pub fn parse(cfg: &OpsConfig, token: &str) -> Result<SealedPlan, BackendError> {
     let body: Value =
         serde_json::from_slice(&raw).map_err(|_| BackendError("invalid plan token".into()))?;
     let class = PlanClass::parse(body.get("class").and_then(Value::as_str).unwrap_or(""))?;
+    let manager =
+        crate::systemd::Manager::parse(body.get("manager").and_then(Value::as_str).unwrap_or(""))
+            .ok_or_else(|| BackendError("invalid plan token".into()))?;
+    if manager != cfg.manager {
+        return Err(BackendError(format!(
+            "plan token is for the {} manager; current manager is {}",
+            manager.as_str(),
+            cfg.manager.as_str()
+        )));
+    }
     let expires_at = body
         .get("expires_at")
         .and_then(Value::as_u64)
@@ -123,6 +137,7 @@ pub fn parse(cfg: &OpsConfig, token: &str) -> Result<SealedPlan, BackendError> {
         .to_string();
     Ok(SealedPlan {
         class,
+        manager,
         unit,
         issued_at: body.get("issued_at").and_then(Value::as_u64).unwrap_or(0),
         expires_at,
@@ -240,7 +255,6 @@ mod tests {
     use super::*;
     use crate::config::OpsConfig;
     use crate::systemd::Manager;
-    use std::path::PathBuf;
 
     #[test]
     fn b64_roundtrip() {
@@ -270,12 +284,67 @@ mod tests {
         let parsed = parse(&cfg, &token).unwrap();
         assert_eq!(parsed.class, PlanClass::Control);
         assert_eq!(parsed.unit, "managed-x.service");
+        assert_eq!(parsed.manager, Manager::User);
         let mut bad = token.clone();
         let last = bad.pop().unwrap();
         bad.push(if last == 'a' { 'b' } else { 'a' });
         let err = parse(&cfg, &bad).unwrap_err();
         assert!(err.0.contains("bad mac") || err.0.contains("invalid"));
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = PathBuf::from(".");
+    }
+
+    fn cfg(manager: Manager, dir: &std::path::Path) -> OpsConfig {
+        OpsConfig {
+            manager,
+            write_prefix: Some("managed-*".into()),
+            plan_ttl_secs: 600,
+            state_dir: dir.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn user_token_rejected_on_system_manager() {
+        let dir =
+            std::env::temp_dir().join(format!("systemd-ops-token-user-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let user = cfg(Manager::User, &dir);
+        let system = cfg(Manager::System, &dir);
+        let (token, _) = mint(
+            &user,
+            PlanClass::Control,
+            "managed-x.service",
+            None,
+            json!({"action":"start"}),
+        )
+        .unwrap();
+        let err = parse(&system, &token).unwrap_err();
+        assert!(
+            err.0.contains("user") && err.0.contains("system"),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn system_token_rejected_on_user_manager() {
+        let dir =
+            std::env::temp_dir().join(format!("systemd-ops-token-sys-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let user = cfg(Manager::User, &dir);
+        let system = cfg(Manager::System, &dir);
+        let (token, _) = mint(
+            &system,
+            PlanClass::Control,
+            "managed-x.service",
+            None,
+            json!({"action":"start"}),
+        )
+        .unwrap();
+        let err = parse(&user, &token).unwrap_err();
+        assert!(
+            err.0.contains("user") && err.0.contains("system"),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

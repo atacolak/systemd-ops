@@ -10,13 +10,17 @@ The crate is `systemd-ops`. Direct CLI `systemd-ops` is the default
 frontend. Optional `systemd-ops-mcp` still speaks MCP over stdio.
 Process-local numeric plan ids are gone; plan/apply uses HMAC-sealed
 `plan_token` values with short expiry and stale/precondition checks.
-No nonce ledger. Writes without a configured write-prefix are refused.
-There is no implied unit namespace. New authored units carry
-`# managed: systemd-ops 1`. Packaging files are `systemd-ops-mcp.1`,
-`systemd-ops-mcp.socket`, and `systemd-ops-mcp@.service`. OperationView
-exposes exec/cwd/schedule, timer enablement, and never-run as
-`last_result: null`. CLI default manager is user. MCP default manager
-without config is still system.
+The token payload includes the systemd manager; apply rejects a
+user-token on the system manager and the reverse. No nonce ledger.
+Writes without a configured write-prefix are refused. There is no
+implied unit namespace. New authored units carry `# managed: systemd-ops 1`.
+Packaging files are `systemd-ops-mcp.1`, `systemd-ops-mcp.socket`, and
+`systemd-ops-mcp@.service`. OperationView exposes exec/cwd/schedule,
+timer enablement, and never-run as `last_result: null`. CLI and MCP
+default manager is user. Live PID-1 suites pass `--manager system`.
+`ExecStart` argv refuses only NUL and newlines; `$` and `%` are quoted
+so they survive systemd expansion. LICENSE is standard MIT; NOTICE
+records the systemd-mcpd ancestry.
 
 
 

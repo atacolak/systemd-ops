@@ -13,7 +13,7 @@ Documentation=man:systemd-ops-mcp(1)
 # Read scopes only. units:write is not granted here; add it only when
 # this instance is expected to operate the machine rather than inspect
 # it.
-ExecStart=/usr/local/bin/systemd-ops-mcp --grant units:read,journal:read,boot:read
+ExecStart=/usr/local/bin/systemd-ops-mcp --manager system --grant units:read,journal:read,boot:read
 DynamicUser=yes
 SupplementaryGroups=systemd-journal
 

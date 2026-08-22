@@ -1,0 +1,5 @@
+systemd-ops is a derivative of systemd-mcpd
+https://github.com/rhaist/systemd-mcpd
+
+Copyright (c) 2026 Robert Haist and contributors
+Released under the MIT License. See LICENSE.

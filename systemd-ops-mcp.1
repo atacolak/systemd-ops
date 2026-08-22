@@ -42,8 +42,10 @@ an error, not a warning.
 .TP
 .BI \-\-manager " user|system"
 Which systemd manager the CLI backends address. Default
-.BR system
-(PID 1).
+.BR user
+(\fBsystemd \-\-user\fR).
+.B system
+is PID 1.
 .B user
 runs
 .BR systemctl (1),
@@ -54,6 +56,8 @@ with
 .BR \-\-user .
 On systemd 255 the user manager has no varlink socket, so user mode
 never takes that path.
+A plan token is bound to the manager it was issued against; apply
+rejects a mismatch.
 .TP
 .BI \-\-surface " full|compact"
 Advertised tool set. Default

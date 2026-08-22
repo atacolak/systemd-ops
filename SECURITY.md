@@ -21,6 +21,7 @@ The claims this project makes, and therefore the ones worth breaking:
   neither advertised nor callable, in either protocol era.
 - **Nothing mutates without an applied plan.** There is one mutating
   process invocation and it is reachable only through `apply_plan`.
+  A token is bound to the manager it was issued against.
 - **No shell, ever.** Arguments are argv elements. A unit name reaches
   a command line only after `--` or inside a single `--flag=value`,
   and only after validation.

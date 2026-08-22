@@ -130,7 +130,8 @@ have started so far; that too mirrors systemd-analyze.
 - **`apply_plan`**: required `plan_token` from any plan_* tool.
   Optional `context` is provenance only. Re-checks stale state, the
   `--write-prefix` globs, the managed marker for update/retire, and
-  executable existence for create/update.
+  executable existence for create/update. A token issued against the
+  other manager is refused.
 
 Lifecycle actions (start, stop, restart, reload) operate on the unit's
 active state; enablement actions (enable, disable, mask, unmask) on its

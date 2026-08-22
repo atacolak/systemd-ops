@@ -202,7 +202,7 @@ vm_boot_phases() {
   local name=$1 SSH=$2 times props
   say "$name: boot phases against the manager timestamps"
   times=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"boot_times","arguments":{}}}\n' |
-    $SSH sudo /usr/local/bin/systemd-ops-mcp --grant boot:read |
+    $SSH sudo /usr/local/bin/systemd-ops-mcp --manager system --grant boot:read |
     jq -r '.result.content[0].text')
   props=$($SSH sudo systemctl show --no-pager \
     --property=FirmwareTimestampMonotonic,LoaderTimestampMonotonic,InitRDTimestampMonotonic,UserspaceTimestampMonotonic,FinishTimestampMonotonic)
@@ -270,12 +270,12 @@ vm_reboot_persistence() {
   # Enable it through the server's own write path, not systemctl.
   local plan
   planned=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"plan_change","arguments":{"action":"enable","unit":"%s"}}}\n' "$unit" |
-    $SSH sudo /usr/local/bin/systemd-ops-mcp --grant units:write --write-prefix '*' |
+    $SSH sudo /usr/local/bin/systemd-ops-mcp --manager system --grant units:write --write-prefix '*' |
     jq -r '.result.content[0].text')
   token=$(jq -r '.plan_token' <<<"$planned")
   [ -n "$token" ] && [ "$token" != "null" ] || fail "$name: plan_change returned no token: $planned"
   applied=$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"apply_plan","arguments":{"plan_token":"%s"}}}\n' "$token" |
-    $SSH sudo /usr/local/bin/systemd-ops-mcp --grant units:write --write-prefix '*' |
+    $SSH sudo /usr/local/bin/systemd-ops-mcp --manager system --grant units:write --write-prefix '*' |
     jq -r '.result.content[0].text')
   jq -e '.diff.unit_file_state.after == "enabled"' <<<"$applied" >/dev/null ||
     fail "$name: apply did not enable the unit: $applied"

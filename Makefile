@@ -65,7 +65,7 @@ install: build
 	chmod 0644 $(DESTDIR)$(unitdir)/systemd-ops-mcp@.service
 	$(INSTALL) -D -m 0644 systemd-ops-mcp.socket $(DESTDIR)$(unitdir)/systemd-ops-mcp.socket
 	$(INSTALL) -D -m 0644 -t $(DESTDIR)$(docdir) $(DOCS)
-	$(INSTALL) -D -m 0644 LICENSE $(DESTDIR)$(licensedir)/LICENSE
+	$(INSTALL) -D -m 0644 -t $(DESTDIR)$(licensedir) LICENSE NOTICE
 
 uninstall:
 	rm -f $(DESTDIR)$(bindir)/systemd-ops

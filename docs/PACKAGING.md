@@ -44,7 +44,7 @@ make CARGOFLAGS="--release --locked --offline"
 | `$(unitdir)/systemd-ops-mcp.socket` | socket unit, `Accept=yes`, mode 0600 |
 | `$(unitdir)/systemd-ops-mcp@.service` | hardened per-connection template |
 | `$(docdir)/` | README and the docs directory |
-| `$(licensedir)/LICENSE` | the license |
+| `$(licensedir)/LICENSE`, `$(licensedir)/NOTICE` | MIT license and systemd-mcpd attribution |
 
 `unitdir` defaults to whatever `pkg-config --variable=systemdsystemunitdir systemd`
 reports, and to `$(prefix)/lib/systemd/system` when pkg-config or the

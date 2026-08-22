@@ -60,10 +60,10 @@ impl OpsConfig {
         let state_dir = state_dir();
         let file = load_file(config_path)?;
         let manager = manager
-            .or_else(|| env_manager())
+            .or_else(env_manager)
             .or(file.manager)
             .unwrap_or(default_manager);
-        let write_prefix = write_prefix.or_else(|| env_prefix()).or(file.write_prefix);
+        let write_prefix = write_prefix.or_else(env_prefix).or(file.write_prefix);
         if let Some(spec) = &write_prefix {
             systemd::parse_write_prefix(spec).map_err(BackendError)?;
         }

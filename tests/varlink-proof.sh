@@ -33,12 +33,12 @@ request() { # request <tool> <args-json> -> one tools/call request line
 }
 
 call_tool() { # call_tool <scopes> <tool> <args-json> -> inner result text
-  request "$2" "$3" | $MCPD --grant "$1" | jq -r '.result.content[0].text'
+  request "$2" "$3" | $MCPD --manager system --grant "$1" | jq -r '.result.content[0].text'
 }
 
 # The same call with systemctl unreachable: only varlink can answer.
 call_tool_no_path() { # call_tool_no_path <scopes> <tool> <args-json> -> raw reply
-  request "$2" "$3" | $MCPD_NO_PATH --grant "$1"
+  request "$2" "$3" | $MCPD_NO_PATH --manager system --grant "$1"
 }
 
 list_units() { call_tool units:read list_units '{}'; }
