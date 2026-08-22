@@ -6,8 +6,10 @@ use serde_json::{json, Value};
 use systemd_ops::config::OpsConfig;
 use systemd_ops::json;
 use systemd_ops::operations;
+use systemd_ops::scope;
 use systemd_ops::systemd::{self, BackendError, LogFilter, Manager, Surface};
 use systemd_ops::token::{self, PlanClass};
+use systemd_ops::tui;
 use systemd_ops::write::{self, Action};
 
 const USAGE: &str = "\
@@ -21,7 +23,7 @@ Global options:
   --json                       machine-readable envelope on stdout
   --manager user|system        systemd manager (config default: user)
   --write-prefix <glob[,..]>   restrict writes; no prefix means writes refused
-  --cwd <path>                 provenance for authoring plans
+  --cwd <path>                 provenance for authoring plans; also scope discovery
   --config <path>              config file (default: $XDG_CONFIG_HOME/systemd-ops/config.toml)
 
 Commands:
@@ -43,6 +45,10 @@ Commands:
   author plan-update --spec JSON | (flat OperationSpec fields)
   author plan-retire --unit STEM
   author apply --plan-token TOKEN
+
+  scope show
+  scope validate
+  tui
 ";
 fn take_flag_value(
     arg: &str,
@@ -94,6 +100,10 @@ fn from_result(json_mode: bool, result: Result<Value, BackendError>) -> ExitCode
 }
 
 fn print_human(data: &Value) {
+    if data.get("owned").is_some() && data.get("watching").is_some() && data.get("id").is_some() {
+        print_scope_human(data);
+        return;
+    }
     match data {
         Value::Array(rows) => {
             println!("{} rows", rows.len());
@@ -102,6 +112,7 @@ fn print_human(data: &Value) {
                     let extra = row
                         .get("title")
                         .and_then(Value::as_str)
+                        .or_else(|| row.get("health").and_then(Value::as_str))
                         .or_else(|| row.get("description").and_then(Value::as_str))
                         .or_else(|| row.get("active").and_then(Value::as_str))
                         .unwrap_or("");
@@ -150,6 +161,96 @@ fn print_human(data: &Value) {
             }
         }
         other => println!("{other}"),
+    }
+}
+
+fn print_scope_human(data: &Value) {
+    let id = data.get("id").and_then(Value::as_str).unwrap_or("?");
+    let health = data.get("health").and_then(Value::as_str).unwrap_or("?");
+    let root = data.get("root").and_then(Value::as_str).unwrap_or("");
+    let owned = data.get("owned").and_then(Value::as_array);
+    let watching = data.get("watching").and_then(Value::as_array);
+    let attention = data.get("attention").and_then(Value::as_array);
+    let n_owned = owned.map(Vec::len).unwrap_or(0);
+    let n_watch = watching.map(Vec::len).unwrap_or(0);
+    let n_att = attention.map(Vec::len).unwrap_or(0);
+    println!(
+        "{}                                      {}",
+        id.to_uppercase(),
+        health.to_uppercase()
+    );
+    if !root.is_empty() {
+        println!("{root}");
+    }
+    println!("{n_owned} owned · {n_watch} watching · {n_att} attention");
+    println!();
+    println!("OWNED");
+    if let Some(rows) = owned {
+        if rows.is_empty() {
+            println!("  (none)");
+        }
+        for row in rows {
+            print_scope_row(row);
+        }
+    }
+    println!();
+    println!("WATCHING");
+    if let Some(rows) = watching {
+        if rows.is_empty() {
+            println!("  (none)");
+        }
+        for row in rows {
+            print_scope_row(row);
+        }
+    }
+    if n_att > 0 {
+        println!();
+        println!("ATTENTION");
+        if let Some(rows) = attention {
+            for row in rows {
+                let op = row.get("operation").and_then(Value::as_str).unwrap_or("?");
+                let rel = row
+                    .get("relationship")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                let reason = row.get("reason").and_then(Value::as_str).unwrap_or("?");
+                println!("  {op}  {rel}  {reason}");
+            }
+        }
+    }
+}
+
+fn print_scope_row(row: &Value) {
+    let mark = match row.get("health").and_then(Value::as_str) {
+        Some("healthy") => "●",
+        Some("failed") => "✖",
+        _ => "?",
+    };
+    let title = row
+        .get("title")
+        .and_then(Value::as_str)
+        .or_else(|| row.get("unit").and_then(Value::as_str))
+        .unwrap_or("?");
+    let health = row.get("health").and_then(Value::as_str).unwrap_or("?");
+    let crit = if row.get("critical").and_then(Value::as_bool) == Some(true) {
+        "  critical"
+    } else {
+        ""
+    };
+    let next = row.get("next");
+    let next_s = match next {
+        Some(Value::Null) | None => String::new(),
+        Some(v) => format!("  next {v}"),
+    };
+    println!("  {mark} {title}  {health}{crit}{next_s}");
+}
+
+fn run_scope(cmd: &str, args: &mut [String], cwd: Option<&str>) -> Result<Value, BackendError> {
+    remaining_flags(args).map_err(BackendError)?;
+    match cmd {
+        "show" => Ok(scope::show(cwd)?.to_json()),
+        "validate" => scope::validate(cwd),
+        other => Err(BackendError(format!("unknown scope command '{other}'"))),
     }
 }
 
@@ -526,6 +627,14 @@ fn main() -> ExitCode {
         );
     }
     let group = rest.remove(0);
+    let cwd_ref = cwd.as_deref();
+    if group == "tui" {
+        remaining_flags(&rest).ok();
+        return match tui::run(cwd_ref) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(json_mode, "error", &e.0),
+        };
+    }
     if rest.is_empty() {
         return fail(
             json_mode,
@@ -534,15 +643,15 @@ fn main() -> ExitCode {
         );
     }
     let cmd = rest.remove(0);
-    let cwd_ref = cwd.as_deref();
     match group.as_str() {
         "inspect" => from_result(json_mode, run_inspect(&cmd, &mut rest)),
         "control" => from_result(json_mode, run_control(&cmd, &mut rest, cwd_ref)),
         "author" => from_result(json_mode, run_author(&cmd, &mut rest, cwd_ref)),
+        "scope" => from_result(json_mode, run_scope(&cmd, &mut rest, cwd_ref)),
         other => fail(
             json_mode,
             "invalid_argument",
-            &format!("unknown command '{other}' (inspect, control, author)"),
+            &format!("unknown command '{other}' (inspect, control, author, scope, tui)"),
         ),
     }
 }

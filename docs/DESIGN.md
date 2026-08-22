@@ -2,8 +2,9 @@
 
 How systemd-ops talks to systemd, how the write path works, and what
 the optional MCP frontend does. The primary interface is the
-`systemd-ops` CLI. MCP is optional. For arguments and reply shapes see
-[TOOLS.md](TOOLS.md); for how any of this is verified see
+`systemd-ops` CLI. MCP is optional. Responsibility scopes and the TUI
+are specified in [SCOPES.md](SCOPES.md). For arguments and reply
+shapes see [TOOLS.md](TOOLS.md); for how any of this is verified see
 [TESTING.md](TESTING.md).
 
 ## Backends

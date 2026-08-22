@@ -6,6 +6,17 @@ is what a downstream package has to care about.
 
 ## unreleased (not published)
 
+Responsibility scopes: nearest `.systemd-ops.toml` walking up from cwd.
+`systemd-ops scope show` / `scope validate` / `tui` consume one derived
+ScopeView (owned, watching, health, attention). TUI is read-only.
+Managed operations expose `editable_spec` reconstructed from unit files;
+`start_now` is omitted (apply intent, not durable). New managed units
+record `origin_scope` / `origin_scope_root` when a manifest is
+discoverable. Cross-scope updates warn; they do not deny. Health is
+lifecycle/schedule only: `healthy`/`failed`/`unknown` per operation,
+`healthy`/`degraded`/`failed`/`unknown` per scope. Never-run is not
+success.
+
 The crate is `systemd-ops`. Direct CLI `systemd-ops` is the default
 frontend. Optional `systemd-ops-mcp` still speaks MCP over stdio.
 Process-local numeric plan ids are gone; plan/apply uses HMAC-sealed
@@ -21,7 +32,6 @@ default manager is user. Live PID-1 suites pass `--manager system`.
 `ExecStart` argv refuses only NUL and newlines; `$` and `%` are quoted
 so they survive systemd expansion. LICENSE is standard MIT; NOTICE
 records the systemd-mcpd ancestry.
-
 
 
 

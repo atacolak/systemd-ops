@@ -5,8 +5,9 @@
 Inspect, control, and author systemd operations. Direct CLI by default;
 optional MCP frontend. Writes exist only through plan/apply.
 
-Written in Rust, with serde and serde_json as its only dependencies: no
-libsystemd linkage, no D-Bus library, no async runtime.
+Written in Rust. Core dependencies are serde, serde_json, and toml. The
+optional TUI adds ratatui. No libsystemd linkage, no D-Bus library, no
+async runtime.
 
 **Rules, enforced in code:**
 
@@ -92,6 +93,39 @@ write-prefix, definition rewrite is not.
 The `omp/` tree is an Oh My Pi adapter that shells `systemd-ops --json`.
 It lives in git; it is not part of the crates.io package.
 
+## Responsibility scopes
+
+A project may drop `.systemd-ops.toml` at its root. That file names the
+operations the project owns and any it watches. The directory containing
+the file is the scope root.
+
+```toml
+[scope]
+id = "speech"
+owned = ["managed-speech-*"]
+
+critical = ["managed-speech-asr", "managed-speech-tts"]
+
+[[watch]]
+operation = "managed-proxy-health"
+```
+
+```
+systemd-ops scope validate
+systemd-ops scope show
+systemd-ops --json scope show
+systemd-ops tui
+```
+
+`scope show --json` and `tui` consume the same derived ScopeView. Agents
+are the first-class author/control interface; the TUI is read-only
+operational awareness. Details: [docs/SCOPES.md](docs/SCOPES.md).
+
+`get_operation` returns `editable_spec` for systemd-ops-managed stems so
+an agent can change one field and plan-update without dropping the rest.
+`start_now` is apply intent, not durable configuration, and is omitted
+from that reconstruction.
+
 ## Installing
 
 ```
@@ -114,6 +148,7 @@ The socket is mode 0600. The package should not enable it.
 
 ## Documentation
 
+- [docs/SCOPES.md](docs/SCOPES.md): responsibility scopes, TUI, health
 - [docs/TOOLS.md](docs/TOOLS.md): MCP tool arguments and reply shapes
 - [docs/DESIGN.md](docs/DESIGN.md): backends, protocol revisions, write path
 - [docs/TESTING.md](docs/TESTING.md): the three test tiers

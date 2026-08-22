@@ -57,9 +57,13 @@ naming the input.
 - **`list_operations`**: optional `pattern` glob over the operation stem
   (`managed-test-*`). Aggregates unit files matching `--write-prefix` into
   one row per stem. A service+timer pair is one operation. Hand-written and
-  MCP-managed units both appear. Missing metadata is null, not invented.
-  Without `--write-prefix`, a pattern is required.
-- **`get_operation`**: required `unit`, a stem or constituent name.
+  systemd-ops-managed units both appear. Missing metadata is null, not invented.
+  Each row includes `health`, `health_basis`, and `editable_spec` (null for
+  project-managed). Without `--write-prefix`, a pattern is required.
+- **`get_operation`**: required `unit`, a stem or constituent name. Same
+  fields as `list_operations` for one stem. `editable_spec` reconstructs
+  durable authoring fields from the unit files; `start_now` is omitted.
+
 - **`unit_log_control`**: required `unit`. Reads through systemd's
   LogControl1 interface over D-Bus, so the service must declare
   `BusName=` and implement the interface. systemd-logind and

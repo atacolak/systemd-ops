@@ -24,6 +24,7 @@ const INSPECT_ACTIONS = [
 	"list_unit_files",
 	"unit_dependencies",
 	"unit_logs",
+	"scope_show",
 ] as const;
 
 const CONTROL_LIFECYCLE = [
@@ -131,11 +132,15 @@ function inspectArgv(action: string, args: Json): string[] {
 			if (typeof args.grep === "string") argv.push("--grep", args.grep);
 			if (typeof args.boot === "number") argv.push("--boot", String(args.boot));
 			break;
+		case "scope_show":
+			argv.push("scope", "show");
+			break;
 		default:
 			throw new Error(`unknown inspect action '${action}'`);
 	}
 	return argv;
 }
+
 function runOps(argv: string[], cwd?: string): Promise<Json> {
 	const { promise, resolve, reject } = Promise.withResolvers<Json>();
 	const child = spawn(opsBin(), ["--json", "--manager", "user", ...(cwd ? ["--cwd", cwd] : []), ...argv], {
@@ -203,8 +208,9 @@ export default function systemdTools(pi: { cwd?: string }) {
 			approval: "read" as const,
 			description:
 				"Read systemd state. Inspect first: list_operations / get_operation for write-prefix stems, " +
-				"then list_units, failed_units, get_unit, list_timers, list_unit_files, unit_dependencies, unit_logs. " +
-				"Never apply, never plan. Do not shell systemctl for these units.",
+				"scope_show for the nearest .systemd-ops.toml, then list_units, failed_units, get_unit, " +
+				"list_timers, list_unit_files, unit_dependencies, unit_logs. Never apply, never plan. " +
+				"Do not shell systemctl for these units.",
 			parameters: {
 				type: "object",
 				required: ["action"],

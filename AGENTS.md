@@ -4,30 +4,33 @@ Working notes for coding agents. Conventions and gotchas that are not
 evident from the source.
 
 ## What this is
-A systemd operations engine with a direct CLI and an optional MCP
-frontend. Line-delimited JSON-RPC 2.0 on stdin/stdout for MCP; JSON
-envelope on stdout for `systemd-ops --json`. No async runtime, no
-libsystemd linkage. Dependencies are serde and serde_json; adding a
-third needs a reason that survives review.
+A systemd operations engine with a direct CLI, a native TUI, and an
+optional MCP frontend. Line-delimited JSON-RPC 2.0 on stdin/stdout for
+MCP; JSON envelope on stdout for `systemd-ops --json`. No async runtime,
+no libsystemd linkage. Core dependencies are serde, serde_json, and
+toml; the TUI adds ratatui. Adding another crate needs a reason that
+survives review.
 
 ## Layout
 
 | File                    | Holds                                                    |
 |-------------------------|----------------------------------------------------------|
 | `src/lib.rs`            | crate root                                               |
-| `src/bin/systemd_ops.rs`    | direct CLI (`inspect`/`control`/`author`)            |
+| `src/bin/systemd_ops.rs`    | direct CLI (`inspect`/`control`/`author`/`scope`/`tui`) |
 | `src/bin/systemd_ops_mcp.rs`| optional MCP frontend                                |
-| `src/mcp.rs`            | protocol, tool registry, scope gating                    |
+| `src/mcp.rs`            | protocol, tool registry, MCP scope gating                |
 | `src/operations.rs`     | OperationSpec, OperationView, authoring plans            |
+| `src/scope.rs`          | `.systemd-ops.toml`, ScopeView, health aggregation       |
+| `src/tui.rs`            | read-only ratatui console over ScopeView                 |
 | `src/sha256.rs`         | spec/file digest and HMAC-SHA256                         |
 | `src/token.rs`          | sealed plan tokens                                       |
 | `src/config.rs`         | local config, write-prefix, HMAC key                     |
 | `src/json.rs`           | `--json` envelope                                        |
-| `src/systemd.rs`        | backend: process invocation, parsers, scope definitions  |
+| `src/systemd.rs`        | backend: process invocation, parsers, write-prefix       |
 | `src/varlink.rs`        | varlink client for PID 1's socket                        |
 | `src/write.rs`          | plan/apply (lifecycle + authoring)                       |
 | `omp/systemd.ts`        | OMP custom tools spawning `systemd-ops --json`           |
-
+| `docs/SCOPES.md`        | responsibility-scope / TUI contract                      |
 
 Actions are pinned by major tag and kept current by
 `.github/dependabot.yml`, not pinned by commit SHA. A SHA pin is

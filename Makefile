@@ -32,7 +32,7 @@ INSTALL    ?= install
 
 BIN     := target/release/systemd-ops
 MCPBIN  := target/release/systemd-ops-mcp
-DOCS    := README.md docs/TOOLS.md docs/DESIGN.md docs/TESTING.md
+DOCS    := README.md docs/TOOLS.md docs/DESIGN.md docs/TESTING.md docs/SCOPES.md
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
 .PHONY: all build check test install uninstall clean

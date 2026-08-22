@@ -17,7 +17,9 @@ cargo fmt --check
 bash tests/docs.sh
 ```
 
-`make check` runs all of them.
+`make check` runs all of them. Scope discovery, `editable_spec`
+round-trip, provenance warnings, and ScopeView aggregation are unit
+tests under `src/scope.rs` and `src/operations.rs`.
 
 `tests/docs.sh` lints the man page: `groff -mandoc -ww -z`, which is
 what Debian runs as `manpage-has-errors-from-man`, and `lexgrog`, which

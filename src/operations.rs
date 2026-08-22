@@ -108,6 +108,8 @@ pub struct NormalizedSpec {
     pub enabled: bool,
     pub start_now: bool,
     pub origin_cwd: Option<String>,
+    pub origin_scope: Option<String>,
+    pub origin_scope_root: Option<String>,
     pub created_at: String,
 }
 
@@ -125,6 +127,8 @@ impl NormalizedSpec {
         let mut v = canonical_spec_json(self);
         if let Value::Object(map) = &mut v {
             map.insert("origin_cwd".into(), json!(self.origin_cwd));
+            map.insert("origin_scope".into(), json!(self.origin_scope));
+            map.insert("origin_scope_root".into(), json!(self.origin_scope_root));
             map.insert("created_at".into(), json!(self.created_at));
         }
         v
@@ -139,7 +143,16 @@ impl NormalizedSpec {
             .get("created_at")
             .and_then(Value::as_str)
             .map(str::to_string);
-        parse_spec(&json!({ "spec": v }), origin, created)
+        let mut spec = parse_spec(&json!({ "spec": v }), origin, created)?;
+        spec.origin_scope = v
+            .get("origin_scope")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        spec.origin_scope_root = v
+            .get("origin_scope_root")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok(spec)
     }
 
     fn has_install(&self) -> bool {
@@ -174,6 +187,8 @@ struct FileMeta {
     purpose: Option<String>,
     tags: Vec<String>,
     origin_cwd: Option<String>,
+    origin_scope: Option<String>,
+    origin_scope_root: Option<String>,
     created_at: Option<String>,
     service_type: Option<String>,
     remain_after_exit: bool,
@@ -185,6 +200,13 @@ struct FileMeta {
     on_unit_active_sec: Option<String>,
     persistent: Option<bool>,
     accuracy_sec: Option<String>,
+    env: BTreeMap<String, String>,
+    path: Vec<String>,
+    environment_files: Vec<String>,
+    after: Vec<String>,
+    wants_network_online: bool,
+    restart: Option<String>,
+    nice: Option<i32>,
 }
 
 pub fn parse_context_cwd(args: &Value) -> Result<Option<String>, BackendError> {
@@ -224,13 +246,22 @@ fn normalize_cwd(s: &str) -> Result<String, BackendError> {
     Ok(s.trim_end_matches('/').to_string())
 }
 
-fn cross_context_warning(origin: Option<&str>, current: Option<&str>) -> Option<String> {
-    match (origin, current) {
-        (Some(o), Some(c)) if o != c => Some(format!(
-            "cross-context: origin_cwd is {o}, current context.cwd is {c}"
-        )),
-        _ => None,
+fn stamp_origin_scope(spec: &mut NormalizedSpec) {
+    let Some(cwd) = spec.origin_cwd.as_deref() else {
+        return;
+    };
+    if let Ok(manifest) = crate::scope::discover(Path::new(cwd)) {
+        spec.origin_scope = Some(manifest.id);
+        spec.origin_scope_root = Some(manifest.root.to_string_lossy().into_owned());
     }
+}
+
+fn context_warning(
+    origin_cwd: Option<&str>,
+    origin_scope: Option<&str>,
+    current: Option<&str>,
+) -> Option<String> {
+    crate::scope::provenance_warning(origin_cwd, origin_scope, current)
 }
 
 fn stem_of(name: &str) -> String {
@@ -680,7 +711,7 @@ pub fn parse_spec(
     .or_else(|| title.clone())
     .unwrap_or_else(|| unit.to_string());
 
-    Ok(NormalizedSpec {
+    let mut spec = NormalizedSpec {
         unit: unit.to_string(),
         kind,
         title,
@@ -701,8 +732,12 @@ pub fn parse_spec(
         enabled,
         start_now,
         origin_cwd,
+        origin_scope: None,
+        origin_scope_root: None,
         created_at: created_at.unwrap_or_else(now_rfc3339),
-    })
+    };
+    stamp_origin_scope(&mut spec);
+    Ok(spec)
 }
 
 fn canonical_spec_json(spec: &NormalizedSpec) -> Value {
@@ -777,6 +812,12 @@ fn header_lines(spec: &NormalizedSpec) -> String {
     }
     if let Some(cwd) = &spec.origin_cwd {
         lines.push(format!("# systemd-ops-origin-cwd: {cwd}"));
+    }
+    if let Some(scope) = &spec.origin_scope {
+        lines.push(format!("# systemd-ops-origin-scope: {scope}"));
+    }
+    if let Some(root) = &spec.origin_scope_root {
+        lines.push(format!("# systemd-ops-origin-scope-root: {root}"));
     }
     lines.push(format!("# systemd-ops-created-at: {}", spec.created_at));
     lines.join("\n")
@@ -911,6 +952,10 @@ fn parse_meta(text: &str) -> FileMeta {
                 .collect();
         } else if let Some(rest) = comment_field(t, "origin-cwd") {
             meta.origin_cwd = Some(rest.to_string());
+        } else if let Some(rest) = comment_field(t, "origin-scope") {
+            meta.origin_scope = Some(rest.to_string());
+        } else if let Some(rest) = comment_field(t, "origin-scope-root") {
+            meta.origin_scope_root = Some(rest.to_string());
         } else if let Some(rest) = comment_field(t, "created-at") {
             meta.created_at = Some(rest.to_string());
         } else if let Some(rest) = t.strip_prefix("Type=") {
@@ -946,9 +991,50 @@ fn parse_meta(text: &str) -> FileMeta {
             || t == "Persistent=0"
         {
             meta.persistent = Some(false);
+        } else if let Some(rest) = t.strip_prefix("Environment=") {
+            parse_environment_assignment(&mut meta, rest.trim());
+        } else if let Some(rest) = t.strip_prefix("EnvironmentFile=") {
+            meta.environment_files.push(rest.trim().to_string());
+        } else if let Some(rest) = t.strip_prefix("After=") {
+            for dep in rest.split_whitespace() {
+                if !meta.after.iter().any(|a| a == dep) {
+                    meta.after.push(dep.to_string());
+                }
+            }
+        } else if t.starts_with("Wants=") && t.contains("network-online.target") {
+            meta.wants_network_online = true;
+        } else if let Some(rest) = t.strip_prefix("Restart=") {
+            meta.restart = Some(rest.trim().to_string());
+        } else if let Some(rest) = t.strip_prefix("Nice=") {
+            if let Ok(n) = rest.trim().parse::<i32>() {
+                meta.nice = Some(n);
+            }
         }
     }
     meta
+}
+
+fn parse_environment_assignment(meta: &mut FileMeta, rest: &str) {
+    let rest = unquote_env_value(rest);
+    if let Some((k, v)) = rest.split_once('=') {
+        if k == "PATH" && meta.path.is_empty() {
+            meta.path = v.split(':').map(|s| s.to_string()).collect();
+        } else {
+            meta.env.insert(k.to_string(), v.to_string());
+        }
+    }
+}
+
+fn unquote_env_value(s: &str) -> String {
+    let t = s.trim();
+    if let Some(inner) = t.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        inner
+            .replace("\\\\", "\\")
+            .replace("\\\"", "\"")
+            .replace("\\$", "$")
+    } else {
+        t.to_string()
+    }
 }
 
 fn read_unit_file(path: &Path) -> Option<(String, FileMeta, String)> {
@@ -1045,6 +1131,36 @@ fn infer_kind(meta: &FileMeta, has_timer: bool) -> Option<&'static str> {
     }
 }
 
+fn unescape_exec_word(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('\\') => {
+                    chars.next();
+                    out.push('\\');
+                }
+                Some('$') => {
+                    chars.next();
+                    out.push('$');
+                }
+                Some('"') => {
+                    chars.next();
+                    out.push('"');
+                }
+                _ => out.push('\\'),
+            }
+        } else if c == '%' && chars.peek() == Some(&'%') {
+            chars.next();
+            out.push('%');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn split_exec(line: &str) -> (Option<String>, Vec<String>) {
     let mut words = Vec::new();
     let mut cur = String::new();
@@ -1066,8 +1182,122 @@ fn split_exec(line: &str) -> (Option<String>, Vec<String>) {
     if words.is_empty() {
         return (None, Vec::new());
     }
-    let path = words.remove(0);
-    (Some(path), words)
+    let path = unescape_exec_word(&words.remove(0));
+    let argv = words.into_iter().map(|w| unescape_exec_word(&w)).collect();
+    (Some(path), argv)
+}
+
+fn enablement_is_on(enablement: &Value) -> bool {
+    matches!(
+        enablement.as_str(),
+        Some("enabled") | Some("enabled-runtime") | Some("static")
+    )
+}
+
+fn editable_spec_json(
+    stem: &str,
+    managed: bool,
+    service_meta: Option<&FileMeta>,
+    timer_meta: Option<&FileMeta>,
+    enablement: &Value,
+    has_timer: bool,
+) -> Value {
+    if !managed {
+        return Value::Null;
+    }
+    let Some(svc) = service_meta else {
+        return Value::Null;
+    };
+    let (exec_path, exec_argv) = svc
+        .exec_start
+        .as_deref()
+        .map(split_exec)
+        .unwrap_or((None, Vec::new()));
+    let mut after = svc.after.clone();
+    if svc.wants_network_online {
+        after.retain(|a| a != "network-online.target");
+    }
+    json!({
+        "unit": stem,
+        "kind": infer_kind(svc, has_timer),
+        "title": svc.title,
+        "purpose": svc.purpose,
+        "tags": svc.tags,
+        "description": svc.description,
+        "exec": { "path": exec_path, "argv": exec_argv },
+        "cwd": svc.working_directory,
+        "env": svc.env,
+        "path": svc.path,
+        "environment_files": svc.environment_files,
+        "after": after,
+        "wants_network_online": svc.wants_network_online,
+        "restart": svc.restart,
+        "nice": svc.nice,
+        "schedule": schedule_view(timer_meta),
+        "enabled": enablement_is_on(enablement),
+    })
+}
+
+pub fn operation_health(view: &Value) -> &'static str {
+    if view.get("missing").and_then(Value::as_bool) == Some(true) {
+        return "unknown";
+    }
+    let kind = view.get("kind").and_then(Value::as_str);
+    let state = view.get("state").and_then(Value::as_str).unwrap_or("");
+    let sub = view.get("sub").and_then(Value::as_str).unwrap_or("");
+    let last_result = view.get("last_result");
+    let never = last_result.map(Value::is_null).unwrap_or(true)
+        && view.get("last").map(Value::is_null).unwrap_or(true);
+    let enabled = enablement_is_on(view.get("enablement").unwrap_or(&Value::Null));
+    match kind {
+        Some("simple") => {
+            if state == "failed" || sub == "failed" {
+                "failed"
+            } else if state == "active" && sub == "running" {
+                "healthy"
+            } else if enabled {
+                "failed"
+            } else {
+                "unknown"
+            }
+        }
+        Some("oneshot") | Some("oneshot-linger") => {
+            if never {
+                "unknown"
+            } else if last_result.and_then(Value::as_str) == Some("success") {
+                "healthy"
+            } else if last_result.map(|v| !v.is_null()).unwrap_or(false) || state == "failed" {
+                "failed"
+            } else {
+                "unknown"
+            }
+        }
+        _ => {
+            if state == "failed" {
+                "failed"
+            } else if state == "active" {
+                "healthy"
+            } else {
+                "unknown"
+            }
+        }
+    }
+}
+
+pub fn health_basis(view: &Value) -> &'static str {
+    match view.get("kind").and_then(Value::as_str) {
+        Some("simple") => "lifecycle",
+        Some("oneshot") | Some("oneshot-linger") => {
+            if view.get("last_result").map(Value::is_null).unwrap_or(true)
+                && view.get("last").map(Value::is_null).unwrap_or(true)
+            {
+                "never-run"
+            } else {
+                "last-result"
+            }
+        }
+        _ => "lifecycle",
+    }
 }
 
 fn never_ran(shown: Option<&Value>, last: &Value) -> bool {
@@ -1202,6 +1432,8 @@ fn operation_view(stem: &str, loaded: &[Value], files: &[Value], timers: &[Value
     let purpose = first.and_then(|m| m.purpose.clone());
     let tags = first.map(|m| m.tags.clone()).unwrap_or_default();
     let origin = first.and_then(|m| m.origin_cwd.clone());
+    let origin_scope = first.and_then(|m| m.origin_scope.clone());
+    let origin_scope_root = first.and_then(|m| m.origin_scope_root.clone());
     let description = service_meta
         .and_then(|m| m.description.clone())
         .or_else(|| title.clone());
@@ -1242,8 +1474,15 @@ fn operation_view(stem: &str, loaded: &[Value], files: &[Value], timers: &[Value
             .cloned()
             .unwrap_or(Value::Null)
     };
-
-    json!({
+    let editable = editable_spec_json(
+        stem,
+        managed,
+        service_meta,
+        timer_meta,
+        &enablement,
+        has_timer,
+    );
+    let mut view = json!({
         "unit": stem,
         "title": title,
         "purpose": purpose,
@@ -1263,10 +1502,17 @@ fn operation_view(stem: &str, loaded: &[Value], files: &[Value], timers: &[Value
         "next": timer_view.as_ref().and_then(|v| v.get("next")).cloned().unwrap_or(Value::Null),
         "last": last,
         "origin_cwd": origin,
+        "origin_scope": origin_scope,
+        "origin_scope_root": origin_scope_root,
         "fragment_paths": fragments,
         "editable_definition": managed,
         "retire_definition": managed,
-    })
+        "editable_spec": editable,
+    });
+    let health = operation_health(&view);
+    view["health"] = json!(health);
+    view["health_basis"] = json!(health_basis(&view));
+    view
 }
 
 fn inventory_globs(pattern: Option<&str>) -> Result<Vec<String>, BackendError> {
@@ -1326,6 +1572,28 @@ pub fn list_operations(pattern: Option<&str>) -> Result<Value, BackendError> {
     Ok(Value::Array(views))
 }
 
+pub fn list_operations_matching(globs: &[String]) -> Result<Vec<Value>, BackendError> {
+    if globs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (files, loaded, timers) = collect_inventory(globs);
+    let mut stems: Vec<String> = files
+        .iter()
+        .filter_map(|f| {
+            let name = f.get("unit_file").and_then(Value::as_str)?;
+            let base = name.rsplit('/').next().unwrap_or(name);
+            Some(stem_of(base))
+        })
+        .collect();
+    stems.sort();
+    stems.dedup();
+    stems.retain(|s| globs.iter().any(|g| crate::scope::glob_matches_stem(g, s)));
+    Ok(stems
+        .iter()
+        .map(|s| operation_view(s, &loaded, &files, &timers))
+        .collect())
+}
+
 pub fn get_operation(name: &str) -> Result<Value, BackendError> {
     systemd::validate_unit_name(&if name.contains('.') {
         name.to_string()
@@ -1339,10 +1607,20 @@ pub fn get_operation(name: &str) -> Result<Value, BackendError> {
             write_prefix_label()
         )));
     }
-    let globs = match systemd::write_prefix() {
-        Some(g) => g,
-        None => vec![format!("{stem}*")],
-    };
+    get_operation_any(&stem)
+}
+
+pub fn get_operation_any(name: &str) -> Result<Value, BackendError> {
+    let stem = stem_of(name);
+    systemd::validate_unit_name(&format!("{stem}.service"))?;
+    let mut globs = vec![
+        format!("{stem}.service"),
+        format!("{stem}.timer"),
+        format!("{stem}*"),
+    ];
+    if let Some(g) = systemd::write_prefix() {
+        globs.extend(g);
+    }
     let (files, loaded, timers) = collect_inventory(&globs);
     let view = operation_view(&stem, &loaded, &files, &timers);
     let empty = view
@@ -1389,6 +1667,8 @@ fn authoring_extra(
         out["enable_unit"] = json!(spec.enable_unit());
         out["start_unit"] = json!(spec.start_unit());
         out["origin_cwd"] = json!(spec.origin_cwd);
+        out["origin_scope"] = json!(spec.origin_scope);
+        out["origin_scope_root"] = json!(spec.origin_scope_root);
     }
     if let Some(w) = warning {
         out["warning"] = json!(w);
@@ -1480,7 +1760,11 @@ pub fn plan_update(args: &Value) -> Result<Value, BackendError> {
         }
         snapshots.push(snap);
     }
-    let warning = cross_context_warning(spec.origin_cwd.as_deref(), cwd.as_deref());
+    let warning = context_warning(
+        spec.origin_cwd.as_deref(),
+        spec.origin_scope.as_deref(),
+        cwd.as_deref(),
+    );
     let extra = authoring_extra(
         AuthoringVerb::Update,
         Some(&spec),
@@ -1514,6 +1798,7 @@ pub fn plan_retire(args: &Value) -> Result<Value, BackendError> {
     ];
     let mut snapshots = Vec::new();
     let mut origin = None;
+    let mut origin_scope = None;
     let mut saw_managed = false;
     for path in &candidates {
         if !path.exists() {
@@ -1532,6 +1817,9 @@ pub fn plan_retire(args: &Value) -> Result<Value, BackendError> {
         if origin.is_none() {
             origin = meta.origin_cwd;
         }
+        if origin_scope.is_none() {
+            origin_scope = meta.origin_scope;
+        }
         snapshots.push(snapshot(path));
     }
     if !saw_managed {
@@ -1539,7 +1827,7 @@ pub fn plan_retire(args: &Value) -> Result<Value, BackendError> {
             "retire refused: no systemd-ops-managed files for '{stem}'"
         )));
     }
-    let warning = cross_context_warning(origin.as_deref(), cwd.as_deref());
+    let warning = context_warning(origin.as_deref(), origin_scope.as_deref(), cwd.as_deref());
     let extra = authoring_extra(AuthoringVerb::Retire, None, &stem, &snapshots, warning);
     write::plan_authoring(
         AuthoringWork {
@@ -1561,7 +1849,11 @@ pub fn apply_authoring(
         require_snapshot_fresh(snap)?;
     }
     systemd::require_write_unit(&format!("{stem}.service"))?;
-    let warning = cross_context_warning(work.origin_cwd.as_deref(), apply_cwd);
+    let warning = context_warning(
+        work.origin_cwd.as_deref(),
+        work.spec.as_ref().and_then(|s| s.origin_scope.as_deref()),
+        apply_cwd,
+    );
 
     match work.verb {
         AuthoringVerb::Create | AuthoringVerb::Update => {
@@ -1873,12 +2165,12 @@ mod tests {
     }
 
     #[test]
-    fn cross_context_is_warning_only() {
-        assert!(cross_context_warning(Some("/a"), Some("/a")).is_none());
-        assert!(cross_context_warning(Some("/a"), Some("/b"))
+    fn context_warning_falls_back_to_cwd() {
+        assert!(context_warning(Some("/a"), None, Some("/a")).is_none());
+        assert!(context_warning(Some("/a"), None, Some("/b"))
             .unwrap()
             .contains("cross-context"));
-        assert!(cross_context_warning(Some("/a"), None).is_none());
+        assert!(context_warning(Some("/a"), None, None).is_none());
     }
 
     #[test]
@@ -1894,6 +2186,241 @@ mod tests {
         let a = parse_spec(&spec_json(), Some("/tmp".into()), Some("t0".into())).unwrap();
         let b = parse_spec(&spec_json(), Some("/other".into()), Some("t1".into())).unwrap();
         assert_eq!(spec_sha(&a), spec_sha(&b));
+        systemd::set_write_prefix(None);
+    }
+
+    fn rich_spec(kind: &str, schedule: Value) -> Value {
+        json!({
+            "spec": {
+                "unit": "managed-test-roundtrip",
+                "kind": kind,
+                "title": "Round trip",
+                "purpose": "prove reconstruction",
+                "tags": ["alpha", "beta"],
+                "description": "Round-trip unit",
+                "exec": { "path": "/bin/true", "argv": ["--flag", "https://example.com/x?a=1&b=2"] },
+                "cwd": "/tmp",
+                "env": { "FOO": "bar" },
+                "path": ["/usr/bin", "/bin"],
+                "environment_files": ["/etc/environment"],
+                "after": ["network-online.target"],
+                "wants_network_online": true,
+                "restart": if kind == "simple" { json!("on-failure") } else { Value::Null },
+                "nice": -5,
+                "schedule": schedule,
+                "enabled": true,
+                "start_now": true
+            }
+        })
+    }
+
+    fn reconstruct_from_render(spec: &NormalizedSpec) -> Value {
+        let service = render_service(spec);
+        let svc_meta = parse_meta(&service);
+        let timer_meta = render_timer(spec).map(|t| parse_meta(&t));
+        let has_timer = timer_meta.is_some();
+        editable_spec_json(
+            &spec.unit,
+            true,
+            Some(&svc_meta),
+            timer_meta.as_ref(),
+            &json!("enabled"),
+            has_timer,
+        )
+    }
+
+    fn assert_round_trip(kind: &str, schedule: Value) {
+        systemd::set_write_prefix(Some("managed-*".into()));
+        let spec = parse_spec(
+            &rich_spec(kind, schedule),
+            Some("/tmp".into()),
+            Some("t0".into()),
+        )
+        .unwrap();
+        let got = reconstruct_from_render(&spec);
+        assert_eq!(got["unit"], json!(spec.unit));
+        assert_eq!(got["kind"], json!(spec.kind.as_str()));
+        assert_eq!(got["title"], json!(spec.title));
+        assert_eq!(got["purpose"], json!(spec.purpose));
+        assert_eq!(got["tags"], json!(spec.tags));
+        assert_eq!(got["description"], json!(spec.description));
+        assert_eq!(got["exec"]["path"], json!(spec.exec_path));
+        assert_eq!(got["exec"]["argv"], json!(spec.exec_argv));
+        assert_eq!(got["cwd"], json!(spec.cwd));
+        assert_eq!(got["env"]["FOO"], json!("bar"));
+        assert_eq!(got["path"], json!(spec.path));
+        assert_eq!(got["environment_files"], json!(spec.environment_files));
+        assert_eq!(got["wants_network_online"], json!(true));
+        assert_eq!(got["nice"], json!(-5));
+        assert_eq!(got["enabled"], json!(true));
+        assert!(got.get("start_now").is_none());
+        if spec.kind == Kind::Simple {
+            assert_eq!(got["restart"], json!("on-failure"));
+        }
+        match &spec.schedule {
+            Some(Schedule::Calendar { on_calendar, .. }) => {
+                assert_eq!(got["schedule"]["type"], json!("calendar"));
+                assert_eq!(got["schedule"]["on_calendar"], json!(on_calendar));
+            }
+            Some(Schedule::Interval {
+                on_boot_sec,
+                on_unit_active_sec,
+                ..
+            }) => {
+                assert_eq!(got["schedule"]["type"], json!("interval"));
+                assert_eq!(got["schedule"]["on_boot_sec"], json!(on_boot_sec));
+                assert_eq!(
+                    got["schedule"]["on_unit_active_sec"],
+                    json!(on_unit_active_sec)
+                );
+            }
+            None => assert!(got["schedule"].is_null()),
+        }
+        systemd::set_write_prefix(None);
+    }
+
+    #[test]
+    fn editable_spec_round_trip_simple() {
+        assert_round_trip("simple", Value::Null);
+    }
+
+    #[test]
+    fn editable_spec_round_trip_oneshot() {
+        assert_round_trip("oneshot", Value::Null);
+    }
+
+    #[test]
+    fn editable_spec_round_trip_oneshot_linger() {
+        assert_round_trip("oneshot-linger", Value::Null);
+    }
+
+    #[test]
+    fn editable_spec_round_trip_calendar() {
+        assert_round_trip(
+            "oneshot",
+            json!({"type":"calendar","on_calendar":"Mon 07:00","persistent":true,"accuracy_sec":"1min"}),
+        );
+    }
+
+    #[test]
+    fn editable_spec_round_trip_interval() {
+        assert_round_trip(
+            "oneshot",
+            json!({"type":"interval","on_boot_sec":"1min","on_unit_active_sec":"15min","persistent":true,"accuracy_sec":"1min"}),
+        );
+    }
+
+    #[test]
+    fn project_managed_editable_spec_is_null() {
+        let got = editable_spec_json(
+            "managed-test-x",
+            false,
+            None,
+            None,
+            &json!("enabled"),
+            false,
+        );
+        assert!(got.is_null());
+    }
+
+    #[test]
+    fn never_run_is_unknown_not_success() {
+        let view = json!({
+            "kind": "oneshot",
+            "activation": "timer",
+            "state": "inactive",
+            "sub": "dead",
+            "last_result": Value::Null,
+            "last": Value::Null,
+        });
+        assert_eq!(operation_health(&view), "unknown");
+        assert_eq!(health_basis(&view), "never-run");
+    }
+
+    #[test]
+    fn successful_scheduled_is_healthy() {
+        let view = json!({
+            "kind": "oneshot",
+            "last_result": "success",
+            "last": "2026-01-01T00:00:00Z",
+            "state": "inactive",
+            "sub": "dead",
+        });
+        assert_eq!(operation_health(&view), "healthy");
+    }
+
+    #[test]
+    fn failed_scheduled_is_failed() {
+        let view = json!({
+            "kind": "oneshot",
+            "last_result": "exit-code",
+            "last": "2026-01-01T00:00:00Z",
+            "state": "failed",
+            "sub": "failed",
+        });
+        assert_eq!(operation_health(&view), "failed");
+    }
+
+    #[test]
+    fn active_simple_is_healthy() {
+        let view = json!({
+            "kind": "simple",
+            "state": "active",
+            "sub": "running",
+        });
+        assert_eq!(operation_health(&view), "healthy");
+        assert_eq!(health_basis(&view), "lifecycle");
+    }
+
+    #[test]
+    fn inactive_enabled_simple_is_failed() {
+        let view = json!({
+            "kind": "simple",
+            "state": "inactive",
+            "sub": "dead",
+            "enablement": "enabled",
+        });
+        assert_eq!(operation_health(&view), "failed");
+    }
+
+    #[test]
+    fn inactive_disabled_simple_is_unknown() {
+        let view = json!({
+            "kind": "simple",
+            "state": "inactive",
+            "sub": "dead",
+            "enablement": "disabled",
+        });
+        assert_eq!(operation_health(&view), "unknown");
+    }
+
+    #[test]
+    fn origin_scope_stamped_from_manifest() {
+        systemd::set_write_prefix(Some("managed-*".into()));
+        let dir = std::env::temp_dir().join(format!("systemd-ops-origin-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join(".systemd-ops.toml"),
+            "[scope]\nid=\"speech\"\nowned=[\"managed-speech-*\"]\n",
+        )
+        .unwrap();
+        let spec = parse_spec(
+            &json!({
+                "spec": {
+                    "unit": "managed-test-origin",
+                    "kind": "oneshot",
+                    "exec": { "path": "/bin/true", "argv": [] }
+                }
+            }),
+            Some(dir.to_string_lossy().into_owned()),
+            Some("t0".into()),
+        )
+        .unwrap();
+        assert_eq!(spec.origin_scope.as_deref(), Some("speech"));
+        let header = header_lines(&spec);
+        assert!(header.contains("# systemd-ops-origin-scope: speech"));
+        assert!(header.contains("# systemd-ops-origin-scope-root:"));
+        let _ = std::fs::remove_dir_all(&dir);
         systemd::set_write_prefix(None);
     }
 }
