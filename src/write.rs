@@ -1,14 +1,10 @@
-//! The write path. Nothing mutates without a plan.
+//! Control and authoring writes. Nothing mutates without a sealed token.
 //!
-//! A change is made in two steps. `plan` reads the unit's current state
-//! and returns it with the predicted state, the rollback action, and a
-//! sealed plan token, executing nothing. `apply` takes the token,
-//! re-reads the state, refuses if it no longer matches what the plan
-//! was made against, executes, and returns a before/after diff.
-//! Tokens are HMAC-sealed, expire, and are not a replay ledger.
-//!
-//! The one mutating process invocation in the program is here, at the
-//! end of `apply`, reachable through no other path.
+//! `plan` / `plan_authoring` mint an HMAC token that records the
+//! observed precondition. `apply` re-reads that precondition, refuses
+//! drift, then calls the single mutating backend (`systemd::apply_verb`
+//! or `operations::apply_authoring`). Tokens are not a process-local
+//! ledger; expiry and HMAC live in `crate::token`.
 
 use serde_json::{json, Value};
 
@@ -31,18 +27,13 @@ pub enum Action {
     LogTarget,
 }
 
-/// Which state dimension an action changes, and therefore which
-/// property the plan records and the apply precondition re-checks:
-/// `ActiveState` for lifecycle actions, `UnitFileState` for enablement,
-/// the LogControl1 value for log tuning.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    UnitState,
-    FileState,
-    LogControl,
+enum Dimension {
+    Active,
+    UnitFile,
+    Log,
 }
 
-/// Accepted values for the log-control actions, checked before argv.
 pub const LOG_LEVELS: &[&str] = &[
     "emerg", "alert", "crit", "err", "warning", "notice", "info", "debug",
 ];
@@ -57,23 +48,22 @@ pub const LOG_TARGETS: &[&str] = &[
 
 impl Action {
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "start" => Some(Action::Start),
-            "stop" => Some(Action::Stop),
-            "restart" => Some(Action::Restart),
-            "reload" => Some(Action::Reload),
-            "enable" => Some(Action::Enable),
-            "disable" => Some(Action::Disable),
-            "reset-failed" => Some(Action::ResetFailed),
-            "mask" => Some(Action::Mask),
-            "unmask" => Some(Action::Unmask),
-            "log-level" => Some(Action::LogLevel),
-            "log-target" => Some(Action::LogTarget),
-            _ => None,
-        }
+        Some(match s {
+            "start" => Action::Start,
+            "stop" => Action::Stop,
+            "restart" => Action::Restart,
+            "reload" => Action::Reload,
+            "enable" => Action::Enable,
+            "disable" => Action::Disable,
+            "reset-failed" => Action::ResetFailed,
+            "mask" => Action::Mask,
+            "unmask" => Action::Unmask,
+            "log-level" => Action::LogLevel,
+            "log-target" => Action::LogTarget,
+            _ => return None,
+        })
     }
 
-    /// The wire name, as accepted by plan_change.
     pub fn name(self) -> &'static str {
         match self {
             Action::LogLevel => "log-level",
@@ -82,7 +72,6 @@ impl Action {
         }
     }
 
-    /// The systemctl verb. The names are systemd's own.
     pub fn verb(self) -> &'static str {
         match self {
             Action::Start => "start",
@@ -99,37 +88,32 @@ impl Action {
         }
     }
 
-    fn kind(self) -> Kind {
+    fn dimension(self) -> Dimension {
         match self {
             Action::Start
             | Action::Stop
             | Action::Restart
             | Action::Reload
-            | Action::ResetFailed => Kind::UnitState,
-            Action::Enable | Action::Disable | Action::Mask | Action::Unmask => Kind::FileState,
-            Action::LogLevel | Action::LogTarget => Kind::LogControl,
+            | Action::ResetFailed => Dimension::Active,
+            Action::Enable | Action::Disable | Action::Mask | Action::Unmask => Dimension::UnitFile,
+            Action::LogLevel | Action::LogTarget => Dimension::Log,
         }
     }
 
-    /// Whether this action takes a value ("debug", "journal", ...).
     pub fn takes_value(self) -> bool {
-        self.kind() == Kind::LogControl
+        matches!(self.dimension(), Dimension::Log)
     }
 
-    /// The action that undoes this one. Restart and reload have no
-    /// inverse; the reply reports null for them. Log-control actions
-    /// invert to themselves with the previously observed value.
     fn inverse(self) -> Option<Action> {
         match self {
             Action::Start => Some(Action::Stop),
             Action::Stop => Some(Action::Start),
-            Action::Restart | Action::Reload | Action::ResetFailed => None,
             Action::Enable => Some(Action::Disable),
             Action::Disable => Some(Action::Enable),
             Action::Mask => Some(Action::Unmask),
             Action::Unmask => Some(Action::Mask),
-            Action::LogLevel => Some(Action::LogLevel),
-            Action::LogTarget => Some(Action::LogTarget),
+            Action::LogLevel | Action::LogTarget => Some(self),
+            Action::Restart | Action::Reload | Action::ResetFailed => None,
         }
     }
 
@@ -144,22 +128,19 @@ impl Action {
         }
     }
 
-    /// The JSON key for this action's state dimension, used in the
-    /// `current`, `predicted`, and `diff` objects.
     pub fn state_key(self) -> &'static str {
         match self {
             Action::LogLevel => "log_level",
             Action::LogTarget => "log_target",
-            other => match other.kind() {
-                Kind::UnitState => "active",
-                Kind::FileState => "unit_file_state",
-                Kind::LogControl => unreachable!("log actions matched above"),
-            },
+            Action::Start
+            | Action::Stop
+            | Action::Restart
+            | Action::Reload
+            | Action::ResetFailed => "active",
+            Action::Enable | Action::Disable | Action::Mask | Action::Unmask => "unit_file_state",
         }
     }
 
-    /// Compact surface hides mask/unmask and log-control. Full surface
-    /// keeps the upstream set plus reset-failed.
     pub fn visible_on_surface(self) -> bool {
         match systemd::surface() {
             systemd::Surface::Full => true,
@@ -222,10 +203,10 @@ pub struct AuthoringWork {
 }
 
 pub fn observe(action: Action, unit: &str) -> Result<(String, String), BackendError> {
-    match action.kind() {
-        Kind::UnitState => systemd::unit_state(unit),
-        Kind::FileState => Ok((systemd::unit_file_state(unit)?, String::new())),
-        Kind::LogControl => Ok((
+    match action.dimension() {
+        Dimension::Active => systemd::unit_state(unit),
+        Dimension::UnitFile => Ok((systemd::unit_file_state(unit)?, String::new())),
+        Dimension::Log => Ok((
             systemd::service_log_get(action.verb(), unit)?,
             String::new(),
         )),
@@ -249,7 +230,7 @@ pub fn plan(action: Action, unit: &str, value: Option<&str>) -> Result<Value, Ba
     let (observed, sub) = observe(action, unit)?;
     let key = action.state_key();
     let mut current = json!({ key: observed });
-    if action.kind() == Kind::UnitState {
+    if action.dimension() == Dimension::Active {
         current["sub"] = json!(sub);
     }
     let predicted = value
@@ -296,13 +277,15 @@ pub fn plan_authoring(work: AuthoringWork, extra: Value) -> Result<Value, Backen
                 .map(str::to_string)
         })
         .unwrap_or_default();
+    let files: Vec<Value> = work
+        .snapshots
+        .iter()
+        .map(|s| json!({ "path": s.path, "sha256": s.sha256 }))
+        .collect();
     let payload = json!({
         "verb": work.verb.as_str(),
         "spec": work.spec.as_ref().map(|s| s.to_json()),
-        "snapshots": work.snapshots.iter().map(|s| json!({
-            "path": s.path,
-            "sha256": s.sha256,
-        })).collect::<Vec<_>>(),
+        "snapshots": files,
         "origin_cwd": work.origin_cwd,
     });
     let (token, sealed) = token::mint(
@@ -319,14 +302,7 @@ pub fn plan_authoring(work: AuthoringWork, extra: Value) -> Result<Value, Backen
     out["action"] = json!(work.verb.as_str());
     out["issued_at"] = json!(config::unix_to_rfc3339(sealed.issued_at));
     out["expires_at"] = json!(config::unix_to_rfc3339(sealed.expires_at));
-    out["files"] = json!(work
-        .snapshots
-        .iter()
-        .map(|s| json!({
-            "path": s.path,
-            "sha256": s.sha256,
-        }))
-        .collect::<Vec<_>>());
+    out["files"] = json!(files);
     out["note"] = json!("nothing has been executed; apply with the plan_token");
     Ok(out)
 }
@@ -339,51 +315,40 @@ pub fn apply_with_context(token: &str, cwd: Option<&str>) -> Result<Value, Backe
     let cfg = config::current_or_load()?;
     let plan = token::parse(&cfg, token)?;
     match plan.class {
-        PlanClass::Control => apply_control(&plan, cwd),
+        PlanClass::Control => apply_control(&plan),
         PlanClass::Author => apply_author(&plan, cwd),
     }
 }
 
-fn apply_control(plan: &token::SealedPlan, _cwd: Option<&str>) -> Result<Value, BackendError> {
-    let action_name = plan
-        .payload
-        .get("action")
+fn payload_str(plan: &token::SealedPlan, key: &str) -> Option<String> {
+    plan.payload
+        .get(key)
         .and_then(Value::as_str)
-        .ok_or_else(|| BackendError("invalid plan token".into()))?;
-    let action = Action::parse(action_name)
-        .ok_or_else(|| BackendError(format!("unknown action '{action_name}'")))?;
+        .map(str::to_string)
+}
+
+fn apply_control(plan: &token::SealedPlan) -> Result<Value, BackendError> {
+    let action_name = payload_str(plan, "action").unwrap_or_default();
+    let action =
+        Action::parse(&action_name).ok_or_else(|| BackendError("invalid plan token".into()))?;
     systemd::require_write_unit(&plan.unit)?;
-    let observed = plan
-        .payload
-        .get("observed")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let sub = plan
-        .payload
-        .get("sub")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let value = plan
-        .payload
-        .get("value")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let (observed_now, _) = observe(action, &plan.unit)?;
-    if observed_now != observed {
+    let observed = payload_str(plan, "observed").unwrap_or_default();
+    let sub = payload_str(plan, "sub").unwrap_or_default();
+    let value = payload_str(plan, "value");
+    let (now, _) = observe(action, &plan.unit)?;
+    if now != observed {
         return Err(BackendError(format!(
-            "plan is stale: '{}' was {observed} at plan time but is {observed_now} now; re-plan",
+            "plan is stale: '{}' was {observed} at plan time but is {now} now; re-plan",
             plan.unit
         )));
     }
     let changes = systemd::apply_verb(action.verb(), &plan.unit, value.as_deref())?;
-    let (observed_after, sub_after) = observe(action, &plan.unit)?;
+    let (after, sub_after) = observe(action, &plan.unit)?;
     let key = action.state_key();
     let mut diff = json!({
-        key: { "before": observed, "after": observed_after },
+        key: { "before": observed, "after": after },
     });
-    if action.kind() == Kind::UnitState {
+    if action.dimension() == Dimension::Active {
         diff["sub"] = json!({ "before": sub, "after": sub_after });
     }
     Ok(json!({
@@ -399,44 +364,44 @@ fn apply_control(plan: &token::SealedPlan, _cwd: Option<&str>) -> Result<Value, 
 
 fn apply_author(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, BackendError> {
     token::require_class(plan, PlanClass::Author)?;
-    let verb = AuthoringVerb::parse(
-        plan.payload
-            .get("verb")
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-    )?;
+    let verb = AuthoringVerb::parse(payload_str(plan, "verb").as_deref().unwrap_or(""))?;
     let snapshots = snapshots_from_json(plan.payload.get("snapshots"))?;
     let spec = match plan.payload.get("spec") {
         Some(Value::Null) | None => None,
         Some(v) => Some(crate::operations::NormalizedSpec::from_json(v)?),
     };
-    let work = AuthoringWork {
-        verb,
-        spec,
-        snapshots,
-        origin_cwd: plan.origin_cwd.clone(),
-    };
-    crate::operations::apply_authoring(&plan.unit, work, cwd)
+    crate::operations::apply_authoring(
+        &plan.unit,
+        AuthoringWork {
+            verb,
+            spec,
+            snapshots,
+            origin_cwd: plan.origin_cwd.clone(),
+        },
+        cwd,
+    )
 }
 
 fn snapshots_from_json(v: Option<&Value>) -> Result<Vec<FileSnapshot>, BackendError> {
     let Some(arr) = v.and_then(Value::as_array) else {
         return Ok(Vec::new());
     };
-    let mut out = Vec::new();
-    for item in arr {
-        let path = item
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| BackendError("invalid plan token".into()))?
-            .to_string();
-        let sha256 = item
-            .get("sha256")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        out.push(FileSnapshot { path, sha256 });
-    }
-    Ok(out)
+    arr.iter()
+        .map(|item| {
+            let path = item
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| BackendError("invalid plan token".into()))?
+                .to_string();
+            Ok(FileSnapshot {
+                path,
+                sha256: item
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -460,7 +425,6 @@ mod tests {
         assert_eq!(Action::Restart.predicted(), Some("active"));
         assert_eq!(Action::Enable.predicted(), Some("enabled"));
         assert_eq!(Action::Mask.predicted(), Some("masked"));
-        // unmask's outcome depends on the unit's install configuration.
         assert_eq!(Action::Unmask.predicted(), None);
         assert_eq!(Action::Start.state_key(), "active");
         assert_eq!(Action::Enable.state_key(), "unit_file_state");
@@ -476,8 +440,6 @@ mod tests {
         assert!(!Action::Start.takes_value());
         assert_eq!(Action::LogLevel.state_key(), "log_level");
         assert_eq!(Action::LogTarget.state_key(), "log_target");
-        // Log-control actions invert to themselves with the previous
-        // value; lifecycle inverses carry no value.
         assert_eq!(
             rollback_json(Action::LogLevel, "info"),
             serde_json::json!({ "action": "log-level", "value": "info" })
