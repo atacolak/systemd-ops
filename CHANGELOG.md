@@ -44,7 +44,7 @@ timer enablement, and never-run as `last_result: null`. CLI and MCP
 default manager is user. Live PID-1 suites pass `--manager system`.
 `ExecStart` argv refuses only NUL and newlines; `$` and `%` are quoted
 so they survive systemd expansion. LICENSE is standard MIT; NOTICE
-records the systemd-mcpd ancestry.
+records that portions originate from systemd-mcpd.
 
 
 

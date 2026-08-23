@@ -1,4 +1,4 @@
-systemd-ops is a derivative of systemd-mcpd
+Portions of systemd-ops originate from systemd-mcpd:
 https://github.com/rhaist/systemd-mcpd
 
 Copyright (c) 2026 Robert Haist and contributors

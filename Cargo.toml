@@ -10,7 +10,7 @@ license = "MIT"
 readme = "README.md"
 keywords = ["systemd", "journald", "sysadmin", "mcp"]
 categories = ["command-line-utilities", "os::linux-apis"]
-authors = ["Robert Haist <rhaist@mailbox.org>", "contributors"]
+authors = ["systemd-ops contributors"]
 # The published crate is the buildable source and its documentation.
 # Live suites, GitHub workflows, and the OMP adapter live in git.
 exclude = ["/tests", "/.github", "/omp"]

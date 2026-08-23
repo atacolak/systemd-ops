@@ -1,7 +1,5 @@
 # systemd-ops
 
-*A derivative of [systemd-mcpd](https://github.com/rhaist/systemd-mcpd).*
-
 Inspect, control, and author systemd operations. Direct CLI by default;
 optional MCP frontend. Writes exist only through plan/apply.
 
@@ -163,4 +161,7 @@ The socket is mode 0600. The package should not enable it.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Ancestry: [NOTICE](NOTICE).
+MIT, see [LICENSE](LICENSE).
+
+Portions of this codebase originate from
+[systemd-mcpd](https://github.com/rhaist/systemd-mcpd). See [NOTICE](NOTICE).
