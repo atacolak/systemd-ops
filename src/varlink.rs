@@ -1,234 +1,232 @@
-//! A minimal varlink client.
+//! PID 1 varlink reads used by the system-manager backend.
 //!
-//! Varlink is NUL-terminated JSON over a Unix socket; `UnixStream` plus
-//! the serde_json already in the tree covers it, so no varlink crate is
-//! used.
+//! systemd ≥ 258 exposes `/run/systemd/io.systemd.Manager`. This module
+//! calls two methods on that socket and nothing else:
 //!
-//! systemd ≥ 258 serves PID 1's API at `/run/systemd/io.systemd.Manager`
-//! (one socket, several interfaces; unit listing is `io.systemd.Unit.List`,
-//! verified against the v261.2 interface definitions in
-//! `src/shared/varlink-io.systemd.Unit.c`). Any failure (no socket,
-//! older systemd, an error reply, an unfamiliar reply shape) is an
-//! `Err`, and the caller falls back to the CLI. The probe is the
-//! `connect()` itself; a failed connect to a missing path is cheap
-//! enough that the result is not cached.
+//! - `io.systemd.Unit.List` (streaming; `more` / `continues`)
+//! - `io.systemd.Manager.Describe` (one reply)
+//!
+//! Wire format is the varlink protocol: one JSON object per message,
+//! terminated by a single NUL byte. See https://varlink.org.
+//! Interface field names come from systemd v261.2
+//! (`varlink-io.systemd.Unit.c`, `varlink-io.systemd.Manager.c`).
+//!
+//! Every failure — missing socket, timeout, protocol error, or a reply
+//! that is not the expected schema — is `Err`. `systemd.rs` then uses
+//! the CLI. Connect is the probe; the result is not cached. The user
+//! manager never comes here (no socket on systemd 255).
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::systemd::BackendError;
 
-const MANAGER_SOCKET: &str = "/run/systemd/io.systemd.Manager";
-const TIMEOUT: Duration = Duration::from_secs(5);
+const PID1: &str = "/run/systemd/io.systemd.Manager";
+const BUDGET: Duration = Duration::from_secs(5);
+const LIST: &str = "io.systemd.Unit.List";
+const DESCRIBE: &str = "io.systemd.Manager.Describe";
 
-/// Units via `io.systemd.Unit.List`, normalized to the exact shape
-/// `systemctl list-units --output=json` emits, so callers cannot tell
-/// the backends apart.
+/// Loaded units as `systemctl list-units --output=json` rows:
+/// `unit`, `load`, `active`, `sub`, `description`.
 pub fn list_units() -> Result<Vec<Value>, BackendError> {
-    call(MANAGER_SOCKET, "io.systemd.Unit.List", true)?
+    exchange(PID1, LIST, true)?
         .iter()
-        .map(normalize_unit)
+        .map(row_from_unit_list)
         .collect()
 }
 
-/// Boot timestamps via `io.systemd.Manager.Describe` (a plain method, no
-/// streaming): the same five monotonic values `systemctl show` serves,
-/// in the [firmware, loader, initrd, userspace, finish] order
-/// `compute_boot_times` expects. Absent or null phases map to 0, matching
-/// the CLI's semantics; a reply without `UserspaceTimestamp` at all is
-/// not the interface we expect and refuses, so the CLI answers.
+/// Monotonic boot timestamps in microseconds, in the order
+/// `compute_boot_times` consumes: firmware, loader, initrd, userspace,
+/// finish. Userspace is required. The other four default to 0 when the
+/// Timestamp object is null or omitted, matching `systemctl show`.
 pub fn boot_timestamps() -> Result<[u64; 5], BackendError> {
-    let replies = call(MANAGER_SOCKET, "io.systemd.Manager.Describe", false)?;
-    extract_boot_timestamps(
-        replies
-            .first()
-            .ok_or_else(|| BackendError("empty varlink Describe reply".into()))?,
-    )
+    let mut replies = exchange(PID1, DESCRIBE, false)?;
+    let payload = replies
+        .pop()
+        .ok_or_else(|| BackendError("Describe returned no parameters".into()))?;
+    boot_from_describe(&payload)
 }
 
-fn extract_boot_timestamps(reply: &Value) -> Result<[u64; 5], BackendError> {
-    let runtime = reply
-        .get("runtime")
-        .ok_or_else(|| BackendError("varlink Describe reply has no runtime".into()))?;
-    let monotonic = |key: &str| {
-        runtime
-            .get(key)
-            .and_then(|t| t.get("monotonic"))
-            .and_then(Value::as_u64)
-    };
-    let userspace = monotonic("UserspaceTimestamp")
-        .ok_or_else(|| BackendError("varlink Describe reply has no UserspaceTimestamp".into()))?;
-    Ok([
-        monotonic("FirmwareTimestamp").unwrap_or(0),
-        monotonic("LoaderTimestamp").unwrap_or(0),
-        monotonic("InitRDTimestamp").unwrap_or(0),
-        userspace,
-        monotonic("FinishTimestamp").unwrap_or(0),
-    ])
-}
+fn exchange(path: &str, method: &str, stream: bool) -> Result<Vec<Value>, BackendError> {
+    let mut sock =
+        UnixStream::connect(path).map_err(|e| BackendError(format!("connect {path}: {e}")))?;
+    let _ = sock.set_read_timeout(Some(BUDGET));
+    let _ = sock.set_write_timeout(Some(BUDGET));
 
-/// One method call. With `more`, expect systemd's List-style streaming
-/// (one message per entry, `continues` on all but the last); without it,
-/// a single reply. Returns each reply's `parameters`, in order.
-fn call(socket_path: &str, method: &str, more: bool) -> Result<Vec<Value>, BackendError> {
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|e| BackendError(format!("connect {socket_path}: {e}")))?;
-    stream.set_read_timeout(Some(TIMEOUT)).ok();
-    stream.set_write_timeout(Some(TIMEOUT)).ok();
-
-    let mut message = json!({ "method": method, "parameters": {} });
-    if more {
-        message["more"] = json!(true);
+    let mut req = Map::new();
+    req.insert("method".into(), json!(method));
+    req.insert("parameters".into(), json!({}));
+    if stream {
+        req.insert("more".into(), json!(true));
     }
-    let mut request = serde_json::to_vec(&message).expect("static request serializes");
-    request.push(0);
-    stream
-        .write_all(&request)
-        .map_err(|e| BackendError(format!("write to {socket_path}: {e}")))?;
+    let mut bytes = serde_json::to_vec(&Value::Object(req))
+        .map_err(|e| BackendError(format!("encode request: {e}")))?;
+    bytes.push(0);
+    sock.write_all(&bytes)
+        .map_err(|e| BackendError(format!("write {path}: {e}")))?;
 
-    let mut reader = BufReader::new(&stream);
-    let mut replies = Vec::new();
-    let mut buf = Vec::new();
+    let mut reader = BufReader::new(sock);
+    let mut frames = Vec::new();
     loop {
-        buf.clear();
+        let mut frame = Vec::new();
         reader
-            .read_until(0, &mut buf)
-            .map_err(|e| BackendError(format!("read from {socket_path}: {e}")))?;
-        if buf.pop() != Some(0) {
-            return Err(BackendError("truncated varlink reply".into()));
+            .read_until(0, &mut frame)
+            .map_err(|e| BackendError(format!("read {path}: {e}")))?;
+        let Some(0) = frame.pop() else {
+            return Err(BackendError("incomplete varlink frame".into()));
+        };
+        let msg: Value = serde_json::from_slice(&frame)
+            .map_err(|e| BackendError(format!("decode varlink frame: {e}")))?;
+        if let Some(err) = msg.get("error").and_then(Value::as_str) {
+            return Err(BackendError(format!("varlink error: {err}")));
         }
-        let mut reply: Value = serde_json::from_slice(&buf)
-            .map_err(|e| BackendError(format!("bad varlink JSON: {e}")))?;
-        if let Some(error) = reply.get("error").and_then(Value::as_str) {
-            return Err(BackendError(format!("varlink error: {error}")));
-        }
-        let continues = reply
+        let cont = msg
             .get("continues")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        // Move the per-unit payload out rather than deep-cloning it;
-        // this path runs once per unit on every list call.
-        replies.push(
-            reply
-                .get_mut("parameters")
-                .map(Value::take)
-                .unwrap_or(json!({})),
-        );
-        if !continues {
-            return Ok(replies);
+        let params = match msg {
+            Value::Object(mut o) => o.remove("parameters").unwrap_or(json!({})),
+            _ => json!({}),
+        };
+        frames.push(params);
+        if !cont {
+            return Ok(frames);
         }
     }
 }
 
-/// `io.systemd.Unit.List` streams one `{context, runtime}` pair per unit,
-/// PascalCase fields; systemctl's JSON speaks short names (`active`). One
-/// shape goes out either way. A missing required field means the interface
-/// isn't what we expect, so refuse and let the CLI answer rather than emit
-/// half a unit.
-fn normalize_unit(entry: &Value) -> Result<Value, BackendError> {
-    let field = |section: &str, key: &str| {
-        entry
-            .get(section)
-            .and_then(|s| s.get(key))
+/// Map one `Unit.List` `parameters` object onto the systemctl JSON row.
+///
+/// IDL (v261.2): output is `{ context: UnitContext, runtime: UnitRuntime }`.
+/// `context.ID` is the unit name. `context.Description` is nullable;
+/// systemd omits it when it would equal the id, and `systemctl
+/// list-units --output=json` then prints the id. We do the same so the
+/// two backends stay indistinguishable. `runtime.{Load,Active,Sub}State`
+/// are nullable in the IDL; a missing required state is treated as the
+/// wrong interface so the CLI answers instead of inventing a row.
+fn row_from_unit_list(params: &Value) -> Result<Value, BackendError> {
+    let context = params
+        .get("context")
+        .and_then(Value::as_object)
+        .ok_or_else(|| BackendError("Unit.List parameters missing context".into()))?;
+    let runtime = params
+        .get("runtime")
+        .and_then(Value::as_object)
+        .ok_or_else(|| BackendError("Unit.List parameters missing runtime".into()))?;
+    let id = context
+        .get("ID")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("Unit.List context missing ID".into()))?;
+    let need = |key: &str| {
+        runtime
+            .get(key)
             .and_then(Value::as_str)
-            .ok_or_else(|| BackendError(format!("varlink unit entry missing '{section}.{key}'")))
+            .ok_or_else(|| BackendError(format!("Unit.List runtime missing {key}")))
     };
-    let id = field("context", "ID")?;
+    let description = context
+        .get("Description")
+        .and_then(Value::as_str)
+        .unwrap_or(id);
     Ok(json!({
         "unit": id,
-        "load": field("runtime", "LoadState")?,
-        "active": field("runtime", "ActiveState")?,
-        "sub": field("runtime", "SubState")?,
-        // systemd omits Description when it equals the unit id, and
-        // systemctl fills the id back in. Falling back to "" instead
-        // made the two backends distinguishable, which is the one
-        // thing this module promises they are not.
-        "description": field("context", "Description").unwrap_or(id),
+        "load": need("LoadState")?,
+        "active": need("ActiveState")?,
+        "sub": need("SubState")?,
+        "description": description,
     }))
+}
+
+fn boot_from_describe(params: &Value) -> Result<[u64; 5], BackendError> {
+    let runtime = params
+        .get("runtime")
+        .ok_or_else(|| BackendError("Describe parameters missing runtime".into()))?;
+    let usec = |name: &str| -> Option<u64> {
+        runtime
+            .get(name)
+            .and_then(|ts| ts.get("monotonic"))
+            .and_then(Value::as_u64)
+    };
+    let userspace = usec("UserspaceTimestamp").ok_or_else(|| {
+        BackendError("Describe runtime missing UserspaceTimestamp.monotonic".into())
+    })?;
+    Ok([
+        usec("FirmwareTimestamp").unwrap_or(0),
+        usec("LoaderTimestamp").unwrap_or(0),
+        usec("InitRDTimestamp").unwrap_or(0),
+        userspace,
+        usec("FinishTimestamp").unwrap_or(0),
+    ])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::thread;
 
-    /// The socket directory, removed when the test that made it ends,
-    /// including when it ends by panicking. Without this every `cargo
-    /// test` left three directories in /tmp forever; 173 of them had
-    /// accumulated before anyone looked.
-    struct TempDir(std::path::PathBuf);
-
-    impl Drop for TempDir {
+    struct Dir(PathBuf);
+    impl Drop for Dir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
-    /// A one-shot fake varlink server: accepts one connection, reads the
-    /// request, plays back canned replies. Lives in /tmp because AF_UNIX
-    /// paths are capped at ~108 bytes.
-    fn serve(
-        replies: &'static [&'static str],
-    ) -> (std::path::PathBuf, std::thread::JoinHandle<Value>, TempDir) {
-        // A counter, not the address of `replies`: `{:p}` on a slice
-        // reference formats the whole fat pointer, which put
-        // `Pointer { addr: 0x..., metadata: 1 }`, spaces and braces
-        // included, into the path.
-        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("mcpd-vl-{}-{n}", std::process::id()));
+    fn playback(frames: &'static [&'static str]) -> (PathBuf, thread::JoinHandle<Value>, Dir) {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sops-vl-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let guard = TempDir(dir.clone());
-        let path = dir.join("sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        let handle = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(&stream);
+        let guard = Dir(dir.clone());
+        let sock = dir.join("s");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let join = thread::spawn(move || {
+            let (peer, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(&peer);
             let mut buf = Vec::new();
-            reader.read_until(0, &mut buf).unwrap();
+            r.read_until(0, &mut buf).unwrap();
             buf.pop();
-            let request: Value = serde_json::from_slice(&buf).unwrap();
-            for reply in replies {
-                (&stream).write_all(reply.as_bytes()).unwrap();
-                (&stream).write_all(&[0]).unwrap();
+            let seen: Value = serde_json::from_slice(&buf).unwrap();
+            for frame in frames {
+                (&peer).write_all(frame.as_bytes()).unwrap();
+                (&peer).write_all(&[0]).unwrap();
             }
-            request
+            seen
         });
-        (path, handle, guard)
+        (sock, join, guard)
     }
 
     #[test]
-    fn streams_until_continues_stops() {
-        let (path, server, _dir) = serve(&[
+    fn list_sets_more_and_drains_until_final_frame() {
+        let (path, join, _dir) = playback(&[
             r#"{"parameters":{"context":{"ID":"a.service"}},"continues":true}"#,
             r#"{"parameters":{"context":{"ID":"b.service"}}}"#,
         ]);
-        let replies = call(path.to_str().unwrap(), "io.systemd.Unit.List", true).unwrap();
-        assert_eq!(replies.len(), 2);
-        assert_eq!(replies[1]["context"]["ID"], json!("b.service"));
-        // The request asked for streaming, as systemd's List methods require.
-        let request = server.join().unwrap();
-        assert_eq!(request["more"], json!(true));
-        assert_eq!(request["method"], json!("io.systemd.Unit.List"));
+        let out = exchange(path.to_str().unwrap(), LIST, true).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1]["context"]["ID"], json!("b.service"));
+        let req = join.join().unwrap();
+        assert_eq!(req["method"], json!(LIST));
+        assert_eq!(req["more"], json!(true));
     }
 
     #[test]
-    fn plain_methods_omit_more() {
-        let (path, server, _dir) = serve(&[r#"{"parameters":{"runtime":{}}}"#]);
-        let replies = call(path.to_str().unwrap(), "io.systemd.Manager.Describe", false).unwrap();
-        assert_eq!(replies.len(), 1);
-        // Describe is a plain method: the request must not ask to stream.
-        let request = server.join().unwrap();
-        assert!(request.get("more").is_none());
+    fn describe_does_not_set_more() {
+        let (path, join, _dir) = playback(&[r#"{"parameters":{"runtime":{}}}"#]);
+        let out = exchange(path.to_str().unwrap(), DESCRIBE, false).unwrap();
+        assert_eq!(out.len(), 1);
+        let req = join.join().unwrap();
+        assert!(req.get("more").is_none());
+        assert_eq!(req["method"], json!(DESCRIBE));
     }
 
     #[test]
-    fn boot_timestamp_extraction() {
-        // Shape per v261.2: runtime carries dual-clock Timestamp objects.
-        let reply = json!({
+    fn describe_reads_monotonic_usec_and_null_phases() {
+        let payload = json!({
             "context": {},
             "runtime": {
                 "FirmwareTimestamp": { "realtime": 1, "monotonic": 5_000_000 },
@@ -239,49 +237,44 @@ mod tests {
             }
         });
         assert_eq!(
-            extract_boot_timestamps(&reply).unwrap(),
+            boot_from_describe(&payload).unwrap(),
             [5_000_000, 2_000_000, 0, 4_000_000, 10_000_000]
         );
-        // No UserspaceTimestamp at all → not our interface → refuse.
-        assert!(extract_boot_timestamps(&json!({ "runtime": {} })).is_err());
+        assert!(boot_from_describe(&json!({ "runtime": {} })).is_err());
     }
 
     #[test]
-    fn error_replies_and_dead_sockets_are_errors() {
-        let (path, _server, _dir) = serve(&[r#"{"error":"org.varlink.service.MethodNotFound"}"#]);
-        let err = call(path.to_str().unwrap(), "io.systemd.Unit.List", true).unwrap_err();
-        assert!(err.0.contains("MethodNotFound"), "got: {err}");
-        // No socket at all, the everyday case on systemd < 258.
-        assert!(call("/no/such/socket", "x", true).is_err());
+    fn method_errors_and_absent_socket_fail() {
+        let (path, _join, _dir) = playback(&[r#"{"error":"org.varlink.service.MethodNotFound"}"#]);
+        let err = exchange(path.to_str().unwrap(), LIST, true).unwrap_err();
+        assert!(err.0.contains("MethodNotFound"), "got {err}");
+        assert!(exchange("/no/such/socket", LIST, true).is_err());
     }
 
     #[test]
-    fn normalization_is_strict() {
-        // Reply shape per v261.2 varlink-io.systemd.Unit.c: one
-        // {context, runtime} pair per unit, PascalCase fields.
+    fn unit_row_matches_systemctl_json_keys() {
         let full = json!({
             "context": { "ID": "ssh.service", "Description": "OpenBSD Secure Shell server" },
             "runtime": { "LoadState": "loaded", "ActiveState": "active", "SubState": "running" }
         });
         assert_eq!(
-            normalize_unit(&full).unwrap(),
+            row_from_unit_list(&full).unwrap(),
             json!({
-                "unit": "ssh.service", "load": "loaded", "active": "active",
-                "sub": "running", "description": "OpenBSD Secure Shell server"
+                "unit": "ssh.service",
+                "load": "loaded",
+                "active": "active",
+                "sub": "running",
+                "description": "OpenBSD Secure Shell server"
             })
         );
-        // Description is nullable in the IDL; absent maps to "".
         let no_desc = json!({
             "context": { "ID": "x.service" },
             "runtime": { "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead" }
         });
-        // Absent Description means "same as the id", which is what
-        // systemctl reports and therefore what this must report.
         assert_eq!(
-            normalize_unit(&no_desc).unwrap()["description"],
+            row_from_unit_list(&no_desc).unwrap()["description"],
             json!("x.service")
         );
-        // Unfamiliar shape → refuse, so the caller falls back to the CLI.
-        assert!(normalize_unit(&json!({ "context": { "ID": "x.service" } })).is_err());
+        assert!(row_from_unit_list(&json!({ "context": { "ID": "x.service" } })).is_err());
     }
 }
