@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use systemd_ops::config::OpsConfig;
 use systemd_ops::json;
 use systemd_ops::operations;
+use systemd_ops::operator;
 use systemd_ops::scope;
 use systemd_ops::systemd::{self, BackendError, LogFilter, Manager, Surface};
 use systemd_ops::token::{self, PlanClass};
@@ -48,6 +49,12 @@ Commands:
 
   scope show
   scope validate
+
+  operator show --unit STEM
+  operator set --unit STEM [--about TEXT] [--headline TEXT] [--body TEXT]
+  operator append --unit STEM --text TEXT
+  operator clear --unit STEM
+
   tui
 ";
 fn take_flag_value(
@@ -213,8 +220,9 @@ fn print_scope_human(data: &Value) {
                     .get("relationship")
                     .and_then(Value::as_str)
                     .unwrap_or("?");
+                let code = row.get("code").and_then(Value::as_str).unwrap_or("?");
                 let reason = row.get("reason").and_then(Value::as_str).unwrap_or("?");
-                println!("  {op}  {rel}  {reason}");
+                println!("  {op}  {rel}  {code}  {reason}");
             }
         }
     }
@@ -530,6 +538,40 @@ fn run_author(cmd: &str, args: &mut Vec<String>, cwd: Option<&str>) -> Result<Va
     }
 }
 
+fn run_operator(
+    cmd: &str,
+    args: &mut Vec<String>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    match cmd {
+        "show" => {
+            let unit = require_opt(args, "--unit").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            operator::show(cwd, &unit)
+        }
+        "set" => {
+            let unit = require_opt(args, "--unit").map_err(BackendError)?;
+            let about = take_opt(args, "--about").map_err(BackendError)?;
+            let headline = take_opt(args, "--headline").map_err(BackendError)?;
+            let body = take_opt(args, "--body").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            operator::set(cwd, &unit, about, headline, body)
+        }
+        "append" => {
+            let unit = require_opt(args, "--unit").map_err(BackendError)?;
+            let text = require_opt(args, "--text").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            operator::append(cwd, &unit, &text)
+        }
+        "clear" => {
+            let unit = require_opt(args, "--unit").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            operator::clear(cwd, &unit)
+        }
+        other => Err(BackendError(format!("unknown operator command '{other}'"))),
+    }
+}
+
 fn main() -> ExitCode {
     let mut json_mode = false;
     let mut manager = None;
@@ -661,10 +703,11 @@ fn main() -> ExitCode {
         "control" => from_result(json_mode, run_control(&cmd, &mut rest, cwd_ref)),
         "author" => from_result(json_mode, run_author(&cmd, &mut rest, cwd_ref)),
         "scope" => from_result(json_mode, run_scope(&cmd, &mut rest, cwd_ref)),
+        "operator" => from_result(json_mode, run_operator(&cmd, &mut rest, cwd_ref)),
         other => fail(
             json_mode,
             "invalid_argument",
-            &format!("unknown command '{other}' (inspect, control, author, scope, tui)"),
+            &format!("unknown command '{other}' (inspect, control, author, scope, operator, tui)"),
         ),
     }
 }

@@ -12,10 +12,13 @@ async runtime.
 1. **Writes need an explicit prefix.** No `--write-prefix` (and no
    config/env prefix) means reads still work and writes are refused.
    There is no implied operator namespace.
-2. **All writes go through plan/apply.** Nothing mutates directly. A
-   change is planned first, then applied with a sealed `plan_token`.
-   Apply is refused if the token is stale, expired, tampered, the
-   wrong class (control vs author), or bound to the other manager.
+2. **All systemd mutations go through plan/apply.** Lifecycle,
+   enablement, and definition authoring are planned first, then applied
+   with a sealed `plan_token`. Apply is refused if the token is stale,
+   expired, tampered, the wrong class (control vs author), or bound to
+   the other manager. Operator commentary under
+   `.systemd-ops/operator/` is advisory soft state: it is written
+   directly by `systemd-ops operator ...` and never touches unit files.
 3. **The MCP frontend grants nothing by default.** `systemd-ops-mcp`
    refuses to start without `--grant`. Tools outside the granted scopes
    are not advertised and are refused.
@@ -116,12 +119,31 @@ systemd-ops tui
 ```
 
 `scope show --json` and `tui` consume the same derived ScopeView. Agents
-are the first-class author/control interface; the TUI is read-only
-operational awareness. The TUI list uses relative times, unwraps journal
-entries, and hides empty WATCHING. Keys: `j`/`k` `/` `r` `d` `l` `q`.
-Authoring without `--cwd` uses the process working directory for
-provenance and scope discovery. Details:
+are the first-class author/control/operator interface; the TUI is a
+read-only operator cockpit. Default mode joins objective OperationView
+facts with optional `.systemd-ops/operator/<stem>.json` commentary.
+`d` is wiring, `l` is diagnostics (raw journal, lazy). Keys: `j`/`k`
+`/` `r` `d` `l` `q` / Esc. Authoring without `--cwd` uses the process
+working directory for provenance and scope discovery. Details:
 [docs/SCOPES.md](docs/SCOPES.md).
+
+### Operator commentary
+
+```
+systemd-ops --json --cwd ~/worlds/personal operator set \
+  --unit managed-personal-youtube-poll \
+  --about "Polls YouTube for new uploads and queues summaries." \
+  --headline "waiting for next poll" \
+  --body "Last poll succeeded; next timer is armed."
+systemd-ops --json --cwd ~/worlds/personal operator append \
+  --unit managed-personal-youtube-poll \
+  --text "manual reconsolidation after schedule tweak"
+systemd-ops --json --cwd ~/worlds/personal operator show \
+  --unit managed-personal-youtube-poll
+```
+
+Only stems matching the current scope `owned` globs may be written.
+Deleting `.systemd-ops/operator/` has no effect on systemd operations.
 
 `get_operation` returns `editable_spec` for systemd-ops-managed stems so
 an agent can change one field and plan-update without dropping the rest.

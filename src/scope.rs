@@ -64,6 +64,7 @@ impl ScopeHealth {
 pub struct Attention {
     pub operation: String,
     pub relationship: &'static str,
+    pub code: &'static str,
     pub reason: String,
 }
 
@@ -75,6 +76,7 @@ pub struct ScopeView {
     pub owned: Vec<Value>,
     pub watching: Vec<Value>,
     pub attention: Vec<Attention>,
+    pub warnings: Vec<String>,
 }
 
 impl ScopeView {
@@ -88,8 +90,10 @@ impl ScopeView {
             "attention": self.attention.iter().map(|a| json!({
                 "operation": a.operation,
                 "relationship": a.relationship,
+                "code": a.code,
                 "reason": a.reason,
             })).collect::<Vec<_>>(),
+            "warnings": self.warnings,
         })
     }
 }
@@ -266,6 +270,7 @@ pub fn aggregate(
 ) -> ScopeView {
     let mut health = ScopeHealth::Healthy;
     let mut attention = Vec::new();
+    let mut warnings = Vec::new();
     let mut owned = Vec::new();
     for mut view in owned_ops {
         let unit = view
@@ -278,12 +283,27 @@ pub fn aggregate(
         view["health"] = json!(op_health);
         view["relationship"] = json!("owned");
         view["critical"] = json!(critical);
+        if view.get("definition_revision").is_none() {
+            view["definition_revision"] = Value::Null;
+        }
+        let def_rev = view
+            .get("definition_revision")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let (operator, operator_state, warn) =
+            crate::operator::join_for_scope(&manifest.root, &unit, def_rev.as_deref());
+        view["operator"] = operator;
+        view["operator_state"] = json!(operator_state.as_str());
+        if let Some(w) = warn {
+            warnings.push(w);
+        }
         match op_health {
             "failed" if critical => {
                 health = health.raise(ScopeHealth::Failed);
                 attention.push(Attention {
                     operation: unit,
                     relationship: "owned",
+                    code: "operation_failed",
                     reason: "failed".into(),
                 });
             }
@@ -292,6 +312,7 @@ pub fn aggregate(
                 attention.push(Attention {
                     operation: unit,
                     relationship: "owned",
+                    code: "operation_failed",
                     reason: "failed".into(),
                 });
             }
@@ -300,6 +321,7 @@ pub fn aggregate(
                 attention.push(Attention {
                     operation: unit,
                     relationship: "owned",
+                    code: "operation_unknown",
                     reason: "unknown".into(),
                 });
             }
@@ -318,11 +340,17 @@ pub fn aggregate(
         view["health"] = json!(op_health);
         view["relationship"] = json!("watching");
         view["critical"] = json!(false);
+        if view.get("definition_revision").is_none() {
+            view["definition_revision"] = Value::Null;
+        }
+        view["operator"] = Value::Null;
+        view["operator_state"] = Value::Null;
         if op_health == "failed" {
             health = health.raise(ScopeHealth::Degraded);
             attention.push(Attention {
                 operation: unit.clone(),
                 relationship: "watching",
+                code: "operation_failed",
                 reason: "failed".into(),
             });
         }
@@ -338,6 +366,7 @@ pub fn aggregate(
         owned,
         watching,
         attention,
+        warnings,
     }
 }
 
@@ -355,6 +384,7 @@ fn missing_view(stem: &str) -> Value {
         "last": Value::Null,
         "next": Value::Null,
         "editable_spec": Value::Null,
+        "definition_revision": Value::Null,
         "missing": true,
     })
 }
@@ -613,6 +643,7 @@ operation = "managed-proxy-health"
         assert_eq!(view.health, ScopeHealth::Failed);
         assert_eq!(view.attention[0].relationship, "owned");
         assert_eq!(view.attention[0].reason, "failed");
+        assert_eq!(view.attention[0].code, "operation_failed");
     }
 
     #[test]
@@ -654,6 +685,7 @@ operation = "managed-proxy-health"
         assert_eq!(view.health, ScopeHealth::Degraded);
         assert_eq!(view.attention[0].relationship, "watching");
         assert_eq!(view.attention[0].operation, "managed-proxy-health");
+        assert_eq!(view.attention[0].code, "operation_failed");
     }
 
     #[test]
@@ -668,6 +700,7 @@ operation = "managed-proxy-health"
         );
         assert_eq!(view.health, ScopeHealth::Unknown);
         assert_eq!(view.attention[0].reason, "unknown");
+        assert_eq!(view.attention[0].code, "operation_unknown");
     }
 
     #[test]

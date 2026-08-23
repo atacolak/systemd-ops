@@ -25,6 +25,7 @@ const INSPECT_ACTIONS = [
 	"unit_dependencies",
 	"unit_logs",
 	"scope_show",
+	"operator_show",
 ] as const;
 
 const CONTROL_LIFECYCLE = [
@@ -135,10 +136,32 @@ export function inspectArgv(action: string, args: Json): string[] {
 		case "scope_show":
 			argv.push("scope", "show");
 			break;
+		case "operator_show":
+			argv.push("operator", "show", "--unit", String(args.unit ?? ""));
+			break;
 		default:
 			throw new Error(`unknown inspect action '${action}'`);
 	}
 	return argv;
+}
+
+export function operatorArgv(action: string, args: Json): string[] {
+	const unit = String(args.unit ?? "");
+	switch (action) {
+		case "set": {
+			const argv = ["operator", "set", "--unit", unit];
+			if (typeof args.about === "string") argv.push("--about", args.about);
+			if (typeof args.headline === "string") argv.push("--headline", args.headline);
+			if (typeof args.body === "string") argv.push("--body", args.body);
+			return argv;
+		}
+		case "append":
+			return ["operator", "append", "--unit", unit, "--text", String(args.text ?? "")];
+		case "clear":
+			return ["operator", "clear", "--unit", unit];
+		default:
+			throw new Error(`unknown operator action '${action}'`);
+	}
 }
 
 export function opsCliArgv(argv: string[], cwd?: string): string[] {
@@ -212,7 +235,8 @@ export default function systemdTools(pi: { cwd?: string }) {
 			approval: "read" as const,
 			description:
 				"Read systemd state. Inspect first: list_operations / get_operation for write-prefix stems, " +
-				"scope_show for the nearest .systemd-ops.toml, then list_units, failed_units, get_unit, " +
+				"scope_show for the nearest .systemd-ops.toml (includes owned operator briefs), " +
+				"operator_show for one owned stem's advisory commentary, then list_units, failed_units, get_unit, " +
 				"list_timers, list_unit_files, unit_dependencies, unit_logs. Never apply, never plan. " +
 				"Do not shell systemctl for these units.",
 			parameters: {
@@ -407,6 +431,66 @@ export default function systemdTools(pi: { cwd?: string }) {
 						"systemd_author action is plan_create, plan_update, plan_retire, or apply.",
 						{ isError: true },
 					);
+				} catch (e) {
+					return textResult(e instanceof Error ? e.message : String(e), { isError: true });
+				}
+			},
+		},
+		{
+			name: "systemd_operator",
+			label: "systemd operator",
+			approval: "write" as const,
+			description:
+				"Maintain human-facing operator commentary for an operation owned by the current " +
+				"responsibility scope. `set` reconsolidates what the operation is doing/means now; " +
+				"`append` records a meaningful workflow milestone. Do not copy stdout, journal lines, " +
+				"or every tool call. This mutates project-local advisory state under " +
+				".systemd-ops/operator/, not systemd unit files.",
+			parameters: {
+				type: "object",
+				required: ["action", "unit"],
+				properties: {
+					action: {
+						type: "string",
+						enum: ["set", "append", "clear"],
+						description: "set brief fields, append an activity line, or clear the note",
+					},
+					unit: {
+						type: "string",
+						description: "Owned operation stem, e.g. managed-personal-youtube-poll",
+					},
+					about: { type: "string", description: "set: stable what/why text" },
+					headline: { type: "string", description: "set: short current headline" },
+					body: { type: "string", description: "set: current reconsolidated understanding" },
+					text: { type: "string", description: "append: one semantic activity line" },
+				},
+			},
+			async execute(_id: string, params: Json, _onUpdate: unknown, ctx: SessionLike) {
+				const action = String(params?.action ?? "");
+				const unit = params.unit;
+				if (typeof unit !== "string" || unit.length === 0) {
+					return textResult("systemd_operator requires unit (owned stem).", { isError: true });
+				}
+				if (action === "set") {
+					const hasField =
+						typeof params.about === "string" ||
+						typeof params.headline === "string" ||
+						typeof params.body === "string";
+					if (!hasField) {
+						return textResult("set requires at least one of about, headline, body.", {
+							isError: true,
+						});
+					}
+				} else if (action === "append") {
+					if (typeof params.text !== "string" || params.text.length === 0) {
+						return textResult("append requires text.", { isError: true });
+					}
+				} else if (action !== "clear") {
+					return textResult("systemd_operator action is set, append, or clear.", { isError: true });
+				}
+				const cwd = sessionCwd(ctx, factoryCwd);
+				try {
+					return envelopeResult(await runOps(operatorArgv(action, params), cwd));
 				} catch (e) {
 					return textResult(e instanceof Error ? e.message : String(e), { isError: true });
 				}

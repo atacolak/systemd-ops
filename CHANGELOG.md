@@ -6,6 +6,17 @@ is what a downstream package has to care about.
 
 ## unreleased (not published)
 
+Operator cockpit substrate: project-local advisory soft state under
+`.systemd-ops/operator/<stem>.json` with `operator show|set|append|clear`.
+Owned ScopeView entries gain `definition_revision`, `operator`, and
+`operator_state` (`missing|unbased|current|outdated|error`). Attention
+items gain stable `code` (`operation_failed` / `operation_unknown`).
+ScopeView may carry non-fatal `warnings`. TUI default mode is the
+operator cockpit; `d` is wiring, `l` is diagnostics and no longer loads
+journald on open/selection. OMP adapter adds write-tier
+`systemd_operator` and inspect `operator_show`. Operator writes are
+direct soft state and do not use plan/apply; systemd mutations still do.
+
 TUI: unwrap `unit_logs` entries instead of dumping the JSON envelope;
 ops list on top, detail underneath, logs at the bottom quarter; NEXT
 is a live `4m 12s` countdown redrawn every frame; hide empty WATCHING;

@@ -145,8 +145,21 @@ ScopeView
   health: healthy | degraded | failed | unknown
   owned[]     operation views + critical flag
   watching[]  operation views
-  attention[] { operation, relationship, reason }
+  attention[] { operation, relationship, code, reason }
+  warnings[]  soft/non-fatal notes (e.g. malformed operator state)
 ```
+
+Owned operation entries also carry:
+
+```
+  definition_revision   sha256 over ordered definition fragment files, or null
+  operator              advisory brief JSON, or null
+  operator_state        missing|unbased|current|outdated|error
+                        (null on watching entries)
+```
+
+`operator_state` is advisory only. It never affects operation or scope
+health. Watching entries never read another scope's operator files.
 
 Aggregation:
 
@@ -170,25 +183,47 @@ not store subscriber lists. No notification behavior in this slice.
 `systemd-ops tui` discovers the nearest manifest. No manifest: error,
 not an all-systemd dashboard.
 
-v1 is read-only: navigate, select, filter, refresh, inspect details,
-inspect logs. No start/stop/restart/enable/disable, no create/edit/
-retire, no OperationSpec forms, no plan dialogs.
+Modes:
 
-The console is built for a herdr split, not a 200-column monitor:
+| key | mode | content |
+|---|---|---|
+| (default) | COCKPIT | about/purpose, NOW brief, activity, objective RUNTIME |
+| `d` | WIRING | unit/management/exec/paths/definition_revision |
+| `l` | DIAGNOSTICS | raw journal for the selected service (lazy fetch) |
 
-- one-line header: scope id, health, op count, failing count
-- ops list on top (health glyph, title, countdown). Failed ops sort
-  first. Empty WATCHING is omitted
-- detail under the list: purpose, a bright NEXT countdown (`4m 12s`,
-  ticking every frame), last, exec, state. `d` expands provenance
-- logs take the bottom quarter. Hide below 24 rows until `l`
-- log lines use local clock time. Tracebacks and failure lines are red
-- systemd state refreshes every 3s; the countdown redraws every 250ms
+Esc / the same key returns to cockpit. Opening the TUI or moving the
+selection does **not** fetch journald.
 
-Keys: `q` quit, `j`/`k` move, `/` filter, `r` refresh, `d` details,
-`l` logs, Enter reload logs.
+Header: `SCOPE_ID   HEALTH` then `N owned · M watching · K attention`.
 
-Human mutation via the TUI is deliberately undecided and not built.
+## Operator soft state
+
+Per owned stem:
+
+```
+<scope-root>/.systemd-ops/operator/<stem>.json
+```
+
+Schema v1 fields: `version`, `about`, `headline`, `body`, `updated_at`,
+`basis_revision`, `activity[{at,text}]`. Bounds: about 2000, headline
+256, body 8000, activity text 1000, latest 100 activity entries.
+
+CLI:
+
+```
+systemd-ops operator show --unit STEM
+systemd-ops operator set --unit STEM [--about TEXT] [--headline TEXT] [--body TEXT]
+systemd-ops operator append --unit STEM --text TEXT
+systemd-ops operator clear --unit STEM
+```
+
+`set` stamps `updated_at` and `basis_revision = definition_revision`.
+`append` preserves those brief stamps. Direct soft writes are intentional;
+they are not systemd mutations and do not use plan/apply.
+
+Deleting `.systemd-ops/operator/` leaves automations operationally
+unchanged.
+
 
 ## Deferred
 

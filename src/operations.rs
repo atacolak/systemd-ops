@@ -1527,6 +1527,7 @@ fn operation_view(stem: &str, loaded: &[Value], files: &[Value], timers: &[Value
         "editable_definition": managed,
         "retire_definition": managed,
         "editable_spec": editable,
+        "definition_revision": crate::operator::definition_revision_from_paths(&fragments),
     });
     let health = operation_health(&view);
     view["health"] = json!(health);

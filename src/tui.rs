@@ -1,7 +1,8 @@
 //! Read-only operational console for one responsibility scope.
 //!
 //! Consumes [`crate::scope::show`]. Does not shell the CLI. Does not
-//! mutate systemd.
+//! mutate systemd. Default mode is the operator cockpit; wiring and
+//! diagnostics are explicit modes.
 
 use std::io::{self, stdout};
 use std::process::Command;
@@ -26,7 +27,7 @@ use crate::scope::{self, ScopeView};
 use crate::systemd::{self, BackendError, LogFilter};
 
 const REFRESH_EVERY: Duration = Duration::from_secs(3);
-const TALL_LOGS: u16 = 24;
+const ACTIVITY_MAX: usize = 6;
 
 const BORDER: Color = Color::Rgb(86, 90, 108);
 const MUTED: Color = Color::Rgb(138, 142, 158);
@@ -37,6 +38,13 @@ const GREEN: Color = Color::Rgb(166, 209, 137);
 const RED: Color = Color::Rgb(232, 136, 136);
 const YELLOW: Color = Color::Rgb(230, 197, 120);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Cockpit,
+    Wiring,
+    Diagnostics,
+}
+
 struct App {
     view: ScopeView,
     rows: Vec<ListRow>,
@@ -46,9 +54,7 @@ struct App {
     logs: Vec<LogLine>,
     last_error: Option<String>,
     last_refresh: Instant,
-    detail_expanded: bool,
-    logs_force: Option<bool>,
-    last_frame: Rect,
+    mode: Mode,
 }
 
 #[derive(Clone)]
@@ -61,6 +67,12 @@ enum ListRow {
 struct LogLine {
     text: String,
     alert: bool,
+}
+
+#[derive(Clone)]
+struct ActivityEntry {
+    at: String,
+    text: String,
 }
 
 #[derive(Clone)]
@@ -86,6 +98,13 @@ struct Row {
     fragments: String,
     health_basis: String,
     activation: String,
+    about: String,
+    headline: String,
+    body: String,
+    updated_at: String,
+    operator_state: String,
+    activity: Vec<ActivityEntry>,
+    definition_revision: String,
 }
 
 pub(crate) fn logs_unit(stem: &str) -> String {
@@ -118,6 +137,10 @@ fn health_rank(health: &str) -> u8 {
 impl App {
     fn load(cwd: Option<&str>) -> Result<Self, BackendError> {
         let view = scope::show(cwd)?;
+        Ok(Self::from_view(view))
+    }
+
+    fn from_view(view: ScopeView) -> Self {
         let mut app = Self {
             rows: Vec::new(),
             view,
@@ -127,13 +150,11 @@ impl App {
             logs: Vec::new(),
             last_error: None,
             last_refresh: Instant::now(),
-            detail_expanded: false,
-            logs_force: None,
-            last_frame: Rect::default(),
+            mode: Mode::Cockpit,
         };
         app.rebuild_rows();
-        app.reload_logs();
-        Ok(app)
+        // Cockpit default: never fetch journald on load.
+        app
     }
 
     fn rebuild_rows(&mut self) {
@@ -184,6 +205,7 @@ impl App {
         row.unit.to_ascii_lowercase().contains(&q)
             || row.title.to_ascii_lowercase().contains(&q)
             || row.purpose.to_ascii_lowercase().contains(&q)
+            || row.about.to_ascii_lowercase().contains(&q)
             || row.tags.to_ascii_lowercase().contains(&q)
     }
 
@@ -205,7 +227,9 @@ impl App {
             i = (i + dir).rem_euclid(len);
             if matches!(self.rows.get(i as usize), Some(ListRow::Op(_))) {
                 self.list.select(Some(i as usize));
-                self.reload_logs();
+                if self.mode == Mode::Diagnostics {
+                    self.reload_logs();
+                }
                 return;
             }
         }
@@ -248,27 +272,54 @@ impl App {
                 self.view = view;
                 self.last_error = None;
                 self.rebuild_rows();
-                self.reload_logs();
+                if self.mode == Mode::Diagnostics {
+                    self.reload_logs();
+                }
                 self.last_refresh = Instant::now();
             }
             Err(e) => self.last_error = Some(e.0),
         }
     }
 
-    fn logs_shown(&self) -> bool {
-        self.logs_force
-            .unwrap_or(self.last_frame.height >= TALL_LOGS)
+    fn enter_diagnostics(&mut self) {
+        self.mode = Mode::Diagnostics;
+        self.reload_logs();
     }
 
-    fn detail_shown(&self) -> bool {
-        true
+    fn leave_diagnostics(&mut self) {
+        self.mode = Mode::Cockpit;
+        self.logs.clear();
     }
 
-    fn toggle_logs(&mut self) {
-        let showing = self.logs_shown();
-        self.logs_force = Some(!showing);
-        if !showing {
-            self.reload_logs();
+    fn toggle_wiring(&mut self) {
+        match self.mode {
+            Mode::Wiring => self.mode = Mode::Cockpit,
+            Mode::Cockpit => self.mode = Mode::Wiring,
+            Mode::Diagnostics => {
+                self.logs.clear();
+                self.mode = Mode::Wiring;
+            }
+        }
+    }
+
+    fn toggle_diagnostics(&mut self) {
+        match self.mode {
+            Mode::Diagnostics => self.leave_diagnostics(),
+            _ => self.enter_diagnostics(),
+        }
+    }
+
+    fn return_cockpit(&mut self) -> bool {
+        match self.mode {
+            Mode::Cockpit => false,
+            Mode::Wiring => {
+                self.mode = Mode::Cockpit;
+                true
+            }
+            Mode::Diagnostics => {
+                self.leave_diagnostics();
+                true
+            }
         }
     }
 }
@@ -321,6 +372,46 @@ fn row_from_view(v: &Value, relationship: &'static str) -> Option<Row> {
                 .join("\n")
         })
         .unwrap_or_default();
+    let operator = v.get("operator");
+    let about = operator
+        .and_then(|o| o.get("about"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let headline = operator
+        .and_then(|o| o.get("headline"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let body = operator
+        .and_then(|o| o.get("body"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let updated_at = operator
+        .and_then(|o| o.get("updated_at"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let activity = operator
+        .and_then(|o| o.get("activity"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let at = item.get("at")?.as_str()?.to_string();
+                    let text = item.get("text")?.as_str()?.to_string();
+                    Some(ActivityEntry { at, text })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let operator_state = match v.get("operator_state") {
+        Some(Value::Null) | None => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+    };
     Some(Row {
         unit,
         title,
@@ -343,6 +434,13 @@ fn row_from_view(v: &Value, relationship: &'static str) -> Option<Row> {
         fragments,
         health_basis: json_str(v, "health_basis"),
         activation: json_str(v, "activation"),
+        about,
+        headline,
+        body,
+        updated_at,
+        operator_state,
+        activity,
+        definition_revision: json_str(v, "definition_revision"),
     })
 }
 
@@ -457,9 +555,8 @@ pub fn run(cwd: Option<&str>) -> Result<(), BackendError> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| BackendError(format!("tui: {e}")))?;
     let result = event_loop(&mut terminal, &mut app, cwd);
-    let _ = disable_raw_mode();
-    let mut out = io::stdout();
-    let _ = execute!(out, LeaveAlternateScreen);
+    disable_raw_mode().ok();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
     result
 }
 
@@ -492,12 +589,16 @@ fn event_loop(
                     app.filtering = false;
                     app.filter.clear();
                     app.rebuild_rows();
-                    app.reload_logs();
+                    if app.mode == Mode::Diagnostics {
+                        app.reload_logs();
+                    }
                 }
                 KeyCode::Enter => {
                     app.filtering = false;
                     app.rebuild_rows();
-                    app.reload_logs();
+                    if app.mode == Mode::Diagnostics {
+                        app.reload_logs();
+                    }
                 }
                 KeyCode::Backspace => {
                     app.filter.pop();
@@ -512,28 +613,26 @@ fn event_loop(
             continue;
         }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Char('q') => return Ok(()),
+            KeyCode::Esc => {
+                if !app.return_cockpit() {
+                    return Ok(());
+                }
+            }
             KeyCode::Char('r') => app.refresh(cwd),
             KeyCode::Char('/') => app.filtering = true,
             KeyCode::Down | KeyCode::Char('j') => app.move_sel(1),
             KeyCode::Up | KeyCode::Char('k') => app.move_sel(-1),
-            KeyCode::Char('l') => app.toggle_logs(),
-            KeyCode::Char('d') => {
-                app.detail_expanded = !app.detail_expanded;
-            }
-            KeyCode::Enter => {
-                app.reload_logs();
-                app.logs_force = Some(true);
-            }
+            KeyCode::Char('l') => app.toggle_diagnostics(),
+            KeyCode::Char('d') => app.toggle_wiring(),
             _ => {}
         }
     }
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
-    app.last_frame = f.area();
-    let show_logs = app.logs_shown();
-    let show_detail = app.detail_shown();
+    let show_logs = app.mode == Mode::Diagnostics;
+    let show_detail = app.mode != Mode::Diagnostics;
     let header_h = 4;
     let status_h = 1;
     let total = f.area().height;
@@ -576,26 +675,21 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, chunks[3], app);
 }
 
+fn header_counts(view: &ScopeView) -> String {
+    let n_owned = view.owned.len();
+    let n_watch = view.watching.len();
+    let n_att = view.attention.len();
+    if n_watch == 0 {
+        format!("{n_owned} owned · {n_att} attention")
+    } else {
+        format!("{n_owned} owned · {n_watch} watching · {n_att} attention")
+    }
+}
+
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let id = app.view.id.to_uppercase();
     let health = app.view.health.as_str().to_uppercase();
-    let n_ops = app.view.owned.len() + app.view.watching.len();
-    let n_fail = app
-        .view
-        .owned
-        .iter()
-        .chain(app.view.watching.iter())
-        .filter(|v| v.get("health").and_then(Value::as_str) == Some("failed"))
-        .count();
-    let root = short_path(&app.view.root.display().to_string());
-    let fail = if n_fail == 0 {
-        Span::styled(format!("{n_ops} ops"), Style::default().fg(MUTED))
-    } else {
-        Span::styled(
-            format!("{n_ops} ops  ·  {n_fail} failing"),
-            Style::default().fg(RED),
-        )
-    };
+    let counts = Span::styled(header_counts(&app.view), Style::default().fg(MUTED));
     let text = vec![
         Line::from(vec![
             Span::styled(id, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
@@ -604,10 +698,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
                 health,
                 health_style(app.view.health.as_str()).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("   ", Style::default()),
-            fail,
         ]),
-        Line::from(Span::styled(root, Style::default().fg(MUTED))),
+        Line::from(counts),
     ];
     f.render_widget(
         Paragraph::new(text).block(
@@ -683,111 +775,315 @@ fn op_line(title: &str, health: &str, when: &str, inner: u16) -> Line<'static> {
     Line::from(spans)
 }
 
+fn description_for(r: &Row) -> &str {
+    if !r.about.is_empty() {
+        &r.about
+    } else if !r.purpose.is_empty() {
+        &r.purpose
+    } else {
+        &r.title
+    }
+}
+
+fn operator_brief_style(state: &str) -> Style {
+    match state {
+        "error" | "missing" | "outdated" | "unbased" => Style::default().fg(YELLOW),
+        _ => Style::default().fg(MUTED),
+    }
+}
+
+fn operator_brief_cue(state: &str) -> Option<&'static str> {
+    match state {
+        "outdated" => Some("outdated"),
+        "missing" => Some("missing"),
+        "error" => Some("error"),
+        "unbased" => Some("unbased"),
+        _ => None,
+    }
+}
+
+fn activity_window(activity: &[ActivityEntry], max: usize) -> (usize, &[ActivityEntry]) {
+    if activity.len() <= max {
+        (0, activity)
+    } else {
+        let skip = activity.len() - max;
+        (skip, &activity[skip..])
+    }
+}
+
+/// Plain cockpit surface for tests and review (no journal, no ExecStart).
+#[cfg(test)]
+fn cockpit_plain(r: &Row, now: SystemTime) -> String {
+    let mut out = Vec::new();
+    out.push(r.title.clone());
+    out.push(description_for(r).to_string());
+    if !r.headline.is_empty() || !r.body.is_empty() {
+        out.push("NOW".into());
+        if !r.headline.is_empty() {
+            out.push(r.headline.clone());
+        }
+        if !r.body.is_empty() {
+            out.push(r.body.clone());
+        }
+    }
+    if r.relationship == "owned" {
+        let mut brief = String::from("AGENT BRIEF");
+        if !r.updated_at.is_empty() {
+            brief.push_str(&format!("  {}", relative_label(&r.updated_at, now)));
+        }
+        if let Some(cue) = operator_brief_cue(&r.operator_state) {
+            brief.push_str(&format!("  [{cue}]"));
+        }
+        out.push(brief);
+        if !r.activity.is_empty() {
+            out.push("ACTIVITY".into());
+            let (earlier, window) = activity_window(&r.activity, ACTIVITY_MAX);
+            if earlier > 0 {
+                out.push(format!("… {earlier} earlier"));
+            }
+            for entry in window {
+                let when = if entry.at.is_empty() {
+                    String::new()
+                } else {
+                    relative_label(&entry.at, now)
+                };
+                if when.is_empty() {
+                    out.push(entry.text.clone());
+                } else {
+                    out.push(format!("{when}  {}", entry.text));
+                }
+            }
+        }
+    }
+    out.push("RUNTIME".into());
+    out.push(format!("state  {}", state_line(r)));
+    out.push(format!("last   {}", when_last(r, now)));
+    out.push(format!("next   {}", next_display(r, now)));
+    out.join("\n")
+}
+
 fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
     let now = SystemTime::now();
     let body = if let Some(r) = app.selected() {
-        let mut lines = vec![
-            Line::from(Span::styled(
-                r.title.clone(),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                empty(&r.purpose).to_string(),
-                Style::default().fg(MUTED),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    "NEXT  ",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    next_display(r, now),
-                    Style::default()
-                        .fg(Color::Rgb(250, 248, 240))
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("last  ", Style::default().fg(MUTED)),
-                Span::styled(when_last(r, now), Style::default().fg(TEXT)),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("exec  ", Style::default().fg(MUTED)),
-                Span::styled(short_exec(&r.exec), Style::default().fg(TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("state ", Style::default().fg(MUTED)),
-                Span::styled(state_line(r), Style::default().fg(TEXT)),
-            ]),
-        ];
-        if app.detail_expanded {
-            lines.push(Line::from(""));
-            if !r.tags.is_empty() {
-                lines.push(Line::from(vec![
-                    muted_k("tags"),
-                    Span::styled(r.tags.clone(), Style::default().fg(MUTED)),
-                ]));
-            }
-            lines.push(Line::from(vec![
-                muted_k("unit"),
-                Span::styled(r.unit.clone(), Style::default().fg(MUTED)),
-            ]));
-            if !r.management.is_empty() {
-                lines.push(Line::from(vec![
-                    muted_k("mgmt"),
-                    Span::styled(r.management.clone(), Style::default().fg(MUTED)),
-                ]));
-            }
-            if r.relationship == "watching" {
-                lines.push(Line::from(vec![
-                    muted_k("role"),
-                    Span::styled("watching", Style::default().fg(MUTED)),
-                ]));
-            }
-            if !r.cwd.is_empty() {
-                lines.push(Line::from(vec![
-                    muted_k("cwd"),
-                    Span::styled(short_path(&r.cwd), Style::default().fg(MUTED)),
-                ]));
-            }
-            if !r.origin.is_empty() {
-                lines.push(Line::from(vec![
-                    muted_k("origin"),
-                    Span::styled(short_path(&r.origin), Style::default().fg(MUTED)),
-                ]));
-            }
-            if !r.origin_scope.is_empty() {
-                lines.push(Line::from(vec![
-                    muted_k("scope"),
-                    Span::styled(r.origin_scope.clone(), Style::default().fg(MUTED)),
-                ]));
-            }
-            for frag in r.fragments.lines().filter(|s| !s.is_empty()) {
-                lines.push(Line::from(vec![
-                    muted_k("file"),
-                    Span::styled(short_path(frag), Style::default().fg(MUTED)),
-                ]));
-            }
+        match app.mode {
+            Mode::Wiring => wiring_detail_lines(r, now),
+            Mode::Cockpit => cockpit_detail_lines(r, now),
+            Mode::Diagnostics => Vec::new(),
         }
-        lines
     } else {
         vec![Line::from(Span::styled(
             "nothing selected",
             Style::default().fg(MUTED),
         ))]
     };
-    let title = app
-        .selected()
-        .map(|r| r.title.clone())
-        .unwrap_or_else(|| "detail".into());
+    let title = match app.mode {
+        Mode::Wiring => "wiring".into(),
+        Mode::Cockpit => app
+            .selected()
+            .map(|r| r.title.clone())
+            .unwrap_or_else(|| "cockpit".into()),
+        Mode::Diagnostics => "diagnostics".into(),
+    };
     f.render_widget(
         Paragraph::new(body)
             .wrap(Wrap { trim: true })
             .block(panel(title)),
         area,
     );
+}
+
+fn cockpit_detail_lines(r: &Row, now: SystemTime) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            r.title.clone(),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            description_for(r).to_string(),
+            Style::default().fg(MUTED),
+        )),
+    ];
+
+    if !r.headline.is_empty() || !r.body.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "NOW",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+        if !r.headline.is_empty() {
+            lines.push(Line::from(Span::styled(
+                r.headline.clone(),
+                Style::default()
+                    .fg(Color::Rgb(250, 248, 240))
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+        if !r.body.is_empty() {
+            lines.push(Line::from(Span::styled(
+                r.body.clone(),
+                Style::default().fg(TEXT),
+            )));
+        }
+    }
+
+    if r.relationship == "owned" {
+        lines.push(Line::from(""));
+        let mut brief = vec![Span::styled(
+            "AGENT BRIEF",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )];
+        if !r.updated_at.is_empty() {
+            brief.push(Span::styled(
+                format!("  {}", relative_label(&r.updated_at, now)),
+                Style::default().fg(MUTED),
+            ));
+        }
+        if let Some(cue) = operator_brief_cue(&r.operator_state) {
+            brief.push(Span::styled(
+                format!("  [{cue}]"),
+                operator_brief_style(&r.operator_state),
+            ));
+        } else if r.operator_state == "current" {
+            brief.push(Span::styled("  current", Style::default().fg(MUTED)));
+        }
+        lines.push(Line::from(brief));
+
+        if !r.activity.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "ACTIVITY",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )));
+            let (earlier, window) = activity_window(&r.activity, ACTIVITY_MAX);
+            if earlier > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("… {earlier} earlier"),
+                    Style::default().fg(MUTED),
+                )));
+            }
+            for entry in window {
+                let when = if entry.at.is_empty() {
+                    String::new()
+                } else {
+                    relative_label(&entry.at, now)
+                };
+                let text = if when.is_empty() {
+                    entry.text.clone()
+                } else {
+                    format!("{when}  {}", entry.text)
+                };
+                lines.push(Line::from(Span::styled(text, Style::default().fg(TEXT))));
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "RUNTIME",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(vec![
+        Span::styled("state ", Style::default().fg(MUTED)),
+        Span::styled(state_line(r), Style::default().fg(TEXT)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("last  ", Style::default().fg(MUTED)),
+        Span::styled(when_last(r, now), Style::default().fg(TEXT)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("next  ", Style::default().fg(MUTED)),
+        Span::styled(next_display(r, now), Style::default().fg(TEXT)),
+    ]));
+    lines
+}
+
+fn wiring_detail_lines(r: &Row, _now: SystemTime) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            r.title.clone(),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            muted_k("unit"),
+            Span::styled(r.unit.clone(), Style::default().fg(TEXT)),
+        ]),
+    ];
+    if !r.management.is_empty() {
+        lines.push(Line::from(vec![
+            muted_k("mgmt"),
+            Span::styled(r.management.clone(), Style::default().fg(TEXT)),
+        ]));
+    }
+    if !r.kind.is_empty() {
+        lines.push(Line::from(vec![
+            muted_k("kind"),
+            Span::styled(r.kind.clone(), Style::default().fg(TEXT)),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        muted_k("exec"),
+        Span::styled(short_exec(&r.exec), Style::default().fg(TEXT)),
+    ]));
+    if !r.cwd.is_empty() {
+        lines.push(Line::from(vec![
+            muted_k("cwd"),
+            Span::styled(short_path(&r.cwd), Style::default().fg(TEXT)),
+        ]));
+    }
+    if !r.tags.is_empty() {
+        lines.push(Line::from(vec![
+            muted_k("tags"),
+            Span::styled(r.tags.clone(), Style::default().fg(TEXT)),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        muted_k("state"),
+        Span::styled(state_line(r), Style::default().fg(TEXT)),
+    ]));
+    if !r.sub.is_empty() {
+        lines.push(Line::from(vec![
+            muted_k("sub"),
+            Span::styled(r.sub.clone(), Style::default().fg(TEXT)),
+        ]));
+    }
+    if !r.activation.is_empty() {
+        lines.push(Line::from(vec![
+            muted_k("act"),
+            Span::styled(r.activation.clone(), Style::default().fg(TEXT)),
+        ]));
+    }
+    for frag in r.fragments.lines().filter(|s| !s.is_empty()) {
+        lines.push(Line::from(vec![
+            muted_k("file"),
+            Span::styled(short_path(frag), Style::default().fg(MUTED)),
+        ]));
+    }
+    if !r.origin.is_empty() {
+        lines.push(Line::from(vec![
+            muted_k("origin"),
+            Span::styled(short_path(&r.origin), Style::default().fg(MUTED)),
+        ]));
+    }
+    if !r.origin_scope.is_empty() {
+        lines.push(Line::from(vec![
+            muted_k("scope"),
+            Span::styled(r.origin_scope.clone(), Style::default().fg(MUTED)),
+        ]));
+    }
+    if !r.definition_revision.is_empty() {
+        lines.push(Line::from(vec![
+            muted_k("def"),
+            Span::styled(r.definition_revision.clone(), Style::default().fg(MUTED)),
+        ]));
+    }
+    if !r.health_basis.is_empty() {
+        lines.push(Line::from(vec![
+            muted_k("basis"),
+            Span::styled(r.health_basis.clone(), Style::default().fg(MUTED)),
+        ]));
+    }
+    lines
 }
 
 fn muted_k(label: &str) -> Span<'static> {
@@ -833,20 +1129,17 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(ACCENT),
         ))
     } else {
+        let mode = match app.mode {
+            Mode::Cockpit => "cockpit",
+            Mode::Wiring => "wiring",
+            Mode::Diagnostics => "diagnostics",
+        };
         Line::from(Span::styled(
-            "q quit   j/k move   / find   r refresh   d details   l logs",
+            format!("q quit   j/k move   / find   r refresh   d wiring   l logs   · {mode}"),
             Style::default().fg(MUTED),
         ))
     };
     f.render_widget(Paragraph::new(msg), area);
-}
-
-fn empty(s: &str) -> &str {
-    if s.is_empty() {
-        "—"
-    } else {
-        s
-    }
 }
 
 fn short_path(p: &str) -> String {
@@ -1117,7 +1410,9 @@ fn format_clock_at(utc_secs: i64, offset: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scope::{Attention, ScopeHealth};
     use crate::systemd::usec_to_rfc3339;
+    use std::path::PathBuf;
 
     fn dummy(unit: &str, relationship: &'static str) -> Row {
         Row {
@@ -1142,6 +1437,61 @@ mod tests {
             fragments: String::new(),
             health_basis: String::new(),
             activation: "timer".into(),
+            about: String::new(),
+            headline: String::new(),
+            body: String::new(),
+            updated_at: String::new(),
+            operator_state: String::new(),
+            activity: Vec::new(),
+            definition_revision: String::new(),
+        }
+    }
+
+    fn empty_view() -> ScopeView {
+        ScopeView {
+            id: "personal".into(),
+            root: PathBuf::from("/tmp/personal"),
+            health: ScopeHealth::Healthy,
+            owned: vec![serde_json::json!({
+                "unit": "managed-personal-pr-maintainer",
+                "title": "PR maintainer",
+                "purpose": "fallback purpose",
+                "health": "healthy",
+                "kind": "oneshot",
+                "activation": "timer",
+                "state": "inactive",
+                "sub": "dead",
+                "last": "2026-08-22T10:00:00.000000Z",
+                "next": "2026-08-22T12:00:00.000000Z",
+                "last_result": "success",
+                "exec": {"path": "/bin/bash", "argv": ["-c", "ExecStart=/usr/bin/true"]},
+                "cwd": "/tmp",
+                "tags": ["ops"],
+                "management": "user",
+                "fragment_paths": ["/tmp/x.service"],
+                "origin_cwd": "/tmp",
+                "origin_scope": "personal",
+                "health_basis": "timer",
+                "definition_revision": "sha256:abc",
+                "critical": false,
+                "operator": {
+                    "version": 1,
+                    "about": "Keeps PR queues honest",
+                    "headline": "Queue drained",
+                    "body": "No open PRs need attention.",
+                    "updated_at": "2026-08-22T11:00:00.000000Z",
+                    "basis_revision": "sha256:abc",
+                    "activity": [
+                        {"at": "2026-08-22T09:00:00.000000Z", "text": "earlier sweep"},
+                        {"at": "2026-08-22T10:30:00.000000Z", "text": "closed stale PR"},
+                        {"at": "2026-08-22T11:00:00.000000Z", "text": "queue empty"}
+                    ]
+                },
+                "operator_state": "current"
+            })],
+            watching: vec![],
+            attention: vec![],
+            warnings: vec![],
         }
     }
 
@@ -1300,5 +1650,143 @@ mod tests {
             short_exec("/bin/bash -c /home/sf/worlds/personal/.omp/bin/yt-history poll && { /home/sf/worlds/personal/.omp/bin/yt-history llm-pass || true; }"),
             "yt-history poll && { yt-history llm-pass || true; }"
         );
+    }
+
+    #[test]
+    fn from_view_defaults_cockpit_without_logs() {
+        let app = App::from_view(empty_view());
+        assert_eq!(app.mode, Mode::Cockpit);
+        assert!(app.logs.is_empty());
+        assert!(app.selected().is_some());
+    }
+
+    #[test]
+    fn selection_in_cockpit_does_not_fetch_logs() {
+        let mut view = empty_view();
+        view.owned.push(serde_json::json!({
+            "unit": "managed-personal-other",
+            "title": "Other",
+            "health": "healthy",
+            "kind": "oneshot",
+            "activation": "timer",
+            "operator": Value::Null,
+            "operator_state": "missing"
+        }));
+        let mut app = App::from_view(view);
+        assert!(app.logs.is_empty());
+        app.move_sel(1);
+        assert_eq!(app.mode, Mode::Cockpit);
+        assert!(app.logs.is_empty());
+        app.move_sel(-1);
+        assert!(app.logs.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_toggle_clears_on_leave() {
+        let mut app = App::from_view(empty_view());
+        app.logs = vec![LogLine {
+            text: "Traceback (most recent call last):".into(),
+            alert: true,
+        }];
+        app.mode = Mode::Diagnostics;
+        app.leave_diagnostics();
+        assert_eq!(app.mode, Mode::Cockpit);
+        assert!(app.logs.is_empty());
+    }
+
+    #[test]
+    fn wiring_toggle_round_trips() {
+        let mut app = App::from_view(empty_view());
+        app.toggle_wiring();
+        assert_eq!(app.mode, Mode::Wiring);
+        app.toggle_wiring();
+        assert_eq!(app.mode, Mode::Cockpit);
+        assert!(!app.return_cockpit());
+        app.toggle_wiring();
+        assert!(app.return_cockpit());
+        assert_eq!(app.mode, Mode::Cockpit);
+    }
+
+    #[test]
+    fn cockpit_prefers_about_over_purpose() {
+        let app = App::from_view(empty_view());
+        let row = app.selected().unwrap();
+        assert_eq!(description_for(row), "Keeps PR queues honest");
+        let mut watching = dummy("managed-proxy-health", "watching");
+        watching.purpose = "proxy canary".into();
+        watching.about.clear();
+        assert_eq!(description_for(&watching), "proxy canary");
+    }
+
+    #[test]
+    fn outdated_cue_is_visible_not_failure_red() {
+        assert_eq!(operator_brief_cue("outdated"), Some("outdated"));
+        assert_eq!(operator_brief_cue("missing"), Some("missing"));
+        assert_eq!(operator_brief_cue("error"), Some("error"));
+        assert_eq!(operator_brief_cue("current"), None);
+        let style = operator_brief_style("outdated");
+        assert_eq!(style.fg, Some(YELLOW));
+        assert_ne!(style.fg, Some(RED));
+    }
+
+    #[test]
+    fn header_owned_watching_attention() {
+        let mut view = empty_view();
+        assert_eq!(header_counts(&view), "1 owned · 0 attention");
+        view.watching.push(serde_json::json!({
+            "unit": "managed-proxy-health",
+            "title": "proxy",
+            "health": "healthy"
+        }));
+        view.attention.push(Attention {
+            operation: "managed-personal-pr-maintainer".into(),
+            relationship: "owned",
+            code: "operation_failed",
+            reason: "failed".into(),
+        });
+        assert_eq!(header_counts(&view), "1 owned · 1 watching · 1 attention");
+    }
+
+    #[test]
+    fn pr_maintainer_cockpit_surface_omits_exec_and_traceback() {
+        let app = App::from_view(empty_view());
+        let row = app.selected().unwrap();
+        let now = UNIX_EPOCH
+            + Duration::from_secs(parse_rfc3339_utc("2026-08-22T11:30:00Z").unwrap() as u64);
+        let text = cockpit_plain(row, now);
+        assert!(text.contains("PR maintainer"));
+        assert!(text.contains("Queue drained"));
+        assert!(text.contains("ACTIVITY"));
+        assert!(text.contains("queue empty"));
+        assert!(text.contains("RUNTIME"));
+        assert!(!text.contains("ExecStart"));
+        assert!(!text.to_ascii_lowercase().contains("traceback"));
+        assert!(!text.contains("/bin/bash"));
+    }
+
+    #[test]
+    fn row_from_view_carries_operator_fields() {
+        let app = App::from_view(empty_view());
+        let row = app.selected().unwrap();
+        assert_eq!(row.about, "Keeps PR queues honest");
+        assert_eq!(row.headline, "Queue drained");
+        assert_eq!(row.operator_state, "current");
+        assert_eq!(row.activity.len(), 3);
+        assert_eq!(row.definition_revision, "sha256:abc");
+        assert!(row.exec.contains("ExecStart") || row.exec.contains("/bin/bash"));
+    }
+
+    #[test]
+    fn activity_truncation_marks_earlier() {
+        let activity: Vec<ActivityEntry> = (0..8)
+            .map(|i| ActivityEntry {
+                at: format!("2026-08-22T10:0{i}:00.000000Z"),
+                text: format!("step {i}"),
+            })
+            .collect();
+        let (earlier, window) = activity_window(&activity, 6);
+        assert_eq!(earlier, 2);
+        assert_eq!(window.len(), 6);
+        assert_eq!(window[0].text, "step 2");
     }
 }

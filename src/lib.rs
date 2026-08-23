@@ -9,6 +9,7 @@ pub mod config;
 pub mod json;
 pub mod mcp;
 pub mod operations;
+pub mod operator;
 pub mod scope;
 pub mod sha256;
 pub mod systemd;
