@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${SYSTEMD_OPS_BIN:-$ROOT/target/debug/systemd-ops}
 SOURCE_WRAPPER=${SOURCE_WRAPPER:-/home/sf/workspace/oh-my-pi/.systemd-ops/managed-omp-pr-9363/run}
+SOURCE_DRIVER=${SOURCE_DRIVER:-/home/sf/workspace/oh-my-pi/.systemd-ops/pr-maintainer-run}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -20,8 +21,8 @@ make_case() {
   mkdir -p "$home/state" "$scope/worktree"
   cp "$SOURCE_WRAPPER" "$home/run"
   chmod +x "$home/run"
-  printf 'observe\n' >"$home/mode"
-  printf 'proof prompt\n' >"$home/prompt.md"
+  cp "$SOURCE_DRIVER" "$scope/.systemd-ops/pr-maintainer-run"
+  chmod +x "$scope/.systemd-ops/pr-maintainer-run"
   cat >"$scope/.systemd-ops/scope.toml" <<'EOF'
 [scope]
 id = "omp-proof"
@@ -52,6 +53,7 @@ run_wrapper() {
   SYSTEMD_OPS_BIN="$BIN" \
   FINGERPRINT_TOOL="$scope/.systemd-ops/pr-fingerprint" \
   OMP_BIN="$scope/fake-omp" \
+  AGENT_CWD="$scope/agents" \
   "$scope/.systemd-ops/managed-omp-pr-9363/run"
 }
 
