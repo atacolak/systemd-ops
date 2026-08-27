@@ -1,8 +1,8 @@
 //! Project-local responsibility scopes.
 //!
-//! `.systemd-ops.toml` is discovered by walking upward from cwd. The
-//! directory that contains it is the scope root. ScopeView is derived
-//! on demand; CLI `--json` and the TUI both call [`show`].
+//! `.systemd-ops/scope.toml` (preferred) or `.systemd-ops.toml`
+//! (legacy) is discovered by walking upward from cwd. The directory
+//! that contains it is the scope root. ScopeView is derived on demand.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,8 @@ use serde_json::{json, Value};
 use crate::operations;
 use crate::systemd::{self, BackendError};
 
-const MANIFEST_NAME: &str = ".systemd-ops.toml";
+pub const PREFERRED_MANIFEST: &str = ".systemd-ops/scope.toml";
+pub const LEGACY_MANIFEST: &str = ".systemd-ops.toml";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScopeManifest {
@@ -119,6 +120,32 @@ struct RawWatch {
     operation: Option<String>,
 }
 
+fn manifest_at(root: &Path) -> Result<Option<PathBuf>, BackendError> {
+    let preferred = root.join(PREFERRED_MANIFEST);
+    let legacy = root.join(LEGACY_MANIFEST);
+    let preferred_exists = preferred.is_file();
+    let legacy_exists = legacy.is_file();
+    if preferred_exists && legacy_exists {
+        return Err(BackendError(format!(
+            "ambiguous scope at {}: both {PREFERRED_MANIFEST} and {LEGACY_MANIFEST} exist",
+            root.display()
+        )));
+    }
+    Ok(if preferred_exists {
+        Some(preferred)
+    } else if legacy_exists {
+        Some(legacy)
+    } else {
+        None
+    })
+}
+
+fn read_manifest(root: PathBuf, path: PathBuf) -> Result<ScopeManifest, BackendError> {
+    let text = fs::read_to_string(&path)
+        .map_err(|e| BackendError(format!("cannot read {}: {e}", path.display())))?;
+    parse_manifest_named(&text, root, &path)
+}
+
 pub fn discover(start: &Path) -> Result<ScopeManifest, BackendError> {
     let start = if start.is_absolute() {
         start.to_path_buf()
@@ -136,24 +163,49 @@ pub fn discover(start: &Path) -> Result<ScopeManifest, BackendError> {
             .ok_or_else(|| BackendError("cannot discover a scope from this path".into()))?
     };
     loop {
-        let candidate = dir.join(MANIFEST_NAME);
-        if candidate.is_file() {
-            let text = fs::read_to_string(&candidate)
-                .map_err(|e| BackendError(format!("cannot read {}: {e}", candidate.display())))?;
-            return parse_manifest(&text, dir);
+        if let Some(path) = manifest_at(&dir)? {
+            return read_manifest(dir, path);
         }
         match dir.parent() {
             Some(parent) => dir = parent.to_path_buf(),
             None => {
                 return Err(BackendError(format!(
-                    "no {MANIFEST_NAME} found walking up from the working directory; this is a per-project console, not an all-systemd dashboard"
+                    "no {PREFERRED_MANIFEST} or {LEGACY_MANIFEST} found walking up from the working directory; this is a per-project console, not an all-systemd dashboard"
                 )))
             }
         }
     }
 }
 
-pub fn discover_from_cwd(cwd: Option<&str>) -> Result<ScopeManifest, BackendError> {
+pub fn discover_explicit(root: &Path) -> Result<ScopeManifest, BackendError> {
+    let root = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| BackendError(format!("cannot resolve cwd: {e}")))?
+            .join(root)
+    };
+    let path = manifest_at(&root)?.ok_or_else(|| {
+        BackendError(format!(
+            "explicit scope root {} contains neither {PREFERRED_MANIFEST} nor {LEGACY_MANIFEST}",
+            root.display()
+        ))
+    })?;
+    read_manifest(root, path)
+}
+
+/// Resolve a scope with explicit root, environment root, then cwd discovery precedence.
+pub fn resolve(
+    explicit_root: Option<&str>,
+    environment_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<ScopeManifest, BackendError> {
+    if let Some(root) = explicit_root.filter(|s| !s.is_empty()) {
+        return discover_explicit(Path::new(root));
+    }
+    if let Some(root) = environment_root.filter(|s| !s.is_empty()) {
+        return discover_explicit(Path::new(root));
+    }
     match cwd {
         Some(c) => discover(Path::new(c)),
         None => {
@@ -164,15 +216,29 @@ pub fn discover_from_cwd(cwd: Option<&str>) -> Result<ScopeManifest, BackendErro
     }
 }
 
+pub fn discover_from_cwd(cwd: Option<&str>) -> Result<ScopeManifest, BackendError> {
+    let env_root = std::env::var("SYSTEMD_OPS_SCOPE_ROOT").ok();
+    resolve(None, env_root.as_deref(), cwd)
+}
+
 pub fn parse_manifest(text: &str, root: PathBuf) -> Result<ScopeManifest, BackendError> {
-    let raw: RawFile = toml::from_str(text)
-        .map_err(|e| BackendError(format!("malformed {MANIFEST_NAME}: {e}")))?;
+    parse_manifest_named(text, root, Path::new(PREFERRED_MANIFEST))
+}
+
+fn parse_manifest_named(
+    text: &str,
+    root: PathBuf,
+    manifest_path: &Path,
+) -> Result<ScopeManifest, BackendError> {
+    let name = manifest_path.to_string_lossy();
+    let raw: RawFile =
+        toml::from_str(text).map_err(|e| BackendError(format!("malformed {name}: {e}")))?;
     let scope = raw
         .scope
-        .ok_or_else(|| BackendError(format!("{MANIFEST_NAME} is missing [scope]")))?;
+        .ok_or_else(|| BackendError(format!("{name} is missing [scope]")))?;
     let id = scope
         .id
-        .ok_or_else(|| BackendError(format!("{MANIFEST_NAME} is missing scope.id")))?;
+        .ok_or_else(|| BackendError(format!("{name} is missing scope.id")))?;
     validate_scope_id(&id)?;
     let owned = scope.owned.unwrap_or_default();
     if owned.is_empty() {
@@ -218,8 +284,12 @@ pub fn parse_manifest(text: &str, root: PathBuf) -> Result<ScopeManifest, Backen
     })
 }
 
-pub fn validate(cwd: Option<&str>) -> Result<Value, BackendError> {
-    let manifest = discover_from_cwd(cwd)?;
+pub fn validate_resolved(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let env_root = std::env::var("SYSTEMD_OPS_SCOPE_ROOT").ok();
+    let manifest = resolve(explicit_root, env_root.as_deref(), cwd)?;
     Ok(json!({
         "ok": true,
         "id": manifest.id,
@@ -230,9 +300,21 @@ pub fn validate(cwd: Option<&str>) -> Result<Value, BackendError> {
     }))
 }
 
-pub fn show(cwd: Option<&str>) -> Result<ScopeView, BackendError> {
-    let manifest = discover_from_cwd(cwd)?;
+pub fn validate(cwd: Option<&str>) -> Result<Value, BackendError> {
+    validate_resolved(None, cwd)
+}
+
+pub fn show_resolved(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<ScopeView, BackendError> {
+    let env_root = std::env::var("SYSTEMD_OPS_SCOPE_ROOT").ok();
+    let manifest = resolve(explicit_root, env_root.as_deref(), cwd)?;
     show_manifest(&manifest)
+}
+
+pub fn show(cwd: Option<&str>) -> Result<ScopeView, BackendError> {
+    show_resolved(None, cwd)
 }
 
 pub fn show_manifest(manifest: &ScopeManifest) -> Result<ScopeView, BackendError> {
@@ -283,6 +365,13 @@ pub fn aggregate(
         view["health"] = json!(op_health);
         view["relationship"] = json!("owned");
         view["critical"] = json!(critical);
+        view["scope_id"] = json!(manifest.id);
+        view["scope_root"] = json!(manifest.root.to_string_lossy());
+        view["operation_home"] = json!(manifest
+            .root
+            .join(".systemd-ops")
+            .join(&unit)
+            .to_string_lossy());
         if view.get("definition_revision").is_none() {
             view["definition_revision"] = Value::Null;
         }
@@ -294,6 +383,11 @@ pub fn aggregate(
             crate::operator::join_for_scope(&manifest.root, &unit, def_rev.as_deref());
         view["operator"] = operator;
         view["operator_state"] = json!(operator_state.as_str());
+        view["basis_revision"] = view
+            .get("operator")
+            .and_then(|operator| operator.get("basis_revision"))
+            .cloned()
+            .unwrap_or(Value::Null);
         if let Some(w) = warn {
             warnings.push(w);
         }
@@ -340,11 +434,19 @@ pub fn aggregate(
         view["health"] = json!(op_health);
         view["relationship"] = json!("watching");
         view["critical"] = json!(false);
+        view["scope_id"] = json!(manifest.id);
+        view["scope_root"] = json!(manifest.root.to_string_lossy());
+        view["operation_home"] = json!(manifest
+            .root
+            .join(".systemd-ops")
+            .join(&unit)
+            .to_string_lossy());
         if view.get("definition_revision").is_none() {
             view["definition_revision"] = Value::Null;
         }
         view["operator"] = Value::Null;
         view["operator_state"] = Value::Null;
+        view["basis_revision"] = Value::Null;
         if op_health == "failed" {
             health = health.raise(ScopeHealth::Degraded);
             attention.push(Attention {
@@ -500,14 +602,88 @@ operation = "managed-proxy-health"
     }
 
     #[test]
-    fn walks_up_from_nested_cwd() {
-        let root = tmp("walk");
-        fs::write(root.join(MANIFEST_NAME), sample()).unwrap();
-        let nested = root.join("src").join("bin");
+    fn discovers_preferred_legacy_and_upward() {
+        let preferred = tmp("preferred");
+        fs::create_dir_all(preferred.join(".systemd-ops")).unwrap();
+        fs::write(preferred.join(PREFERRED_MANIFEST), sample()).unwrap();
+        let nested = preferred.join("src/bin");
         fs::create_dir_all(&nested).unwrap();
-        let m = discover(&nested).unwrap();
-        assert_eq!(m.id, "speech");
-        assert_eq!(m.root, root);
+        assert_eq!(discover(&nested).unwrap().root, preferred);
+
+        let legacy = tmp("legacy");
+        fs::write(legacy.join(LEGACY_MANIFEST), sample()).unwrap();
+        assert_eq!(discover(&legacy).unwrap().root, legacy);
+        let _ = fs::remove_dir_all(&preferred);
+        let _ = fs::remove_dir_all(&legacy);
+    }
+
+    #[test]
+    fn same_root_manifest_coexistence_is_ambiguous() {
+        let root = tmp("ambiguous");
+        fs::create_dir_all(root.join(".systemd-ops")).unwrap();
+        fs::write(root.join(PREFERRED_MANIFEST), sample()).unwrap();
+        fs::write(root.join(LEGACY_MANIFEST), sample()).unwrap();
+        let err = discover(&root).unwrap_err();
+        assert!(err.0.contains("ambiguous scope"), "got {}", err.0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_then_environment_then_cwd_precedence() {
+        let explicit = tmp("explicit");
+        let environment = tmp("environment");
+        let cwd = tmp("cwd");
+        for (root, id) in [
+            (&explicit, "explicit"),
+            (&environment, "environment"),
+            (&cwd, "cwd"),
+        ] {
+            fs::write(
+                root.join(LEGACY_MANIFEST),
+                format!("[scope]\nid=\"{id}\"\nowned=[\"managed-{id}-*\"]\n"),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            resolve(
+                Some(&explicit.to_string_lossy()),
+                Some(&environment.to_string_lossy()),
+                Some(&cwd.to_string_lossy()),
+            )
+            .unwrap()
+            .id,
+            "explicit"
+        );
+        assert_eq!(
+            resolve(
+                None,
+                Some(&environment.to_string_lossy()),
+                Some(&cwd.to_string_lossy()),
+            )
+            .unwrap()
+            .id,
+            "environment"
+        );
+        assert_eq!(
+            resolve(None, None, Some(&cwd.to_string_lossy()))
+                .unwrap()
+                .id,
+            "cwd"
+        );
+        let _ = fs::remove_dir_all(explicit);
+        let _ = fs::remove_dir_all(environment);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn worktree_cwd_discovers_its_own_scope() {
+        let root = tmp("worktree");
+        fs::create_dir_all(root.join(".systemd-ops")).unwrap();
+        fs::write(root.join(PREFERRED_MANIFEST), sample()).unwrap();
+        let worktree_cwd = root.join("crates/systemd-ops/src");
+        fs::create_dir_all(&worktree_cwd).unwrap();
+        let manifest = resolve(None, None, Some(&worktree_cwd.to_string_lossy())).unwrap();
+        assert_eq!(manifest.root, root);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -515,7 +691,7 @@ operation = "managed-proxy-health"
     fn missing_manifest_is_an_error() {
         let dir = tmp("none");
         let err = discover(&dir).unwrap_err();
-        assert!(err.0.contains(MANIFEST_NAME), "got {}", err.0);
+        assert!(err.0.contains(PREFERRED_MANIFEST), "got {}", err.0);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -706,7 +882,7 @@ operation = "managed-proxy-health"
     #[test]
     fn same_scope_id_is_not_a_warning() {
         let root = tmp("prov");
-        fs::write(root.join(MANIFEST_NAME), sample()).unwrap();
+        fs::write(root.join(LEGACY_MANIFEST), sample()).unwrap();
         let nested = root.join("src");
         fs::create_dir_all(&nested).unwrap();
         assert!(provenance_warning(
@@ -723,12 +899,12 @@ operation = "managed-proxy-health"
         let a = tmp("scope-a");
         let b = tmp("scope-b");
         fs::write(
-            a.join(MANIFEST_NAME),
+            a.join(LEGACY_MANIFEST),
             "[scope]\nid=\"speech\"\nowned=[\"managed-speech-*\"]\n",
         )
         .unwrap();
         fs::write(
-            b.join(MANIFEST_NAME),
+            b.join(LEGACY_MANIFEST),
             "[scope]\nid=\"personal\"\nowned=[\"managed-personal-*\"]\n",
         )
         .unwrap();

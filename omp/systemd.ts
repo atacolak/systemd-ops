@@ -164,15 +164,44 @@ export function operatorArgv(action: string, args: Json): string[] {
 	}
 }
 
+export function automationArgv(action: string, args: Json): string[] {
+	switch (action) {
+		case "context":
+			return ["automation", "context"];
+		case "report":
+			return [
+				"automation",
+				"report",
+				"--headline",
+				String(args.headline ?? ""),
+				"--summary",
+				JSON.stringify(args.summary ?? []),
+			];
+		case "activity":
+			return ["automation", "activity", "--text", String(args.text ?? "")];
+		default:
+			throw new Error(`unknown automation action '${action}'`);
+	}
+}
+
 export function opsCliArgv(argv: string[], cwd?: string): string[] {
 	return ["--json", "--manager", "user", ...(cwd ? ["--cwd", cwd] : []), ...argv];
+}
+export function opsSpawnContract(argv: string[], cwd?: string) {
+	return {
+		command: opsBin(),
+		args: opsCliArgv(argv, cwd),
+		options: {
+			...(cwd ? { cwd } : {}),
+			stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
+		},
+	};
 }
 
 function runOps(argv: string[], cwd?: string): Promise<Json> {
 	const { promise, resolve, reject } = Promise.withResolvers<Json>();
-	const child = spawn(opsBin(), opsCliArgv(argv, cwd), {
-		stdio: ["ignore", "pipe", "pipe"],
-	});
+	const contract = opsSpawnContract(argv, cwd);
+	const child = spawn(contract.command, contract.args, contract.options);
 	let stdout = "";
 	let stderr = "";
 	child.stdout.setEncoding("utf8");
@@ -234,11 +263,9 @@ export default function systemdTools(pi: { cwd?: string }) {
 			loadMode: "discoverable" as const,
 			approval: "read" as const,
 			description:
-				"Read systemd state. Inspect first: list_operations / get_operation for write-prefix stems, " +
-				"scope_show for the nearest .systemd-ops.toml (includes owned operator briefs), " +
-				"operator_show for one owned stem's advisory commentary, then list_units, failed_units, get_unit, " +
-				"list_timers, list_unit_files, unit_dependencies, unit_logs. Never apply, never plan. " +
-				"Do not shell systemctl for these units.",
+				"Project builder, operator, and admin read surface for general systemd visibility. " +
+				"Inspect operations, scopes, units, timers, dependencies, logs, and low-level operator state. " +
+				"Ordinary autonomous runtime maintainers should use automation_context instead. Never apply or plan.",
 			parameters: {
 				type: "object",
 				required: ["action"],
@@ -291,9 +318,9 @@ export default function systemdTools(pi: { cwd?: string }) {
 			label: "systemd control",
 			approval: "write" as const,
 			description:
-				"Mutate running or enablement state of write-prefix units (start/stop/restart/reload/enable/disable/reset-failed). " +
-				"Does not create or delete unit files. action=plan then action=apply with that plan_token. " +
-				"Inspect first. Never shell systemctl for these units.",
+				"Trusted project operator and admin lifecycle surface. Plan and apply start, stop, restart, reload, " +
+				"enable, disable, or reset-failed for write-prefix units. Do not expose this to ordinary runtime " +
+				"maintainers or delegated workers. Does not create or delete unit files.",
 			parameters: {
 				type: "object",
 				required: ["action"],
@@ -351,9 +378,9 @@ export default function systemdTools(pi: { cwd?: string }) {
 			label: "systemd author",
 			approval: "write" as const,
 			description:
-				"Create, update, or retire systemd-ops-managed definitions (# managed: systemd-ops 1). " +
-				"Refuses unmarked and out-of-prefix units. action=plan_create|plan_update|plan_retire then apply. " +
-				"Inspect first. Never shell systemctl for these units.",
+				"Automation and system builder surface. Create, update, or retire systemd-ops-managed definitions. " +
+				"Do not expose this to ordinary runtime maintainers or delegated workers. Refuses unmarked and " +
+				"out-of-prefix units; use plan then apply.",
 			parameters: {
 				type: "object",
 				required: ["action"],
@@ -441,11 +468,9 @@ export default function systemdTools(pi: { cwd?: string }) {
 			label: "systemd operator",
 			approval: "write" as const,
 			description:
-				"Maintain human-facing operator commentary for an operation owned by the current " +
-				"responsibility scope. `set` reconsolidates what the operation is doing/means now; " +
-				"`append` records a meaningful workflow milestone. Do not copy stdout, journal lines, " +
-				"or every tool call. This mutates project-local advisory state under " +
-				".systemd-ops/operator/, not systemd unit files.",
+				"Low-level manual operator-state administration and compatibility surface for project operators and admins. " +
+				"Ordinary autonomous runtime maintainers should use automation_report and automation_activity. " +
+				"Mutates advisory operator state, never systemd definitions or objective health.",
 			parameters: {
 				type: "object",
 				required: ["action", "unit"],
@@ -491,6 +516,86 @@ export default function systemdTools(pi: { cwd?: string }) {
 				const cwd = sessionCwd(ctx, factoryCwd);
 				try {
 					return envelopeResult(await runOps(operatorArgv(action, params), cwd));
+				} catch (e) {
+					return textResult(e instanceof Error ? e.message : String(e), { isError: true });
+				}
+			},
+		},
+		{
+			name: "automation_context",
+			label: "automation context",
+			hidden: true as const,
+			loadMode: "essential" as const,
+			approval: "read" as const,
+			strict: true as const,
+			description:
+				"Responsible autonomous-operation read surface. Return focused context for the operation bound by " +
+				"SYSTEMD_OPS_SCOPE_ROOT and SYSTEMD_OPS_OPERATION: canonical identity, objective runtime, current " +
+				"human report, active iteration, latest 20 iterations, and notable activity. No parameters. No raw journal.",
+			parameters: { type: "object", additionalProperties: false, properties: {} },
+			async execute(_id: string, _params: Json, _onUpdate?: unknown, ctx?: SessionLike) {
+				try {
+					return envelopeResult(await runOps(automationArgv("context", {}), sessionCwd(ctx, factoryCwd)));
+				} catch (e) {
+					return textResult(e instanceof Error ? e.message : String(e), { isError: true });
+				}
+			},
+		},
+		{
+			name: "automation_report",
+			label: "automation report",
+			hidden: true as const,
+			loadMode: "essential" as const,
+			approval: "write" as const,
+			strict: true as const,
+			description:
+				"Responsible autonomous-operation surface. Submit the current concise human-facing state for your " +
+				"bound operation. This is an operator cockpit, not working memory: include only what a human needs " +
+				"to understand what is happening, what materially changed, what remains, and whether attention is " +
+				"needed. Omit noisy evidence, review inventories, commands, logs, and internal reasoning. Required before normal exit.",
+			parameters: {
+				type: "object",
+				additionalProperties: false,
+				required: ["headline", "summary"],
+				properties: {
+					headline: { type: "string", minLength: 1, maxLength: 80, pattern: "^[^\\r\\n]+$" },
+					summary: {
+						type: "array",
+						minItems: 1,
+						maxItems: 5,
+						items: { type: "string", minLength: 1, maxLength: 280, pattern: "^[^\\r\\n]+$" },
+					},
+				},
+			},
+			async execute(_id: string, params: Json, _onUpdate?: unknown, ctx?: SessionLike) {
+				try {
+					return envelopeResult(await runOps(automationArgv("report", params), sessionCwd(ctx, factoryCwd)));
+				} catch (e) {
+					return textResult(e instanceof Error ? e.message : String(e), { isError: true });
+				}
+			},
+		},
+		{
+			name: "automation_activity",
+			label: "automation activity",
+			hidden: true as const,
+			loadMode: "essential" as const,
+			approval: "write" as const,
+			strict: true as const,
+			description:
+				"Record one notable human-facing milestone for your bound operation. Not every tool call, command, " +
+				"poll, or log line. Omit routine no-change checks and internal reasoning. Optional per iteration.",
+			parameters: {
+				type: "object",
+				additionalProperties: false,
+				required: ["text"],
+				properties: {
+					text: { type: "string", minLength: 1, maxLength: 200, pattern: "^[^\\r\\n]+$" },
+				},
+			},
+			async execute(_id: string, params: Json, _onUpdate?: unknown, ctx?: SessionLike) {
+				try {
+					return envelopeResult(await runOps(automationArgv("activity", params), sessionCwd(ctx, factoryCwd)));
 				} catch (e) {
 					return textResult(e instanceof Error ? e.message : String(e), { isError: true });
 				}

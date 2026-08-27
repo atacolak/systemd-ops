@@ -25,6 +25,7 @@ Global options:
   --manager user|system        systemd manager (config default: user)
   --write-prefix <glob[,..]>   restrict writes; no prefix means writes refused
   --cwd <path>                 provenance for authoring plans; also scope discovery
+  --scope-root <path>          explicit responsibility scope root
   --config <path>              config file (default: $XDG_CONFIG_HOME/systemd-ops/config.toml)
 
 Commands:
@@ -54,6 +55,12 @@ Commands:
   operator set --unit STEM [--about TEXT] [--headline TEXT] [--body TEXT]
   operator append --unit STEM --text TEXT
   operator clear --unit STEM
+  operator iteration-start --unit STEM
+  operator iteration-finish --unit STEM --iteration ID --exit-code N
+
+  automation context
+  automation report --headline TEXT --summary JSON_ARRAY
+  automation activity --text TEXT
 
   tui
 ";
@@ -253,11 +260,16 @@ fn print_scope_row(row: &Value) {
     println!("  {mark} {title}  {health}{crit}{next_s}");
 }
 
-fn run_scope(cmd: &str, args: &mut [String], cwd: Option<&str>) -> Result<Value, BackendError> {
+fn run_scope(
+    cmd: &str,
+    args: &mut [String],
+    scope_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
     remaining_flags(args).map_err(BackendError)?;
     match cmd {
-        "show" => Ok(scope::show(cwd)?.to_json()),
-        "validate" => scope::validate(cwd),
+        "show" => Ok(scope::show_resolved(scope_root, cwd)?.to_json()),
+        "validate" => scope::validate_resolved(scope_root, cwd),
         other => Err(BackendError(format!("unknown scope command '{other}'"))),
     }
 }
@@ -541,13 +553,14 @@ fn run_author(cmd: &str, args: &mut Vec<String>, cwd: Option<&str>) -> Result<Va
 fn run_operator(
     cmd: &str,
     args: &mut Vec<String>,
+    scope_root: Option<&str>,
     cwd: Option<&str>,
 ) -> Result<Value, BackendError> {
     match cmd {
         "show" => {
             let unit = require_opt(args, "--unit").map_err(BackendError)?;
             remaining_flags(args).map_err(BackendError)?;
-            operator::show(cwd, &unit)
+            operator::show(scope_root, cwd, &unit)
         }
         "set" => {
             let unit = require_opt(args, "--unit").map_err(BackendError)?;
@@ -555,20 +568,75 @@ fn run_operator(
             let headline = take_opt(args, "--headline").map_err(BackendError)?;
             let body = take_opt(args, "--body").map_err(BackendError)?;
             remaining_flags(args).map_err(BackendError)?;
-            operator::set(cwd, &unit, about, headline, body)
+            operator::set(scope_root, cwd, &unit, about, headline, body)
         }
         "append" => {
             let unit = require_opt(args, "--unit").map_err(BackendError)?;
             let text = require_opt(args, "--text").map_err(BackendError)?;
             remaining_flags(args).map_err(BackendError)?;
-            operator::append(cwd, &unit, &text)
+            operator::append(scope_root, cwd, &unit, &text)
         }
         "clear" => {
             let unit = require_opt(args, "--unit").map_err(BackendError)?;
             remaining_flags(args).map_err(BackendError)?;
-            operator::clear(cwd, &unit)
+            operator::clear(scope_root, cwd, &unit)
+        }
+        "iteration-start" => {
+            let unit = require_opt(args, "--unit").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            operator::iteration_start(scope_root, cwd, &unit)
+        }
+        "iteration-finish" => {
+            let unit = require_opt(args, "--unit").map_err(BackendError)?;
+            let iteration = require_opt(args, "--iteration").map_err(BackendError)?;
+            let raw_exit = require_opt(args, "--exit-code").map_err(BackendError)?;
+            let exit_code = raw_exit
+                .parse::<i32>()
+                .map_err(|e| BackendError(format!("--exit-code must be a 32-bit integer: {e}")))?;
+            remaining_flags(args).map_err(BackendError)?;
+            operator::iteration_finish(scope_root, cwd, &unit, &iteration, exit_code)
         }
         other => Err(BackendError(format!("unknown operator command '{other}'"))),
+    }
+}
+
+fn run_automation(
+    cmd: &str,
+    args: &mut Vec<String>,
+    scope_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    match cmd {
+        "context" => {
+            remaining_flags(args).map_err(BackendError)?;
+            operator::automation_context(scope_root, cwd)
+        }
+        "report" => {
+            let headline = require_opt(args, "--headline").map_err(BackendError)?;
+            let summary = json_arg(args, "--summary")
+                .map_err(BackendError)?
+                .ok_or_else(|| BackendError("missing --summary".into()))?;
+            let summary = summary
+                .as_array()
+                .ok_or_else(|| BackendError("--summary must be a JSON array".into()))?
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| BackendError("--summary items must be strings".into()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            remaining_flags(args).map_err(BackendError)?;
+            operator::automation_report(scope_root, cwd, &headline, &summary)
+        }
+        "activity" => {
+            let text = require_opt(args, "--text").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            operator::automation_activity(scope_root, cwd, &text)
+        }
+        other => Err(BackendError(format!(
+            "unknown automation command '{other}'"
+        ))),
     }
 }
 
@@ -577,6 +645,7 @@ fn main() -> ExitCode {
     let mut manager = None;
     let mut write_prefix = None;
     let mut cwd = None;
+    let mut scope_root = None;
     let mut config_path = None;
     let mut rest = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -622,6 +691,16 @@ fn main() -> ExitCode {
                     return fail(json_mode, "invalid_argument", "--cwd needs an argument");
                 };
                 cwd = Some(spec);
+            }
+            _ if arg == "--scope-root" || arg.starts_with("--scope-root=") => {
+                let Some(spec) = take_flag_value(&arg, "--scope-root", &mut args) else {
+                    return fail(
+                        json_mode,
+                        "invalid_argument",
+                        "--scope-root needs an argument",
+                    );
+                };
+                scope_root = Some(spec);
             }
             _ if arg == "--config" || arg.starts_with("--config=") => {
                 let Some(spec) = take_flag_value(&arg, "--config", &mut args) else {
@@ -685,7 +764,7 @@ fn main() -> ExitCode {
     let cwd_ref = Some(cwd.as_str());
     if group == "tui" {
         remaining_flags(&rest).ok();
-        return match tui::run(cwd_ref) {
+        return match tui::run(scope_root.as_deref(), cwd_ref) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(json_mode, "error", &e.0),
         };
@@ -702,12 +781,22 @@ fn main() -> ExitCode {
         "inspect" => from_result(json_mode, run_inspect(&cmd, &mut rest)),
         "control" => from_result(json_mode, run_control(&cmd, &mut rest, cwd_ref)),
         "author" => from_result(json_mode, run_author(&cmd, &mut rest, cwd_ref)),
-        "scope" => from_result(json_mode, run_scope(&cmd, &mut rest, cwd_ref)),
-        "operator" => from_result(json_mode, run_operator(&cmd, &mut rest, cwd_ref)),
+        "scope" => from_result(
+            json_mode,
+            run_scope(&cmd, &mut rest, scope_root.as_deref(), cwd_ref),
+        ),
+        "operator" => from_result(
+            json_mode,
+            run_operator(&cmd, &mut rest, scope_root.as_deref(), cwd_ref),
+        ),
+        "automation" => from_result(
+            json_mode,
+            run_automation(&cmd, &mut rest, scope_root.as_deref(), cwd_ref),
+        ),
         other => fail(
             json_mode,
             "invalid_argument",
-            &format!("unknown command '{other}' (inspect, control, author, scope, operator, tui)"),
+            &format!("unknown command '{other}' (inspect, control, author, scope, operator, automation, tui)"),
         ),
     }
 }
@@ -729,5 +818,14 @@ mod tests {
         let got = process_cwd(None).unwrap();
         let here = std::env::current_dir().unwrap();
         assert_eq!(got, here.to_string_lossy());
+    }
+
+    #[test]
+    fn usage_lists_scope_root_and_iterations() {
+        assert!(USAGE.contains("--scope-root <path>"));
+        assert!(USAGE.contains("operator iteration-start --unit STEM"));
+        assert!(
+            USAGE.contains("operator iteration-finish --unit STEM --iteration ID --exit-code N")
+        );
     }
 }

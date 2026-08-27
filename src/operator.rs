@@ -1,18 +1,19 @@
 //! Project-local advisory operator commentary.
 //!
-//! Stored under `<scope-root>/.systemd-ops/operator/<stem>.json`.
-//! Soft state only: never mutates systemd, never feeds health, never
-//! goes through plan/apply. Deleting the directory leaves operations
-//! operationally unchanged.
+//! Stored under `<scope-root>/.systemd-ops/<stem>/state/operator.json`.
+//! The former `.systemd-ops/operator/<stem>.json` location is read-only
+//! compatibility and is migrated after the next successful write.
+//! Soft state never feeds objective operation or scope health.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
-use crate::config;
 use crate::scope::{self, ScopeManifest};
 use crate::sha256::sha256_hex;
 use crate::systemd::{self, BackendError};
@@ -23,9 +24,15 @@ pub const MAX_HEADLINE: usize = 256;
 pub const MAX_BODY: usize = 8_000;
 pub const MAX_ACTIVITY_TEXT: usize = 1_000;
 pub const MAX_ACTIVITY: usize = 100;
+pub const MAX_ITERATIONS: usize = 20;
+pub const MAX_AUTOMATION_HEADLINE: usize = 80;
+pub const MIN_AUTOMATION_SUMMARY_ITEMS: usize = 1;
+pub const MAX_AUTOMATION_SUMMARY_ITEMS: usize = 5;
+pub const MAX_AUTOMATION_SUMMARY_ITEM: usize = 280;
+pub const MAX_AUTOMATION_ACTIVITY: usize = 200;
 
 const DIR_NAME: &str = ".systemd-ops";
-const OPERATOR_DIR: &str = "operator";
+const LEGACY_OPERATOR_DIR: &str = "operator";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperatorState {
@@ -55,6 +62,25 @@ pub struct OperatorActivity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveIteration {
+    pub id: String,
+    pub started_at: String,
+    pub observed_updated_at: Option<String>,
+    pub reported_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperatorIteration {
+    pub id: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub exit_code: Option<i32>,
+    pub reconsolidated: bool,
+    pub headline: Option<String>,
+    pub summary: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OperatorSurface {
     pub version: u32,
     pub about: Option<String>,
@@ -63,6 +89,8 @@ pub struct OperatorSurface {
     pub updated_at: Option<String>,
     pub basis_revision: Option<String>,
     pub activity: Vec<OperatorActivity>,
+    pub active_iteration: Option<ActiveIteration>,
+    pub iterations: Vec<OperatorIteration>,
 }
 
 impl OperatorSurface {
@@ -78,10 +106,28 @@ impl OperatorSurface {
                 "at": a.at,
                 "text": a.text,
             })).collect::<Vec<_>>(),
+            "active_iteration": self.active_iteration.as_ref().map(|iteration| json!({
+                "id": iteration.id,
+                "started_at": iteration.started_at,
+                "observed_updated_at": iteration.observed_updated_at,
+                "reported_at": iteration.reported_at,
+            })),
+            "iterations": self.iterations.iter().map(|iteration| json!({
+                "id": iteration.id,
+                "started_at": iteration.started_at,
+                "finished_at": iteration.finished_at,
+                "exit_code": iteration.exit_code,
+                "reconsolidated": iteration.reconsolidated,
+                "headline": iteration.headline,
+                "summary": iteration.summary,
+            })).collect::<Vec<_>>(),
         })
     }
 }
 
+// Successful loads dominate this CLI-only path. Keep the value inline rather than
+// allocating every parsed operator surface solely to shrink the error variant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum OperatorLoad {
     Missing,
@@ -101,12 +147,18 @@ pub fn derive_state(load: &OperatorLoad, definition_revision: Option<&str>) -> O
     }
 }
 
-pub fn operator_dir(root: &Path) -> PathBuf {
-    root.join(DIR_NAME).join(OPERATOR_DIR)
+pub fn operator_dir(root: &Path, stem: &str) -> PathBuf {
+    root.join(DIR_NAME).join(stem).join("state")
 }
 
 pub fn operator_path(root: &Path, stem: &str) -> PathBuf {
-    operator_dir(root).join(format!("{stem}.json"))
+    operator_dir(root, stem).join("operator.json")
+}
+
+pub fn legacy_operator_path(root: &Path, stem: &str) -> PathBuf {
+    root.join(DIR_NAME)
+        .join(LEGACY_OPERATOR_DIR)
+        .join(format!("{stem}.json"))
 }
 
 pub fn validate_stem(stem: &str) -> Result<(), BackendError> {
@@ -133,18 +185,40 @@ pub fn require_owned(manifest: &ScopeManifest, stem: &str) -> Result<(), Backend
     }
 }
 
-pub fn load(root: &Path, stem: &str) -> OperatorLoad {
-    let path = operator_path(root, stem);
-    if !path.exists() {
-        return OperatorLoad::Missing;
+fn selected_path(root: &Path, stem: &str) -> (PathBuf, Option<String>) {
+    let canonical = operator_path(root, stem);
+    let legacy = legacy_operator_path(root, stem);
+    if canonical.exists() {
+        let warning = legacy.exists().then(|| {
+            format!(
+                "canonical operator state {} wins over legacy {}",
+                canonical.display(),
+                legacy.display()
+            )
+        });
+        (canonical, warning)
+    } else {
+        (legacy, None)
     }
-    match fs::read(&path) {
+}
+
+pub fn load_with_warning(root: &Path, stem: &str) -> (OperatorLoad, Option<String>) {
+    let (path, warning) = selected_path(root, stem);
+    if !path.exists() {
+        return (OperatorLoad::Missing, warning);
+    }
+    let load = match fs::read(&path) {
         Ok(bytes) => match parse_surface(&bytes) {
             Ok(surface) => OperatorLoad::Ready(surface),
             Err(e) => OperatorLoad::Error(e.0),
         },
         Err(e) => OperatorLoad::Error(format!("cannot read {}: {e}", path.display())),
-    }
+    };
+    (load, warning)
+}
+
+pub fn load(root: &Path, stem: &str) -> OperatorLoad {
+    load_with_warning(root, stem).0
 }
 
 pub fn parse_surface(bytes: &[u8]) -> Result<OperatorSurface, BackendError> {
@@ -162,30 +236,30 @@ pub fn parse_surface(bytes: &[u8]) -> Result<OperatorSurface, BackendError> {
             "unsupported operator state version {version}"
         )));
     }
-    let activity = match obj.get("activity") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|item| {
-                let at = item
-                    .get("at")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| BackendError("activity entry missing at".into()))?
-                    .to_string();
-                let text = item
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| BackendError("activity entry missing text".into()))?
-                    .to_string();
-                Ok(OperatorActivity { at, text })
-            })
-            .collect::<Result<Vec<_>, BackendError>>()?,
+    let activity = parse_activity(obj)?;
+    let active_iteration = match obj.get("active_iteration") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(item)) => Some(ActiveIteration {
+            id: required_string(item, "id", "active iteration")?,
+            started_at: required_string(item, "started_at", "active iteration")?,
+            observed_updated_at: opt_string(item, "observed_updated_at"),
+            reported_at: opt_string(item, "reported_at"),
+        }),
         Some(_) => {
             return Err(BackendError(
-                "operator activity must be an array of {{at,text}}".into(),
+                "active_iteration must be an object or null".into(),
             ))
         }
     };
+    let mut iterations = match obj.get("iterations") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(parse_iteration)
+            .collect::<Result<Vec<_>, BackendError>>()?,
+        Some(_) => return Err(BackendError("iterations must be an array".into())),
+    };
+    iterations.truncate(MAX_ITERATIONS);
     Ok(OperatorSurface {
         version: VERSION,
         about: opt_string(obj, "about"),
@@ -194,6 +268,72 @@ pub fn parse_surface(bytes: &[u8]) -> Result<OperatorSurface, BackendError> {
         updated_at: opt_string(obj, "updated_at"),
         basis_revision: opt_string(obj, "basis_revision"),
         activity,
+        active_iteration,
+        iterations,
+    })
+}
+
+fn parse_activity(obj: &Map<String, Value>) -> Result<Vec<OperatorActivity>, BackendError> {
+    match obj.get("activity") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                let item = item
+                    .as_object()
+                    .ok_or_else(|| BackendError("activity entry must be an object".into()))?;
+                Ok(OperatorActivity {
+                    at: required_string(item, "at", "activity entry")?,
+                    text: required_string(item, "text", "activity entry")?,
+                })
+            })
+            .collect(),
+        Some(_) => Err(BackendError(
+            "operator activity must be an array of {at,text}".into(),
+        )),
+    }
+}
+
+fn required_string(
+    obj: &Map<String, Value>,
+    key: &str,
+    context: &str,
+) -> Result<String, BackendError> {
+    obj.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| BackendError(format!("{context} missing {key}")))
+}
+
+fn parse_iteration(value: &Value) -> Result<OperatorIteration, BackendError> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| BackendError("iteration entry must be an object".into()))?;
+    let exit_code = match obj.get("exit_code") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(|| BackendError("iteration exit_code must be a 32-bit integer".into()))
+            .map(Some)?,
+        Some(_) => {
+            return Err(BackendError(
+                "iteration exit_code must be an integer or null".into(),
+            ))
+        }
+    };
+    Ok(OperatorIteration {
+        id: required_string(obj, "id", "iteration")?,
+        started_at: required_string(obj, "started_at", "iteration")?,
+        finished_at: opt_string(obj, "finished_at"),
+        exit_code,
+        reconsolidated: obj
+            .get("reconsolidated")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| BackendError("iteration missing reconsolidated".into()))?,
+        headline: opt_string(obj, "headline"),
+        summary: opt_string(obj, "summary"),
     })
 }
 
@@ -212,19 +352,41 @@ fn bound(field: &str, text: &str, max: usize) -> Result<String, BackendError> {
     }
     Ok(text.to_string())
 }
-
 fn now_stamp() -> String {
-    config::unix_to_rfc3339(config::now_unix())
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    systemd::usec_to_rfc3339(micros)
 }
 
-fn ensure_dirs(root: &Path) -> Result<PathBuf, BackendError> {
+fn new_iteration_id() -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("it-{nanos:032x}-{:08x}-{sequence:016x}", std::process::id())
+}
+
+fn ensure_dirs(root: &Path, stem: &str) -> Result<PathBuf, BackendError> {
     let base = root.join(DIR_NAME);
+    refuse_symlink(&base)?;
     if !base.exists() {
         fs::create_dir(&base)
             .map_err(|e| BackendError(format!("mkdir {}: {e}", base.display())))?;
         let _ = fs::set_permissions(&base, fs::Permissions::from_mode(0o700));
     }
-    let dir = base.join(OPERATOR_DIR);
+    let operation = base.join(stem);
+    refuse_symlink(&operation)?;
+    if !operation.exists() {
+        fs::create_dir(&operation)
+            .map_err(|e| BackendError(format!("mkdir {}: {e}", operation.display())))?;
+        let _ = fs::set_permissions(&operation, fs::Permissions::from_mode(0o700));
+    }
+    let dir = operation.join("state");
+    refuse_symlink(&dir)?;
     if !dir.exists() {
         fs::create_dir(&dir).map_err(|e| BackendError(format!("mkdir {}: {e}", dir.display())))?;
         let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
@@ -305,11 +467,312 @@ pub fn definition_revision_from_paths(paths: &[String]) -> Option<String> {
     Some(format!("sha256:{}", sha256_hex(&buf)))
 }
 
-pub fn show(cwd: Option<&str>, stem: &str) -> Result<Value, BackendError> {
-    let manifest = scope::discover_from_cwd(cwd)?;
+fn empty_surface() -> OperatorSurface {
+    OperatorSurface {
+        version: VERSION,
+        about: None,
+        headline: None,
+        body: None,
+        updated_at: None,
+        basis_revision: None,
+        activity: Vec::new(),
+        active_iteration: None,
+        iterations: Vec::new(),
+    }
+}
+
+fn resolved_manifest(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<ScopeManifest, BackendError> {
+    let env_root = std::env::var("SYSTEMD_OPS_SCOPE_ROOT").ok();
+    scope::resolve(explicit_root, env_root.as_deref(), cwd)
+}
+fn bound_operation() -> Result<String, BackendError> {
+    let stem = std::env::var("SYSTEMD_OPS_OPERATION").map_err(|_| {
+        BackendError("SYSTEMD_OPS_OPERATION is required for automation commands".into())
+    })?;
+    if stem.is_empty() {
+        return Err(BackendError(
+            "SYSTEMD_OPS_OPERATION is required for automation commands".into(),
+        ));
+    }
+    validate_stem(&stem)?;
+    Ok(stem)
+}
+
+fn bound_manifest(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<(ScopeManifest, String), BackendError> {
+    let manifest = resolved_manifest(explicit_root, cwd)?;
+    let stem = bound_operation()?;
+    require_owned(&manifest, &stem)?;
+    Ok((manifest, stem))
+}
+
+fn strict_single_line(label: &str, value: &str, max: usize) -> Result<String, BackendError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(BackendError(format!("{label} must not be empty")));
+    }
+    if value.contains(['\n', '\r']) {
+        return Err(BackendError(format!("{label} must be a single line")));
+    }
+    if value.chars().count() > max {
+        return Err(BackendError(format!("{label} exceeds {max} characters")));
+    }
+    Ok(value.to_string())
+}
+
+fn strict_summary(items: &[String]) -> Result<Vec<String>, BackendError> {
+    if !(MIN_AUTOMATION_SUMMARY_ITEMS..=MAX_AUTOMATION_SUMMARY_ITEMS).contains(&items.len()) {
+        return Err(BackendError(format!(
+            "summary must contain {MIN_AUTOMATION_SUMMARY_ITEMS}..{MAX_AUTOMATION_SUMMARY_ITEMS} paragraphs"
+        )));
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let item = item.trim();
+            if item.is_empty() {
+                return Err(BackendError(format!(
+                    "summary paragraph {} must not be empty",
+                    index + 1
+                )));
+            }
+            if item.contains(['\n', '\r']) {
+                return Err(BackendError(format!(
+                    "summary paragraph {} must be one paragraph",
+                    index + 1
+                )));
+            }
+            if item.chars().count() > MAX_AUTOMATION_SUMMARY_ITEM {
+                return Err(BackendError(format!(
+                    "summary paragraph {} exceeds {} characters",
+                    index + 1,
+                    MAX_AUTOMATION_SUMMARY_ITEM
+                )));
+            }
+            Ok(item.to_string())
+        })
+        .collect()
+}
+
+pub fn automation_context(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let (manifest, stem) = bound_manifest(explicit_root, cwd)?;
+    let view = crate::scope::show_manifest(&manifest)?;
+    let operation = view
+        .owned
+        .iter()
+        .find(|operation| operation.get("unit").and_then(Value::as_str) == Some(stem.as_str()))
+        .ok_or_else(|| {
+            BackendError(format!(
+                "bound operation '{stem}' is not present in the scope"
+            ))
+        })?;
+    let operator = operation.get("operator").cloned().unwrap_or(Value::Null);
+    Ok(json!({
+        "scope": {
+            "id": manifest.id,
+            "root": manifest.root.to_string_lossy(),
+        },
+        "operation": {
+            "unit": stem,
+            "title": operation.get("title").cloned().unwrap_or(Value::Null),
+            "purpose": operation.get("purpose").cloned().unwrap_or(Value::Null),
+            "health": operation.get("health").cloned().unwrap_or(Value::Null),
+            "operator_state": operation.get("operator_state").cloned().unwrap_or(Value::Null),
+            "definition_revision": operation.get("definition_revision").cloned().unwrap_or(Value::Null),
+        },
+        "runtime": {
+            "state": operation.get("state").cloned().unwrap_or(Value::Null),
+            "substate": operation.get("sub").cloned().unwrap_or(Value::Null),
+            "last": operation.get("last").cloned().unwrap_or(Value::Null),
+            "last_result": operation.get("last_result").cloned().unwrap_or(Value::Null),
+            "next": operation.get("next").cloned().unwrap_or(Value::Null),
+            "activation": operation.get("activation").cloned().unwrap_or(Value::Null),
+            "kind": operation.get("kind").cloned().unwrap_or(Value::Null),
+        },
+        "current_report": {
+            "headline": operator.get("headline").cloned().unwrap_or(Value::Null),
+            "summary": operator.get("body").cloned().unwrap_or(Value::Null),
+            "updated_at": operator.get("updated_at").cloned().unwrap_or(Value::Null),
+            "basis_revision": operator.get("basis_revision").cloned().unwrap_or(Value::Null),
+        },
+        "active_iteration": operator.get("active_iteration").cloned().unwrap_or(Value::Null),
+        "iterations": operator.get("iterations").cloned().unwrap_or_else(|| json!([])),
+        "activity": operator.get("activity").cloned().unwrap_or_else(|| json!([])),
+    }))
+}
+
+pub fn automation_report(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+    headline: &str,
+    summary: &[String],
+) -> Result<Value, BackendError> {
+    let headline = strict_single_line("headline", headline, MAX_AUTOMATION_HEADLINE)?;
+    let summary = strict_summary(summary)?;
+    let body = summary.join("\n\n");
+    let (manifest, stem) = bound_manifest(explicit_root, cwd)?;
+    let (load, warning) = load_with_warning(&manifest.root, &stem);
+    let mut surface = match load {
+        OperatorLoad::Ready(surface) => surface,
+        OperatorLoad::Missing => empty_surface(),
+        OperatorLoad::Error(message) => {
+            return Err(BackendError(format!(
+                "operator state for '{stem}' is malformed: {message}"
+            )))
+        }
+    };
+    let now = now_stamp();
+    let active = surface.active_iteration.as_mut().ok_or_else(|| {
+        BackendError("automation_report requires an active agent iteration".into())
+    })?;
+    surface.headline = Some(headline);
+    surface.body = Some(body);
+    surface.updated_at = Some(now.clone());
+    surface.basis_revision = current_definition_revision(&manifest, &stem);
+    active.reported_at = Some(now);
+    finish_write(&manifest.root, &stem, &surface)?;
+    Ok(json!({
+        "unit": stem,
+        "operator": surface.to_json(),
+        "definition_revision": surface.basis_revision,
+        "warning": warning,
+        "reported": true,
+    }))
+}
+
+pub fn automation_activity(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+    text: &str,
+) -> Result<Value, BackendError> {
+    let text = strict_single_line("activity text", text, MAX_AUTOMATION_ACTIVITY)?;
+    let (manifest, stem) = bound_manifest(explicit_root, cwd)?;
+    let (load, warning) = load_with_warning(&manifest.root, &stem);
+    let mut surface = match load {
+        OperatorLoad::Ready(surface) => surface,
+        OperatorLoad::Missing => empty_surface(),
+        OperatorLoad::Error(message) => {
+            return Err(BackendError(format!(
+                "operator state for '{stem}' is malformed: {message}"
+            )))
+        }
+    };
+    if surface.active_iteration.is_none() {
+        return Err(BackendError(
+            "automation_activity requires an active agent iteration".into(),
+        ));
+    }
+    surface.activity.push(OperatorActivity {
+        at: now_stamp(),
+        text,
+    });
+    if surface.activity.len() > MAX_ACTIVITY {
+        let drop = surface.activity.len() - MAX_ACTIVITY;
+        surface.activity.drain(0..drop);
+    }
+    finish_write(&manifest.root, &stem, &surface)?;
+    Ok(json!({
+        "unit": stem,
+        "operator": surface.to_json(),
+        "warning": warning,
+        "appended": true,
+    }))
+}
+
+fn finish_write(root: &Path, stem: &str, surface: &OperatorSurface) -> Result<(), BackendError> {
+    ensure_dirs(root, stem)?;
+    let canonical = operator_path(root, stem);
+    let legacy = legacy_operator_path(root, stem);
+    refuse_symlink(&canonical)?;
+    refuse_symlink(&legacy)?;
+    atomic_write(&canonical, surface)?;
+    if legacy.exists() {
+        fs::remove_file(&legacy)
+            .map_err(|e| BackendError(format!("remove migrated {}: {e}", legacy.display())))?;
+    }
+    Ok(())
+}
+
+fn push_iteration(surface: &mut OperatorSurface, iteration: OperatorIteration) {
+    surface.iterations.insert(0, iteration);
+    surface.iterations.truncate(MAX_ITERATIONS);
+}
+
+fn start_iteration(surface: &mut OperatorSurface, id: String, started_at: String) {
+    if let Some(abandoned) = surface.active_iteration.take() {
+        push_iteration(
+            surface,
+            OperatorIteration {
+                id: abandoned.id,
+                started_at: abandoned.started_at,
+                finished_at: None,
+                exit_code: None,
+                reconsolidated: false,
+                headline: None,
+                summary: None,
+            },
+        );
+    }
+    surface.active_iteration = Some(ActiveIteration {
+        id,
+        started_at,
+        observed_updated_at: surface.updated_at.clone(),
+        reported_at: None,
+    });
+}
+
+fn finish_iteration(
+    surface: &mut OperatorSurface,
+    iteration_id: &str,
+    exit_code: i32,
+    finished_at: String,
+) -> Result<bool, BackendError> {
+    let active = surface
+        .active_iteration
+        .take()
+        .ok_or_else(|| BackendError("no active iteration to finish".into()))?;
+    if active.id != iteration_id {
+        let actual = active.id.clone();
+        surface.active_iteration = Some(active);
+        return Err(BackendError(format!(
+            "active iteration is '{actual}', not '{iteration_id}'"
+        )));
+    }
+    let reconsolidated = exit_code == 0 && active.reported_at.is_some();
+    let headline = reconsolidated.then(|| surface.headline.clone()).flatten();
+    let summary = reconsolidated.then(|| surface.body.clone()).flatten();
+    push_iteration(
+        surface,
+        OperatorIteration {
+            id: active.id,
+            started_at: active.started_at,
+            finished_at: Some(finished_at),
+            exit_code: Some(exit_code),
+            reconsolidated,
+            headline,
+            summary,
+        },
+    );
+    Ok(reconsolidated)
+}
+pub fn show(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+    stem: &str,
+) -> Result<Value, BackendError> {
+    let manifest = resolved_manifest(explicit_root, cwd)?;
     require_owned(&manifest, stem)?;
     let definition_revision = current_definition_revision(&manifest, stem);
-    let load = load(&manifest.root, stem);
+    let (load, warning) = load_with_warning(&manifest.root, stem);
     let state = derive_state(&load, definition_revision.as_deref());
     match load {
         OperatorLoad::Missing => Ok(json!({
@@ -317,12 +780,14 @@ pub fn show(cwd: Option<&str>, stem: &str) -> Result<Value, BackendError> {
             "operator": Value::Null,
             "operator_state": state.as_str(),
             "definition_revision": definition_revision,
+            "warning": warning,
         })),
         OperatorLoad::Ready(surface) => Ok(json!({
             "unit": stem,
             "operator": surface.to_json(),
             "operator_state": state.as_str(),
             "definition_revision": definition_revision,
+            "warning": warning,
         })),
         OperatorLoad::Error(msg) => Err(BackendError(format!(
             "operator state for '{stem}' is malformed: {msg}"
@@ -365,6 +830,7 @@ fn current_definition_revision(manifest: &ScopeManifest, stem: &str) -> Option<S
 }
 
 pub fn set(
+    explicit_root: Option<&str>,
     cwd: Option<&str>,
     stem: &str,
     about: Option<String>,
@@ -376,21 +842,12 @@ pub fn set(
             "operator set requires at least one of --about, --headline, --body".into(),
         ));
     }
-    let manifest = scope::discover_from_cwd(cwd)?;
+    let manifest = resolved_manifest(explicit_root, cwd)?;
     require_owned(&manifest, stem)?;
-    ensure_dirs(&manifest.root)?;
-    let path = operator_path(&manifest.root, stem);
-    let mut surface = match load(&manifest.root, stem) {
+    let (load, warning) = load_with_warning(&manifest.root, stem);
+    let mut surface = match load {
         OperatorLoad::Ready(s) => s,
-        OperatorLoad::Missing | OperatorLoad::Error(_) => OperatorSurface {
-            version: VERSION,
-            about: None,
-            headline: None,
-            body: None,
-            updated_at: None,
-            basis_revision: None,
-            activity: Vec::new(),
-        },
+        OperatorLoad::Missing | OperatorLoad::Error(_) => empty_surface(),
     };
     if let Some(v) = about {
         surface.about = Some(bound("about", &v, MAX_ABOUT)?).filter(|s| !s.is_empty());
@@ -404,7 +861,7 @@ pub fn set(
     surface.version = VERSION;
     surface.updated_at = Some(now_stamp());
     surface.basis_revision = current_definition_revision(&manifest, stem);
-    atomic_write(&path, &surface)?;
+    finish_write(&manifest.root, stem, &surface)?;
     Ok(json!({
         "unit": stem,
         "operator": surface.to_json(),
@@ -413,30 +870,27 @@ pub fn set(
             surface.basis_revision.as_deref()
         ).as_str(),
         "definition_revision": surface.basis_revision,
+        "warning": warning,
         "written": true,
     }))
 }
 
-pub fn append(cwd: Option<&str>, stem: &str, text: &str) -> Result<Value, BackendError> {
+pub fn append(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+    stem: &str,
+    text: &str,
+) -> Result<Value, BackendError> {
     let text = bound("activity.text", text, MAX_ACTIVITY_TEXT)?;
     if text.is_empty() {
         return Err(BackendError("activity text must not be empty".into()));
     }
-    let manifest = scope::discover_from_cwd(cwd)?;
+    let manifest = resolved_manifest(explicit_root, cwd)?;
     require_owned(&manifest, stem)?;
-    ensure_dirs(&manifest.root)?;
-    let path = operator_path(&manifest.root, stem);
-    let mut surface = match load(&manifest.root, stem) {
+    let (load, warning) = load_with_warning(&manifest.root, stem);
+    let mut surface = match load {
         OperatorLoad::Ready(s) => s,
-        OperatorLoad::Missing => OperatorSurface {
-            version: VERSION,
-            about: None,
-            headline: None,
-            body: None,
-            updated_at: None,
-            basis_revision: None,
-            activity: Vec::new(),
-        },
+        OperatorLoad::Missing => empty_surface(),
         OperatorLoad::Error(msg) => {
             return Err(BackendError(format!(
                 "operator state for '{stem}' is malformed: {msg}"
@@ -451,31 +905,101 @@ pub fn append(cwd: Option<&str>, stem: &str, text: &str) -> Result<Value, Backen
         let drop = surface.activity.len() - MAX_ACTIVITY;
         surface.activity.drain(0..drop);
     }
-    atomic_write(&path, &surface)?;
+    finish_write(&manifest.root, stem, &surface)?;
+    let definition_revision = current_definition_revision(&manifest, stem);
     Ok(json!({
         "unit": stem,
         "operator": surface.to_json(),
         "operator_state": derive_state(
             &OperatorLoad::Ready(surface.clone()),
-            current_definition_revision(&manifest, stem).as_deref()
+            definition_revision.as_deref()
         ).as_str(),
-        "definition_revision": current_definition_revision(&manifest, stem),
+        "definition_revision": definition_revision,
+        "warning": warning,
         "appended": true,
     }))
 }
 
-pub fn clear(cwd: Option<&str>, stem: &str) -> Result<Value, BackendError> {
-    let manifest = scope::discover_from_cwd(cwd)?;
+pub fn iteration_start(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+    stem: &str,
+) -> Result<Value, BackendError> {
+    let manifest = resolved_manifest(explicit_root, cwd)?;
     require_owned(&manifest, stem)?;
-    let path = operator_path(&manifest.root, stem);
-    refuse_symlink(&path)?;
-    let removed = if path.exists() {
-        fs::remove_file(&path)
-            .map_err(|e| BackendError(format!("remove {}: {e}", path.display())))?;
-        true
-    } else {
-        false
+    let (load, warning) = load_with_warning(&manifest.root, stem);
+    let mut surface = match load {
+        OperatorLoad::Ready(s) => s,
+        OperatorLoad::Missing => empty_surface(),
+        OperatorLoad::Error(msg) => {
+            return Err(BackendError(format!(
+                "operator state for '{stem}' is malformed: {msg}"
+            )))
+        }
     };
+    let iteration_id = new_iteration_id();
+    start_iteration(&mut surface, iteration_id.clone(), now_stamp());
+    finish_write(&manifest.root, stem, &surface)?;
+    Ok(json!({
+        "unit": stem,
+        "iteration_id": iteration_id,
+        "operator": surface.to_json(),
+        "warning": warning,
+        "started": true,
+    }))
+}
+
+pub fn iteration_finish(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+    stem: &str,
+    iteration_id: &str,
+    exit_code: i32,
+) -> Result<Value, BackendError> {
+    let manifest = resolved_manifest(explicit_root, cwd)?;
+    require_owned(&manifest, stem)?;
+    let (load, warning) = load_with_warning(&manifest.root, stem);
+    let mut surface = match load {
+        OperatorLoad::Ready(s) => s,
+        OperatorLoad::Missing => return Err(BackendError("no active iteration to finish".into())),
+        OperatorLoad::Error(msg) => {
+            return Err(BackendError(format!(
+                "operator state for '{stem}' is malformed: {msg}"
+            )))
+        }
+    };
+    let reconsolidated = finish_iteration(&mut surface, iteration_id, exit_code, now_stamp())?;
+    finish_write(&manifest.root, stem, &surface)?;
+    Ok(json!({
+        "unit": stem,
+        "iteration_id": iteration_id,
+        "exit_code": exit_code,
+        "reconsolidated": reconsolidated,
+        "operator": surface.to_json(),
+        "warning": warning,
+        "finished": true,
+    }))
+}
+
+pub fn clear(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+    stem: &str,
+) -> Result<Value, BackendError> {
+    let manifest = resolved_manifest(explicit_root, cwd)?;
+    require_owned(&manifest, stem)?;
+    let canonical = operator_path(&manifest.root, stem);
+    let legacy = legacy_operator_path(&manifest.root, stem);
+    refuse_symlink(&canonical)?;
+    refuse_symlink(&legacy)?;
+    let mut removed = false;
+    for path in [&canonical, &legacy] {
+        if path.exists() {
+            fs::remove_file(path)
+                .map_err(|e| BackendError(format!("remove {}: {e}", path.display())))?;
+            removed = true;
+        }
+    }
     Ok(json!({
         "unit": stem,
         "removed": removed,
@@ -490,11 +1014,11 @@ pub fn join_for_scope(
     stem: &str,
     definition_revision: Option<&str>,
 ) -> (Value, OperatorState, Option<String>) {
-    let load = load(root, stem);
+    let (load, warning) = load_with_warning(root, stem);
     let state = derive_state(&load, definition_revision);
     match load {
-        OperatorLoad::Missing => (Value::Null, state, None),
-        OperatorLoad::Ready(surface) => (surface.to_json(), state, None),
+        OperatorLoad::Missing => (Value::Null, state, warning),
+        OperatorLoad::Ready(surface) => (surface.to_json(), state, warning),
         OperatorLoad::Error(msg) => (
             Value::Null,
             OperatorState::Error,
@@ -548,7 +1072,7 @@ mod tests {
             derive_state(&OperatorLoad::Missing, Some("sha256:abc")),
             OperatorState::Missing
         );
-        ensure_dirs(&m.root).unwrap();
+        ensure_dirs(&m.root, stem).unwrap();
         let mut surface = OperatorSurface {
             version: VERSION,
             about: Some("about".into()),
@@ -560,6 +1084,8 @@ mod tests {
                 at: "t0".into(),
                 text: "started".into(),
             }],
+            active_iteration: None,
+            iterations: Vec::new(),
         };
         atomic_write(&operator_path(&m.root, stem), &surface).unwrap();
         surface.headline = Some("now".into());
@@ -583,7 +1109,7 @@ mod tests {
         let root = tmp_root();
         let m = manifest(&root);
         let stem = "managed-personal-bad";
-        ensure_dirs(&m.root).unwrap();
+        ensure_dirs(&m.root, stem).unwrap();
         fs::write(operator_path(&m.root, stem), b"{not json").unwrap();
         match load(&m.root, stem) {
             OperatorLoad::Error(_) => {}
@@ -601,7 +1127,7 @@ mod tests {
         let root = tmp_root();
         let m = manifest(&root);
         let stem = "managed-personal-trim";
-        ensure_dirs(&m.root).unwrap();
+        ensure_dirs(&m.root, stem).unwrap();
         let mut surface = OperatorSurface {
             version: VERSION,
             about: Some("a".into()),
@@ -610,6 +1136,8 @@ mod tests {
             updated_at: Some("frozen".into()),
             basis_revision: Some("sha256:keep".into()),
             activity: Vec::new(),
+            active_iteration: None,
+            iterations: Vec::new(),
         };
         for i in 0..(MAX_ACTIVITY + 5) {
             surface.activity.push(OperatorActivity {
@@ -639,7 +1167,8 @@ mod tests {
     fn clear_removes_only_requested() {
         let root = tmp_root();
         let m = manifest(&root);
-        ensure_dirs(&m.root).unwrap();
+        ensure_dirs(&m.root, "managed-personal-a").unwrap();
+        ensure_dirs(&m.root, "managed-personal-b").unwrap();
         let a = OperatorSurface {
             version: VERSION,
             about: Some("a".into()),
@@ -648,6 +1177,8 @@ mod tests {
             updated_at: None,
             basis_revision: None,
             activity: Vec::new(),
+            active_iteration: None,
+            iterations: Vec::new(),
         };
         atomic_write(&operator_path(&m.root, "managed-personal-a"), &a).unwrap();
         atomic_write(&operator_path(&m.root, "managed-personal-b"), &a).unwrap();
@@ -696,6 +1227,8 @@ mod tests {
                 updated_at: None,
                 basis_revision: basis.map(str::to_string),
                 activity: Vec::new(),
+                active_iteration: None,
+                iterations: Vec::new(),
             })
         };
         assert_eq!(
@@ -717,12 +1250,149 @@ mod tests {
     }
 
     #[test]
+    fn canonical_path_migration_and_coexistence_warning() {
+        let root = tmp_root();
+        let stem = "managed-personal-migrate";
+        let legacy = legacy_operator_path(&root, stem);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let mut surface = empty_surface();
+        surface.headline = Some("legacy".into());
+        atomic_write(&legacy, &surface).unwrap();
+        assert!(matches!(load(&root, stem), OperatorLoad::Ready(_)));
+        finish_write(&root, stem, &surface).unwrap();
+        assert!(operator_path(&root, stem).is_file());
+        assert!(!legacy.exists());
+
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, serde_json::to_vec(&surface.to_json()).unwrap()).unwrap();
+        let (_, warning) = load_with_warning(&root, stem);
+        assert!(warning.unwrap().contains("canonical operator state"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owned_gate_precedes_directory_creation() {
+        let root = tmp_root();
+        let m = manifest(&root);
+        assert!(require_owned(&m, "managed-other-nope").is_err());
+        assert!(!operator_path(&root, "managed-other-nope").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn iteration_success_nonzero_and_no_reconsolidation() {
+        let mut surface = empty_surface();
+        surface.updated_at = Some("brief-0".into());
+        surface.headline = Some("old headline".into());
+        surface.body = Some("old summary".into());
+        start_iteration(&mut surface, "it-a".into(), "start".into());
+        assert!(!finish_iteration(&mut surface, "it-a", 0, "finish".into()).unwrap());
+        assert_eq!(surface.iterations[0].exit_code, Some(0));
+        assert!(!surface.iterations[0].reconsolidated);
+        assert!(surface.iterations[0].headline.is_none());
+        assert!(surface.iterations[0].summary.is_none());
+
+        start_iteration(&mut surface, "it-b".into(), "start-2".into());
+        surface.active_iteration.as_mut().unwrap().reported_at = Some("brief-1".into());
+        assert!(!finish_iteration(&mut surface, "it-b", 17, "finish-2".into()).unwrap());
+        assert_eq!(surface.iterations[0].exit_code, Some(17));
+        assert!(!surface.iterations[0].reconsolidated);
+        assert!(surface.iterations[0].headline.is_none());
+        assert!(surface.iterations[0].summary.is_none());
+
+        start_iteration(&mut surface, "it-c".into(), "start-3".into());
+        surface.active_iteration.as_mut().unwrap().reported_at = Some("brief-2".into());
+        assert!(finish_iteration(&mut surface, "it-c", 0, "finish-3".into()).unwrap());
+        assert!(surface.iterations[0].reconsolidated);
+        assert_eq!(
+            surface.iterations[0].headline.as_deref(),
+            Some("old headline")
+        );
+
+        start_iteration(&mut surface, "it-d".into(), "start-4".into());
+        assert!(finish_iteration(&mut surface, "wrong", 0, "finish-4".into()).is_err());
+        assert_eq!(surface.active_iteration.as_ref().unwrap().id, "it-d");
+    }
+
+    #[test]
+    fn automation_report_schema_is_strict() {
+        assert_eq!(
+            strict_single_line("headline", " waiting ", MAX_AUTOMATION_HEADLINE).unwrap(),
+            "waiting"
+        );
+        assert!(strict_single_line("headline", "", MAX_AUTOMATION_HEADLINE).is_err());
+        assert!(strict_single_line("headline", "a\nb", MAX_AUTOMATION_HEADLINE).is_err());
+        assert!(strict_single_line(
+            "headline",
+            &"x".repeat(MAX_AUTOMATION_HEADLINE + 1),
+            MAX_AUTOMATION_HEADLINE
+        )
+        .is_err());
+
+        assert_eq!(strict_summary(&[" one ".into()]).unwrap(), ["one"]);
+        assert!(strict_summary(&[]).is_err());
+        assert!(strict_summary(&vec!["x".into(); MAX_AUTOMATION_SUMMARY_ITEMS + 1]).is_err());
+        assert!(strict_summary(&[" \t ".into()]).is_err());
+        assert!(strict_summary(&["one\ntwo".into()]).is_err());
+        assert!(strict_summary(&["x".repeat(MAX_AUTOMATION_SUMMARY_ITEM + 1)]).is_err());
+    }
+
+    #[test]
+    fn automation_activity_schema_is_strict() {
+        assert_eq!(
+            strict_single_line("activity text", " milestone ", MAX_AUTOMATION_ACTIVITY).unwrap(),
+            "milestone"
+        );
+        assert!(strict_single_line("activity text", "", MAX_AUTOMATION_ACTIVITY).is_err());
+        assert!(strict_single_line("activity text", "a\rb", MAX_AUTOMATION_ACTIVITY).is_err());
+        assert!(strict_single_line(
+            "activity text",
+            &"x".repeat(MAX_AUTOMATION_ACTIVITY + 1),
+            MAX_AUTOMATION_ACTIVITY
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn iteration_abandonment_and_trim_newest_first() {
+        let mut surface = empty_surface();
+        start_iteration(&mut surface, "abandoned".into(), "start".into());
+        start_iteration(&mut surface, "replacement".into(), "start-2".into());
+        assert_eq!(surface.active_iteration.as_ref().unwrap().id, "replacement");
+        assert_eq!(surface.iterations[0].id, "abandoned");
+        assert!(surface.iterations[0].finished_at.is_none());
+        assert!(surface.iterations[0].exit_code.is_none());
+
+        for i in 0..(MAX_ITERATIONS + 5) {
+            push_iteration(
+                &mut surface,
+                OperatorIteration {
+                    id: format!("it-{i}"),
+                    started_at: format!("s-{i}"),
+                    finished_at: Some(format!("f-{i}")),
+                    exit_code: Some(0),
+                    reconsolidated: false,
+                    headline: None,
+                    summary: None,
+                },
+            );
+        }
+        assert_eq!(surface.iterations.len(), MAX_ITERATIONS);
+        assert_eq!(
+            surface.iterations[0].id,
+            format!("it-{}", MAX_ITERATIONS + 4)
+        );
+        assert_eq!(surface.iterations.last().unwrap().id, "it-5");
+    }
+
+    #[test]
     fn refuses_symlink_target() {
         let root = tmp_root();
-        ensure_dirs(&root).unwrap();
+        let stem = "managed-personal-link";
+        ensure_dirs(&root, stem).unwrap();
         let real = root.join("real.json");
         fs::write(&real, b"{}").unwrap();
-        let link = operator_path(&root, "managed-personal-link");
+        let link = operator_path(&root, stem);
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let surface = OperatorSurface {
             version: VERSION,
@@ -732,6 +1402,8 @@ mod tests {
             updated_at: None,
             basis_revision: None,
             activity: Vec::new(),
+            active_iteration: None,
+            iterations: Vec::new(),
         };
         assert!(atomic_write(&link, &surface).is_err());
         let _ = fs::remove_dir_all(&root);

@@ -20,8 +20,8 @@ survives review.
 | `src/bin/systemd_ops_mcp.rs`| optional MCP frontend                                |
 | `src/mcp.rs`            | protocol, tool registry, MCP scope gating                |
 | `src/operations.rs`     | OperationSpec, OperationView, authoring plans            |
-| `src/scope.rs`          | `.systemd-ops.toml`, ScopeView, health aggregation       |
-| `src/tui.rs`            | read-only ratatui console over ScopeView                 |
+| `src/scope.rs`          | scope resolution, `.systemd-ops/scope.toml`, ScopeView, health |
+| `src/tui.rs`            | read-only ratatui cockpit over ScopeView                |
 | `src/sha256.rs`         | spec/file digest and HMAC-SHA256                         |
 | `src/token.rs`          | sealed plan tokens                                       |
 | `src/config.rs`         | local config, write-prefix, HMAC key                     |
@@ -32,6 +32,34 @@ survives review.
 | `omp/systemd.ts`        | OMP custom tools spawning `systemd-ops --json`           |
 | `docs/SCOPES.md`        | responsibility-scope / TUI contract                      |
 
+Scope paths have three distinct roles. The scope root contains the
+preferred `.systemd-ops/scope.toml` manifest; `.systemd-ops.toml` is
+legacy compatibility and same-root coexistence is an error. An operation
+home is `<scope-root>/.systemd-ops/<stem>/`. Execution cwd belongs to the
+systemd operation and is independent. Operation homes hold advisory state;
+unit files and systemd runtime remain operational truth.
+
+For direct CLI scope, operator, and TUI resolution, explicit
+`--scope-root` beats `SYSTEMD_OPS_SCOPE_ROOT`, which beats upward discovery
+from `--cwd` or the process cwd. Author and control provenance continue to
+use `--cwd`. Operator state is canonical at
+`.systemd-ops/<stem>/state/operator.json`. The legacy
+`.systemd-ops/operator/<stem>.json` is read only when canonical state is
+absent and migrates on the next successful write, which may remove it. If
+both exist, canonical wins with a warning and contents are not merged.
+
+The OMP adapter prefers session `ctx.cwd` over factory cwd, passes the
+resolved directory as both `systemd-ops --cwd` and child process cwd, and
+does not replace the inherited environment. `SYSTEMD_OPS_SCOPE_ROOT`
+therefore passes through without an adapter-specific parameter.
+
+Bound autonomous commands require both inherited
+`SYSTEMD_OPS_SCOPE_ROOT` and `SYSTEMD_OPS_OPERATION`. They accept no stem
+parameter and must pass the same owned gate as manual operator writes.
+`automation_report` is the only narrow command that marks an active iteration
+reported; activity remains insufficient. Iteration reconsolidation requires
+both a report from that exact active iteration and exit code zero.
+
 Actions are pinned by major tag and kept current by
 `.github/dependabot.yml`, not pinned by commit SHA. A SHA pin is
 stronger only while somebody bumps it; unattended it is a frozen old
@@ -41,8 +69,10 @@ bumping.
 Packaging surface, kept in step with the code: `Makefile` (install
 targets), `systemd-ops-mcp.1` (man page), `systemd-ops-mcp.socket` and
 `systemd-ops-mcp@.service` (the socket-activated pair), `CHANGELOG.md`,
-and `docs/PACKAGING.md`. A new flag or scope
-means updating the man page and the changelog too. `rust-version` in
+and `docs/PACKAGING.md`. A new MCP flag or capability scope means updating
+the MCP man page and changelog. Direct `systemd-ops` globals are documented
+in the CLI help and responsibility-scope docs; do not add them to the MCP
+man page as if the MCP binary accepted them. `rust-version` in
 `Cargo.toml` is a promise to packagers and CI checks it in both
 directions, so raising it is a deliberate act, not a side effect.
 
@@ -72,6 +102,14 @@ directions, so raising it is a deliberate act, not a side effect.
   call resolves them and clients are not required to show protocol
   errors to the model. Protocol errors are for an unknown tool or an
   ungranted scope.
+
+- **Advisory is health-neutral.** Briefs, activity, `active_iteration`,
+  and the latest 20 finished `iterations` describe operator work. They
+  do not feed operation or scope health. Timer activations, service runs,
+  and systemd checks are objective runtime, not iterations.
+- **Operation homes do not own systemd truth.** Never infer durable
+  configuration or execution state solely from files under an operation
+  home. Read the unit files and systemd backend.
 
 ## Building and testing
 

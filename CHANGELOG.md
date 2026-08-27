@@ -6,16 +6,56 @@ is what a downstream package has to care about.
 
 ## unreleased (not published)
 
-Operator cockpit substrate: project-local advisory soft state under
-`.systemd-ops/operator/<stem>.json` with `operator show|set|append|clear`.
-Owned ScopeView entries gain `definition_revision`, `operator`, and
-`operator_state` (`missing|unbased|current|outdated|error`). Attention
-items gain stable `code` (`operation_failed` / `operation_unknown`).
-ScopeView may carry non-fatal `warnings`. TUI default mode is the
-operator cockpit; `d` is wiring, `l` is diagnostics and no longer loads
-journald on open/selection. OMP adapter adds write-tier
-`systemd_operator` and inspect `operator_show`. Operator writes are
-direct soft state and do not use plan/apply; systemd mutations still do.
+Scope and operator substrate: the preferred manifest is now
+`.systemd-ops/scope.toml`; legacy `.systemd-ops.toml` remains readable,
+and same-root coexistence is an error. For scope, operator, and TUI
+commands, direct CLI `--scope-root` overrides `SYSTEMD_OPS_SCOPE_ROOT`,
+which overrides discovery from `--cwd` or the process cwd. Each operation
+home is `.systemd-ops/<stem>/`, distinct from the scope root and the unit's
+execution cwd. Operation homes hold advisory state only and do not replace
+systemd unit files or runtime truth.
+
+Operator state moves to the canonical
+`.systemd-ops/<stem>/state/operator.json`. The legacy
+`.systemd-ops/operator/<stem>.json` is read when canonical state is absent;
+the next successful write uses the canonical path and may remove legacy
+state. Canonical state wins with a warning if both exist. OperatorSurface
+v1 adds `active_iteration` and the latest 20 finished `iterations`.
+`operator iteration-start` and
+`operator iteration-finish` manage explicit advisory work sessions.
+Activity, iterations, and briefs remain objective-health-neutral and are
+distinct from systemd executions and checks.
+
+TUI default mode is the operator cockpit; `d` is wiring and `l` is
+diagnostics and no longer loads journald on open or selection. Cockpit
+content can be scrolled without changing the selected operation. OMP
+adapter calls prefer session cwd, pass it as CLI and process cwd, and
+inherit `SYSTEMD_OPS_SCOPE_ROOT` from the parent environment.
+Operator writes are direct soft state and do not use plan/apply; systemd
+mutations still do.
+
+Autonomous-operation surface: OMP now exposes strict, environment-bound
+`automation_context`, `automation_report`, and `automation_activity` tools.
+The commands accept no operation name and require `SYSTEMD_OPS_OPERATION` to
+resolve to an owned stem in the responsibility scope. Reports require a
+single-line headline of at most 80 characters and 1 to 5 single-paragraph
+summary strings of at most 280 characters; activity is one optional line of at
+most 200 characters. Successful reports stamp the definition basis. Activity
+alone does not reconsolidate an iteration, and a nonzero iteration exit is never
+reconsolidated even when a report was written.
+
+The TUI operation panel is labelled `AUTOMATIONS`. Owned-only scopes omit a
+redundant OWNED heading; mixed scopes retain OWNED and WATCHING sections. The
+cockpit preserves blank lines between report paragraphs, renders the report
+headline distinctly, supports mouse-wheel scrolling by list/detail/log region,
+and keeps selected detail visible above the independently toggled lazy logs
+drawer. Wiring is grouped into identity, responsibility, execution, and
+activation fields, including scope root, operation home, relationship, and brief
+basis.
+
+CLI and wrapper contract proofs cover environment-bound operation access,
+strict report/activity limits, report-required reconsolidation, fingerprint
+preservation on OMP/report/finish failure, and unchanged-fingerprint skips.
 
 TUI: unwrap `unit_logs` entries instead of dumping the JSON envelope;
 ops list on top, detail underneath, logs at the bottom quarter; NEXT
@@ -23,15 +63,15 @@ is a live `4m 12s` countdown redrawn every frame; hide empty WATCHING;
 pin failed ops first; compact detail; hide logs below 24 rows until
 asked; systemd state refreshes every 3s.
 
-Responsibility scopes: nearest `.systemd-ops.toml` walking up from cwd.
-`systemd-ops scope show` / `scope validate` / `tui` consume one derived
-ScopeView (owned, watching, health, attention). TUI is read-only and
-lists OWNED then WATCHING. Operation logs in the TUI are the service
-unit. Scheduled oneshot health is `healthy` only when last success,
-timer enabled, and a next trigger exist. Manifest schema is deny-unknown;
-`critical` lives only under `[scope]`. Direct CLI authoring uses process
-cwd when `--cwd` is omitted. OMP inspect passes session cwd through
-`--cwd`.
+Responsibility scopes: preferred `.systemd-ops/scope.toml`, with legacy
+`.systemd-ops.toml` compatibility. `systemd-ops scope show` / `scope
+validate` / `tui` consume one derived ScopeView (owned, watching, health,
+attention). TUI is read-only and lists OWNED then WATCHING. Operation logs
+in the TUI are the service unit. Scheduled oneshot health is `healthy` only
+when last success, timer enabled, and a next trigger exist. Manifest schema
+is deny-unknown; `critical` lives only under `[scope]`. Direct CLI authoring
+uses process cwd when `--cwd` is omitted. OMP inspect passes session cwd
+through `--cwd`.
 
 Managed operations expose `editable_spec` reconstructed from unit files;
 `start_now` is omitted (apply intent, not durable). New managed units

@@ -1,5 +1,12 @@
 import { expect, test } from "bun:test";
-import { inspectArgv, operatorArgv, opsCliArgv, sessionCwd } from "./systemd.ts";
+import systemdTools, {
+    automationArgv,
+	inspectArgv,
+	operatorArgv,
+	opsCliArgv,
+	opsSpawnContract,
+	sessionCwd,
+} from "./systemd.ts";
 
 test("sessionCwd prefers session over factory", () => {
 	expect(sessionCwd({ cwd: "/project/speech-core" }, "/factory")).toBe(
@@ -22,16 +29,44 @@ test("operator_show inspect argv", () => {
 	]);
 });
 
-test("scope_show uses session cwd when it differs from factory", () => {
-	const session = "/project/speech-core";
+test("scope_show keeps the PR worktree as process cwd and --cwd", () => {
+	const worktree = "/project/speech-core";
 	const factory = "/home/sf/workspace";
-	const cwd = sessionCwd({ cwd: session }, factory);
-	expect(cwd).toBe(session);
+	const cwd = sessionCwd({ cwd: worktree }, factory);
+	expect(cwd).toBe(worktree);
 	expect(cwd).not.toBe(factory);
-	const argv = opsCliArgv(inspectArgv("scope_show", {}), cwd);
-	expect(argv).toContain("--cwd");
-	expect(argv).toContain(session);
-	expect(argv).not.toContain(factory);
+	const contract = opsSpawnContract(inspectArgv("scope_show", {}), cwd);
+	expect(contract.args).toEqual([
+		"--json",
+		"--manager",
+		"user",
+		"--cwd",
+		worktree,
+		"scope",
+		"show",
+	]);
+	expect(contract.options.cwd).toBe(worktree);
+});
+
+test("spawn contract naturally inherits the central scope environment", () => {
+	const worktree = "/worktrees/pr-123";
+	const contract = opsSpawnContract(
+		inspectArgv("operator_show", { unit: "managed-omp-pr-maintainer" }),
+		worktree,
+	);
+	expect(contract.args).toEqual([
+		"--json",
+		"--manager",
+		"user",
+		"--cwd",
+		worktree,
+		"operator",
+		"show",
+		"--unit",
+		"managed-omp-pr-maintainer",
+	]);
+	expect(contract.options.cwd).toBe(worktree);
+	expect(Object.prototype.hasOwnProperty.call(contract.options, "env")).toBe(false);
 });
 
 test("without session or factory cwd, opsCliArgv omits --cwd", () => {
@@ -90,4 +125,56 @@ test("operator argv forwards session cwd", () => {
 	expect(argv).toContain("/home/sf/worlds/personal");
 	expect(argv).toContain("operator");
 	expect(argv).not.toContain("systemctl");
+});
+
+test("bound automation argv never accepts a unit", () => {
+	expect(automationArgv("context", { unit: "managed-other" })).toEqual([
+		"automation",
+		"context",
+	]);
+	expect(
+		automationArgv("report", {
+			unit: "managed-other",
+			headline: "waiting for review",
+			summary: ["all actionable feedback is addressed"],
+		}),
+	).toEqual([
+		"automation",
+		"report",
+		"--headline",
+		"waiting for review",
+		"--summary",
+		'["all actionable feedback is addressed"]',
+	]);
+	expect(automationArgv("activity", { unit: "managed-other", text: "requested review" })).toEqual([
+		"automation",
+		"activity",
+		"--text",
+		"requested review",
+	]);
+});
+
+test("autonomous tools are strict bound surfaces", () => {
+	const tools = systemdTools({ cwd: "/worktrees/pr-123" });
+	const byName = new Map(tools.map((tool) => [tool.name, tool]));
+	for (const name of ["automation_context", "automation_report", "automation_activity"]) {
+		const tool = byName.get(name);
+		expect(tool).toBeDefined();
+		expect(tool?.hidden).toBe(true);
+		expect(tool?.loadMode).toBe("essential");
+		expect(tool?.strict).toBe(true);
+		expect(JSON.stringify(tool?.parameters)).not.toContain("unit");
+	}
+	expect(byName.get("automation_context")?.approval).toBe("read");
+	expect(byName.get("automation_report")?.approval).toBe("write");
+	expect(byName.get("automation_activity")?.approval).toBe("write");
+});
+
+test("broad tools state their capability audiences", () => {
+	const tools = systemdTools({});
+	const byName = new Map(tools.map((tool) => [tool.name, tool.description]));
+	expect(byName.get("systemd_inspect")).toContain("Project builder, operator, and admin");
+	expect(byName.get("systemd_control")).toContain("Trusted project operator and admin");
+	expect(byName.get("systemd_author")).toContain("Automation and system builder");
+	expect(byName.get("systemd_operator")).toContain("Low-level manual operator-state");
 });
