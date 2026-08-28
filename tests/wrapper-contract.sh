@@ -19,14 +19,40 @@ make_case() {
   local scope=$TMP/$name
   local home=$scope/.systemd-ops/managed-omp-pr-9363
   mkdir -p "$home/state" "$scope/worktree"
+  git -C "$scope/worktree" init -q
+  git -C "$scope/worktree" config user.email proof@example.invalid
+  git -C "$scope/worktree" config user.name proof
+  git -C "$scope/worktree" checkout -q -b fix/settings-project-scope
+  touch "$scope/worktree/.proof"
+  git -C "$scope/worktree" add .proof
+  git -C "$scope/worktree" commit -qm proof
+  git -C "$scope/worktree" remote add fork "$scope/worktree"
   cp "$SOURCE_WRAPPER" "$home/run"
   chmod +x "$home/run"
   cp "$SOURCE_DRIVER" "$scope/.systemd-ops/pr-maintainer-run"
   chmod +x "$scope/.systemd-ops/pr-maintainer-run"
-  cat >"$scope/.systemd-ops/scope.toml" <<'EOF'
+  cat >"$scope/.systemd-ops/scope.toml" <<EOF
 [scope]
 id = "omp-proof"
 owned = ["managed-omp-*"]
+
+[automation]
+agent_root = "$scope/agents"
+EOF
+  mkdir -p "$scope/agents/.omp/agents"
+  cat >"$scope/agents/.omp/agents/pr-maintainer.md" <<'EOF'
+---
+name: pr-maintainer
+description: proof agent
+hide: true
+tools: [automation_context, automation_report]
+---
+proof
+EOF
+  cat >"$home/automation.toml" <<'EOF'
+version = 1
+agent = "pr-maintainer"
+brain_paths = [".systemd-ops/pr-fingerprint", ".systemd-ops/pr-maintainer-run"]
 EOF
   cat >"$scope/.systemd-ops/pr-fingerprint" <<'EOF'
 #!/usr/bin/env bash
@@ -60,7 +86,8 @@ run_wrapper() {
 success=$(make_case success)
 write_omp "$success/fake-omp" '"$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "proof current" --summary '\''["report accepted"]'\'' >/dev/null'
 run_wrapper "$success"
-[[ $(cat "$success/.systemd-ops/managed-omp-pr-9363/state/fingerprint") == fp-proof ]] || fail "success did not advance fingerprint"
+success_fp=$(cat "$success/.systemd-ops/managed-omp-pr-9363/state/fingerprint")
+[[ $success_fp =~ ^[0-9a-f]{64}$ ]] || fail "success did not write combined fingerprint"
 jq -e '.iterations[0].reconsolidated == true' "$success/.systemd-ops/managed-omp-pr-9363/state/operator.json" >/dev/null || fail "success did not reconsolidate"
 
 missing=$(make_case missing-report)
@@ -83,7 +110,7 @@ set -e
 [[ ! -e $omp_failure/.systemd-ops/managed-omp-pr-9363/state/fingerprint ]] || fail "OMP failure advanced fingerprint"
 write_omp "$omp_failure/fake-omp" '"$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "retry current" --summary '\''["retry accepted"]'\'' >/dev/null'
 run_wrapper "$omp_failure"
-[[ $(cat "$omp_failure/.systemd-ops/managed-omp-pr-9363/state/fingerprint") == fp-proof ]] || fail "failed iteration was not retried"
+[[ $(cat "$omp_failure/.systemd-ops/managed-omp-pr-9363/state/fingerprint") =~ ^[0-9a-f]{64}$ ]] || fail "failed iteration was not retried"
 retry_count=$(jq '[.iterations[] | select(.headline == "retry current" and .reconsolidated == true)] | length' "$omp_failure/.systemd-ops/managed-omp-pr-9363/state/operator.json")
 [[ $retry_count -eq 1 ]] || fail "retry did not reconsolidate exactly once"
 
@@ -98,7 +125,9 @@ set -e
 [[ ! -e $finish_failure/.systemd-ops/managed-omp-pr-9363/state/fingerprint ]] || fail "finish failure advanced fingerprint"
 
 unchanged=$(make_case unchanged)
-printf 'fp-proof\n' >"$unchanged/.systemd-ops/managed-omp-pr-9363/state/fingerprint"
+external_fp=$("$unchanged/.systemd-ops/pr-fingerprint" 9363)
+brain_revision=$(SYSTEMD_OPS_SCOPE_ROOT="$unchanged" "$BIN" --json --manager user --cwd "$unchanged/worktree" automation revision --unit managed-omp-pr-9363 | jq -er '.data.brain_revision')
+printf 'external=%s\nbrain=%s\n' "$external_fp" "$brain_revision" | sha256sum | cut -d' ' -f1 >"$unchanged/.systemd-ops/managed-omp-pr-9363/state/fingerprint"
 write_omp "$unchanged/fake-omp" 'touch "${SYSTEMD_OPS_SCOPE_ROOT}/agent-was-called"'
 run_wrapper "$unchanged"
 [[ ! -e $unchanged/agent-was-called ]] || fail "unchanged fingerprint invoked OMP"

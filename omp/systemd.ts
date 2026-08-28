@@ -10,6 +10,8 @@
  * Symlink: ~/worlds/base/tools/systemd.ts → this file.
  */
 import { spawn } from "node:child_process";
+import { promises as fs } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 
 const DEFAULT_BIN = `${homedir()}/.local/bin/systemd-ops`;
@@ -58,6 +60,129 @@ const SPEC_KEYS = [
 	"enabled",
 	"start_now",
 ] as const;
+
+const AUTOMATION_SPEC_KEYS = [...SPEC_KEYS, "agent", "parent", "brain_paths"] as const;
+
+const AGENT_FIELDS = [
+	"name",
+	"description",
+	"hide",
+	"tools",
+	"model",
+	"thinkingLevel",
+	"readSummarize",
+	"autoloadSkills",
+	"spawns",
+	"advisor",
+	"systemPrompt",
+] as const;
+
+function validateAgentName(name: string): void {
+	if (!/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(name)) {
+		throw new Error("agent name must be 1..64 lowercase letters, digits, or non-edge hyphens");
+	}
+}
+
+function validateAgentDefinition(input: Json): Json {
+	const unknown = Object.keys(input).filter(
+		(key) => key !== "action" && !(AGENT_FIELDS as readonly string[]).includes(key),
+	);
+	if (unknown.length > 0) throw new Error(`unknown agent fields: ${unknown.join(", ")}`);
+	const name = String(input.name ?? "");
+	validateAgentName(name);
+	if (typeof input.description !== "string" || input.description.trim().length === 0) {
+		throw new Error("agent description is required");
+	}
+	if (typeof input.systemPrompt !== "string" || input.systemPrompt.trim().length === 0) {
+		throw new Error("agent systemPrompt is required");
+	}
+	for (const key of ["tools", "autoloadSkills", "spawns"] as const) {
+		const value = input[key];
+		if (value !== undefined && (!Array.isArray(value) || value.some((item) => typeof item !== "string"))) {
+			throw new Error(`${key} must be an array of strings`);
+		}
+	}
+	for (const key of ["hide", "readSummarize", "advisor"] as const) {
+		if (input[key] !== undefined && typeof input[key] !== "boolean") {
+			throw new Error(`${key} must be boolean`);
+		}
+	}
+	return pick(input, AGENT_FIELDS);
+}
+
+export function serializeAgentDefinition(input: Json): string {
+	const agent = validateAgentDefinition(input);
+	const frontmatter = pick(agent, AGENT_FIELDS.filter((key) => key !== "systemPrompt"));
+	const yaml = Bun.YAML.stringify(frontmatter).trimEnd();
+	return `---\n${yaml}\n---\n\n${String(agent.systemPrompt).trim()}\n`;
+}
+
+async function scopeAgentRoot(cwd?: string): Promise<string> {
+	const env = await runOps(["scope", "show"], cwd);
+	if (env.ok !== true) throw new Error(String((env.error as Json | undefined)?.message ?? "scope show failed"));
+	const root = (env.data as Json | undefined)?.automation;
+	const value = root && typeof root === "object" ? (root as Json).agent_root : undefined;
+	if (typeof value !== "string" || value.length === 0) {
+		throw new Error("scope has no [automation].agent_root configuration");
+	}
+	return value;
+}
+
+function containedAgentPath(root: string, name: string): string {
+	validateAgentName(name);
+	const base = resolve(root, ".omp", "agents");
+	const target = resolve(base, `${name}.md`);
+	if (!target.startsWith(`${base}${sep}`)) throw new Error("agent path escapes configured root");
+	return target;
+}
+
+async function refuseWritableSymlink(path: string): Promise<void> {
+	try {
+		if ((await fs.lstat(path)).isSymbolicLink()) throw new Error(`refusing writable symlink ${path}`);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+}
+
+async function atomicAgentWrite(path: string, content: string): Promise<void> {
+	await fs.mkdir(dirname(path), { recursive: true });
+	await refuseWritableSymlink(path);
+	const temporary = join(dirname(path), `.${path.split(sep).pop()}.tmp.${process.pid}.${crypto.randomUUID()}`);
+	await fs.writeFile(temporary, content, { mode: 0o600, flag: "wx" });
+	await fs.rename(temporary, path);
+}
+
+export async function agentRootFromScope(cwd?: string): Promise<string> {
+	return scopeAgentRoot(cwd);
+}
+
+export function automationAuthorArgv(action: string, params: Json): string[] {
+	switch (action) {
+		case "inspect":
+
+			return ["automation", "inspect", "--unit", String(params.unit ?? "")];
+		case "plan_create":
+		case "plan_update": {
+			const spec = params.spec && typeof params.spec === "object"
+				? (params.spec as Json)
+				: pick(params, AUTOMATION_SPEC_KEYS);
+			return [
+				"automation",
+				action === "plan_create" ? "plan-create" : "plan-update",
+				"--spec",
+				JSON.stringify(spec),
+			];
+		}
+		case "plan_complete":
+			return ["automation", "plan-complete", "--unit", String(params.unit ?? ""), "--reason", String(params.reason ?? "")];
+		case "plan_retire":
+			return ["automation", "plan-retire", "--unit", String(params.unit ?? "")];
+		case "apply":
+			return ["automation", "apply", "--plan-token", String(tokenOf(params) ?? "")];
+		default:
+			throw new Error(`unknown automation author action '${action}'`);
+	}
+}
 
 type Json = Record<string, unknown>;
 
@@ -378,9 +503,10 @@ export default function systemdTools(pi: { cwd?: string }) {
 			label: "systemd author",
 			approval: "write" as const,
 			description:
-				"Automation and system builder surface. Create, update, or retire systemd-ops-managed definitions. " +
-				"Do not expose this to ordinary runtime maintainers or delegated workers. Refuses unmarked and " +
-				"out-of-prefix units; use plan then apply.",
+				"Automation and system builder low-level managed definition authoring surface for project leads and admins. " +
+				"Creates, updates, or retires systemd OperationSpec definitions only. Prefer automation_author " +
+				"for agent-backed instances. Never expose either authoring surface to ordinary runtime maintainers " +
+				"or delegated workers. Refuses unmarked and out-of-prefix units; use plan then apply.",
 			parameters: {
 				type: "object",
 				required: ["action"],
@@ -516,6 +642,128 @@ export default function systemdTools(pi: { cwd?: string }) {
 				const cwd = sessionCwd(ctx, factoryCwd);
 				try {
 					return envelopeResult(await runOps(operatorArgv(action, params), cwd));
+				} catch (e) {
+					return textResult(e instanceof Error ? e.message : String(e), { isError: true });
+				}
+			},
+		},
+		{
+			name: "automation_agent_author",
+			label: "automation agent author",
+			hidden: true as const,
+			approval: "write" as const,
+			strict: true as const,
+			description:
+				"Privileged explicit-only authoring surface for reusable OMP agent definitions under the current " +
+				"scope's configured automation.agent_root. The configured root is authoritative; no destination path is accepted.",
+			parameters: {
+				type: "object",
+				additionalProperties: false,
+				required: ["action"],
+				properties: {
+					action: { type: "string", enum: ["inspect", "list", "create", "update", "retire"] },
+					name: { type: "string" },
+					description: { type: "string" },
+					hide: { type: "boolean" },
+					tools: { type: "array", items: { type: "string" } },
+					model: { type: "string" },
+					thinkingLevel: { type: "string" },
+					readSummarize: { type: "boolean" },
+					autoloadSkills: { type: "array", items: { type: "string" } },
+					spawns: { type: "array", items: { type: "string" } },
+					advisor: { type: "boolean" },
+					systemPrompt: { type: "string" },
+				},
+			},
+			async execute(_id: string, params: Json, _onUpdate?: unknown, ctx?: SessionLike) {
+				try {
+					const cwd = sessionCwd(ctx, factoryCwd);
+					const root = await scopeAgentRoot(cwd);
+					const action = String(params.action ?? "");
+					if (action === "list") {
+						const directory = resolve(root, ".omp", "agents");
+						const entries = await fs.readdir(directory, { withFileTypes: true }).catch((error) => {
+							if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+							throw error;
+						});
+						const agents = entries
+							.filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
+							.map((entry) => entry.name.slice(0, -3))
+							.sort();
+						return textResult(JSON.stringify({ root, agents }, null, 2), { details: { root, agents } });
+					}
+					const name = String(params.name ?? "");
+					const path = containedAgentPath(root, name);
+					if (action === "inspect") {
+						const content = await fs.readFile(path, "utf8");
+						return textResult(content, { details: { root, name, path, content } });
+					}
+					if (action === "retire") {
+						await refuseWritableSymlink(path);
+						await fs.unlink(path);
+						return textResult(JSON.stringify({ retired: true, name, path }, null, 2), { details: { retired: true, name, path } });
+					}
+					if (action !== "create" && action !== "update") {
+						return textResult("action must be inspect, list, create, update, or retire.", { isError: true });
+					}
+					const exists = await fs.lstat(path).then(() => true).catch((error) => {
+						if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+						throw error;
+					});
+					if (action === "create" && exists) throw new Error(`agent '${name}' already exists`);
+					if (action === "update" && !exists) throw new Error(`agent '${name}' does not exist`);
+					const content = serializeAgentDefinition(params);
+					await atomicAgentWrite(path, content);
+					return textResult(content, { details: { action, name, path, content } });
+				} catch (e) {
+					return textResult(e instanceof Error ? e.message : String(e), { isError: true });
+				}
+			},
+		},
+		{
+			name: "automation_author",
+			label: "automation author",
+			hidden: true as const,
+			approval: "write" as const,
+			strict: true as const,
+			description:
+				"Privileged explicit-only automation instance author. Composes existing sealed systemd author plans " +
+				"with generic agent metadata and completed lifecycle state. Not for ordinary runtime maintainers.",
+			parameters: {
+				type: "object",
+				additionalProperties: false,
+				required: ["action"],
+				properties: {
+					action: { type: "string", enum: ["inspect", "plan_create", "plan_update", "plan_complete", "plan_retire", "apply"] },
+					unit: { type: "string" },
+					title: { type: "string" },
+					purpose: { type: "string" },
+					tags: { type: "array", items: { type: "string" } },
+					agent: { type: "string" },
+					parent: { type: "string" },
+					brain_paths: { type: "array", items: { type: "string" } },
+					kind: { type: "string", enum: ["simple", "oneshot", "oneshot-linger"] },
+					cwd: { type: "string" },
+					exec: { type: "object" },
+					env: { type: "object", additionalProperties: { type: "string" } },
+					path: { type: "array", items: { type: "string" } },
+					environment_files: { type: "array", items: { type: "string" } },
+					after: { type: "array", items: { type: "string" } },
+					wants_network_online: { type: "boolean" },
+					restart: { type: "string", enum: ["no", "on-failure", "always"] },
+					nice: { type: "integer" },
+					schedule: { type: "object" },
+					enabled: { type: "boolean" },
+					start_now: { type: "boolean" },
+					reason: { type: "string" },
+					spec: { type: "object" },
+					plan_token: { type: "string" },
+				},
+			},
+			async execute(_id: string, params: Json, _onUpdate?: unknown, ctx?: SessionLike) {
+				try {
+					const action = String(params.action ?? "");
+					return envelopeResult(await runOps(automationAuthorArgv(action, params), sessionCwd(ctx, factoryCwd)));
 				} catch (e) {
 					return textResult(e instanceof Error ? e.message : String(e), { isError: true });
 				}

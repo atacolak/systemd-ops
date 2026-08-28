@@ -1,10 +1,12 @@
 import { expect, test } from "bun:test";
 import systemdTools, {
-    automationArgv,
+	automationArgv,
+	automationAuthorArgv,
 	inspectArgv,
 	operatorArgv,
 	opsCliArgv,
 	opsSpawnContract,
+	serializeAgentDefinition,
 	sessionCwd,
 } from "./systemd.ts";
 
@@ -177,4 +179,56 @@ test("broad tools state their capability audiences", () => {
 	expect(byName.get("systemd_control")).toContain("Trusted project operator and admin");
 	expect(byName.get("systemd_author")).toContain("Automation and system builder");
 	expect(byName.get("systemd_operator")).toContain("Low-level manual operator-state");
+});
+
+test("automation author argv carries typed metadata", () => {
+	expect(automationAuthorArgv("plan_create", {
+		unit: "managed-omp-pr-9969",
+		title: "PR 9969",
+		agent: "pr-maintainer",
+		brain_paths: [".systemd-ops/pr-maintainer-run"],
+	})).toEqual([
+		"automation",
+		"plan-create",
+		"--spec",
+		JSON.stringify({
+			unit: "managed-omp-pr-9969",
+			title: "PR 9969",
+			agent: "pr-maintainer",
+			brain_paths: [".systemd-ops/pr-maintainer-run"],
+		}),
+	]);
+	expect(automationAuthorArgv("plan_complete", {
+		unit: "managed-omp-pr-9969",
+		reason: "merged upstream",
+	})).toEqual([
+		"automation", "plan-complete", "--unit", "managed-omp-pr-9969", "--reason", "merged upstream",
+	]);
+});
+
+test("agent author serialization uses canonical OMP field names", () => {
+	const text = serializeAgentDefinition({
+		name: "pr-maintainer",
+		description: "Maintains one PR",
+		hide: true,
+		tools: ["github", "automation_context"],
+		thinkingLevel: "high",
+		readSummarize: false,
+		autoloadSkills: ["hcom"],
+		advisor: false,
+		systemPrompt: "maintain exactly one PR.",
+	});
+	expect(text).toContain("thinkingLevel: high");
+	expect(text).toContain("readSummarize: false");
+	expect(text).not.toContain("thinking-level");
+	expect(text).not.toContain("read-summarize");
+	expect(text).toContain("maintain exactly one PR.");
+});
+
+test("privileged automation author tools are hidden", () => {
+	const tools = systemdTools({});
+	const byName = new Map(tools.map((tool) => [tool.name, tool]));
+	expect(byName.get("automation_agent_author")?.hidden).toBe(true);
+	expect(byName.get("automation_author")?.hidden).toBe(true);
+	expect(byName.get("automation_context")?.hidden).toBe(true);
 });
