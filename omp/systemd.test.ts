@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import systemdTools, {
 	automationArgv,
 	automationAuthorArgv,
@@ -9,6 +9,49 @@ import systemdTools, {
 	serializeAgentDefinition,
 	sessionCwd,
 } from "./systemd.ts";
+import { promises as fs } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const originalOpsBin = process.env.SYSTEMD_OPS_BIN;
+
+afterEach(() => {
+	if (originalOpsBin === undefined) delete process.env.SYSTEMD_OPS_BIN;
+	else process.env.SYSTEMD_OPS_BIN = originalOpsBin;
+});
+
+async function fakeAgentAuthorScope(): Promise<{ root: string; scope: string }> {
+	const root = await fs.mkdtemp(join(tmpdir(), "systemd-ops-agent-author-"));
+	const scope = join(root, "scope");
+	const agentRoot = join(root, "agents");
+	const bin = join(root, "systemd-ops");
+	await fs.mkdir(scope, { recursive: true });
+	await fs.writeFile(
+		bin,
+		`#!/bin/sh\nprintf '%s\\n' '${JSON.stringify({ ok: true, data: { automation: { agent_root: agentRoot } } })}'\n`,
+		{ mode: 0o755 },
+	);
+	process.env.SYSTEMD_OPS_BIN = bin;
+	return { root, scope };
+}
+
+type AgentAuthorResult = {
+	isError?: boolean;
+	content: Array<{ text: string }>;
+	details?: Record<string, unknown>;
+};
+
+type AgentAuthorExecute = (
+	id: string,
+	params: Record<string, unknown>,
+	update?: unknown,
+	ctx?: { cwd?: string },
+) => Promise<AgentAuthorResult>;
+
+function detailsRecord(result: AgentAuthorResult): Record<string, unknown> {
+	if (!result.details) throw new Error("missing tool details");
+	return result.details;
+}
 
 test("sessionCwd prefers session over factory", () => {
 	expect(sessionCwd({ cwd: "/project/speech-core" }, "/factory")).toBe(
@@ -231,4 +274,78 @@ test("privileged automation author tools are hidden", () => {
 	expect(byName.get("automation_agent_author")?.hidden).toBe(true);
 	expect(byName.get("automation_author")?.hidden).toBe(true);
 	expect(byName.get("automation_context")?.hidden).toBe(true);
+});
+
+test("agent author create update list inspect and retire use configured root", async () => {
+	const { root, scope } = await fakeAgentAuthorScope();
+	try {
+		const tool = systemdTools({ cwd: scope }).find((candidate) => candidate.name === "automation_agent_author");
+		expect(tool).toBeDefined();
+		const execute = tool!.execute as AgentAuthorExecute;
+		const definition = {
+			name: "proof-agent",
+			description: "proof agent",
+			hide: true,
+			tools: ["read"],
+			thinkingLevel: "high",
+			readSummarize: false,
+			systemPrompt: "perform the proof.",
+		};
+		const created = await execute("create", { action: "create", ...definition }, undefined, { cwd: scope });
+		expect(created.isError).toBeUndefined();
+		const path = join(root, "agents", ".omp", "agents", "proof-agent.md");
+		expect(await fs.readFile(path, "utf8")).toContain("perform the proof.");
+
+		const listed = await execute("list", { action: "list" }, undefined, { cwd: scope });
+		expect(detailsRecord(listed).agents).toEqual(["proof-agent"]);
+		const inspected = await execute("inspect", { action: "inspect", name: "proof-agent" }, undefined, { cwd: scope });
+		expect(detailsRecord(inspected).path).toBe(path);
+
+		const updated = await execute(
+			"update",
+			{ action: "update", ...definition, systemPrompt: "perform the updated proof." },
+			undefined,
+			{ cwd: scope },
+		);
+		expect(updated.isError).toBeUndefined();
+		expect(await fs.readFile(path, "utf8")).toContain("updated proof");
+
+		const retired = await execute("retire", { action: "retire", name: "proof-agent" }, undefined, { cwd: scope });
+		expect(detailsRecord(retired).retired).toBe(true);
+		expect(await fs.lstat(path).then(() => true).catch(() => false)).toBe(false);
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("agent author refuses path escape and writable symlink", async () => {
+	const { root, scope } = await fakeAgentAuthorScope();
+	try {
+		const tool = systemdTools({ cwd: scope }).find((candidate) => candidate.name === "automation_agent_author");
+		expect(tool).toBeDefined();
+		const execute = tool!.execute as AgentAuthorExecute;
+		const escaped = await execute("escape", { action: "inspect", name: "../escape" }, undefined, { cwd: scope });
+		expect(escaped.isError).toBe(true);
+		const agents = join(root, "agents", ".omp", "agents");
+		await fs.mkdir(agents, { recursive: true });
+		const target = join(root, "target.md");
+		await fs.writeFile(target, "keep");
+		await fs.symlink(target, join(agents, "proof-agent.md"));
+		const refused = await execute(
+			"update",
+			{
+				action: "update",
+				name: "proof-agent",
+				description: "proof agent",
+				systemPrompt: "do not overwrite the symlink.",
+			},
+			undefined,
+			{ cwd: scope },
+		);
+		expect(refused.isError).toBe(true);
+		expect(refused.content[0].text).toContain("refusing writable symlink");
+		expect(await fs.readFile(target, "utf8")).toBe("keep");
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
 });

@@ -1653,7 +1653,7 @@ fn when_label(r: &Row, now: SystemTime) -> String {
         return "failed".into();
     }
     let intelligent_running = r.active_iteration.is_some()
-        && r.state == "active"
+        && (r.state == "active" || r.state == "activating")
         && (r.sub == "running" || r.sub == "start");
     if intelligent_running {
         return "running".into();
@@ -2169,6 +2169,9 @@ mod tests {
             started_at: String::new(),
             observed_updated_at: String::new(),
         });
+        assert_eq!(when_label(&r, SystemTime::now()), "running");
+        r.state = "activating".into();
+        r.sub = "start".into();
         assert_eq!(when_label(&r, SystemTime::now()), "running");
         r.state = "inactive".into();
         assert_eq!(when_label(&r, SystemTime::now()), "");

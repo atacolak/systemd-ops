@@ -766,13 +766,13 @@ pub fn apply(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Backe
             .map_err(|_| BackendError("invalid automation plan token".into()))?;
             let timer = format!("{}.timer", plan.unit);
             let mut changes = Vec::new();
-            if systemd::ensure_unit_known(&timer).is_ok() {
-                if let Ok(lines) = systemd::apply_verb("stop", &timer, None) {
-                    changes.extend(lines);
+            match systemd::ensure_unit_known(&timer) {
+                Ok(()) => {
+                    changes.extend(systemd::apply_verb("stop", &timer, None)?);
+                    changes.extend(systemd::apply_verb("disable", &timer, None)?);
                 }
-                if let Ok(lines) = systemd::try_disable(&timer) {
-                    changes.extend(lines);
-                }
+                Err(error) if error.0.starts_with("no such unit:") => {}
+                Err(error) => return Err(error),
             }
             let bytes = serde_json::to_vec_pretty(&lifecycle)
                 .map_err(|error| BackendError(format!("cannot serialize lifecycle: {error}")))?;
@@ -831,6 +831,236 @@ pub fn complete_now(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    };
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    static PATH_LOCK: Mutex<()> = Mutex::new(());
+
+    fn tmp_root(name: &str) -> PathBuf {
+        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "systemd-ops-automation-{name}-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn test_manifest(root: &Path, agent_root: &Path) -> ScopeManifest {
+        ScopeManifest {
+            id: "proof".into(),
+            root: root.to_path_buf(),
+            owned: vec!["managed-*".into()],
+            critical: Vec::new(),
+            watch: Vec::new(),
+            automation_agent_root: Some(agent_root.to_path_buf()),
+        }
+    }
+
+    fn write_role(agent_root: &Path, bytes: &[u8]) {
+        let path = agent_root.join(".omp/agents/pr-maintainer.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn write_metadata(root: &Path, stem: &str, brain_paths: Vec<&str>) {
+        let metadata = AutomationMetadata {
+            version: AUTOMATION_VERSION,
+            agent: "pr-maintainer".into(),
+            parent: None,
+            brain_paths: brain_paths.into_iter().map(str::to_string).collect(),
+        };
+        let path = metadata_path(root, stem);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, canonical_metadata(&metadata).unwrap()).unwrap();
+    }
+
+    fn write_parent_fixture(root: &Path, stem: &str, parent: Option<&str>) {
+        let metadata = AutomationMetadata {
+            version: AUTOMATION_VERSION,
+            agent: "pr-maintainer".into(),
+            parent: parent.map(str::to_string),
+            brain_paths: Vec::new(),
+        };
+        let path = metadata_path(root, stem);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, canonical_metadata(&metadata).unwrap()).unwrap();
+    }
+
+    fn fake_inventory_systemctl(root: &Path, stems: &[&str]) -> PathBuf {
+        let bin = root.join("inventory-bin");
+        fs::create_dir_all(&bin).unwrap();
+        let rows: Vec<Value> = stems
+            .iter()
+            .map(|stem| {
+                json!({
+                    "unit_file": format!("{stem}.service"),
+                    "state": "static",
+                    "preset": "enabled"
+                })
+            })
+            .collect();
+        fs::write(
+            bin.join("systemctl"),
+            format!(
+                "#!/bin/sh\ncase \" $* \" in\n  *\" list-unit-files \"*|*\" list-unit-files\"*) cat <<'EOF'\n{}\nEOF\n    ;;\n  *) printf '[]\\n' ;;\nesac\n",
+                serde_json::to_string(&rows).unwrap()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(bin.join("systemctl"), fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    fn with_user_unit_dir<T>(root: &Path, stems: &[&str], run: impl FnOnce() -> T) -> T {
+        let _guard = PATH_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        systemd::set_manager(systemd::Manager::User);
+        let previous_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_path = std::env::var_os("PATH");
+        std::env::set_var("XDG_CONFIG_HOME", root.join("xdg"));
+        let unit_dir = systemd::unit_file_dir();
+        fs::create_dir_all(&unit_dir).unwrap();
+        for stem in stems {
+            fs::write(
+                unit_dir.join(format!("{stem}.service")),
+                format!(
+                    "# Managed by systemd-ops\n[Unit]\nDescription={stem}\n[Service]\nType=oneshot\nExecStart=/bin/true\n"
+                ),
+            )
+            .unwrap();
+        }
+        let bin = fake_inventory_systemctl(root, stems);
+        let mut paths = vec![bin];
+        if let Some(previous) = previous_path.as_ref() {
+            paths.extend(std::env::split_paths(previous));
+        }
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        let result = run();
+        match previous_path {
+            Some(previous) => std::env::set_var("PATH", previous),
+            None => std::env::remove_var("PATH"),
+        }
+        match previous_xdg {
+            Some(previous) => std::env::set_var("XDG_CONFIG_HOME", previous),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        result
+    }
+
+    #[test]
+    fn parent_accepts_existing_same_scope_automation() {
+        let root = tmp_root("parent-success");
+        let manifest = test_manifest(&root, &root.join("agents"));
+        with_user_unit_dir(&root, &["managed-parent"], || {
+            write_parent_fixture(&root, "managed-parent", None);
+            let result = validate_parent(&manifest, "managed-child", Some("managed-parent"));
+            assert!(result.is_ok(), "{result:?}");
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parent_rejects_missing_automation() {
+        let root = tmp_root("parent-missing");
+        let manifest = test_manifest(&root, &root.join("agents"));
+        let error = with_user_unit_dir(&root, &[], || {
+            validate_parent(&manifest, "managed-child", Some("managed-missing")).unwrap_err()
+        });
+        assert!(error.0.contains("does not exist in this scope"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parent_rejects_self_relation() {
+        let root = tmp_root("parent-self");
+        let manifest = test_manifest(&root, &root.join("agents"));
+        let error = validate_parent(&manifest, "managed-child", Some("managed-child")).unwrap_err();
+        assert!(error.0.contains("own parent"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parent_rejects_cycles() {
+        let root = tmp_root("parent-cycle");
+        let manifest = test_manifest(&root, &root.join("agents"));
+        let error = with_user_unit_dir(&root, &["managed-parent"], || {
+            write_parent_fixture(&root, "managed-parent", Some("managed-child"));
+            validate_parent(&manifest, "managed-child", Some("managed-parent")).unwrap_err()
+        });
+        assert!(error.0.contains("create a cycle"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parent_rejects_operation_outside_owned_scope() {
+        let root = tmp_root("parent-unowned");
+        let manifest = test_manifest(&root, &root.join("agents"));
+        let error =
+            validate_parent(&manifest, "managed-child", Some("outside-parent")).unwrap_err();
+        assert!(error.0.contains("restricted to owned stems"), "{}", error.0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn completion_plan(path: &Path, stem: &str) -> token::SealedPlan {
+        token::SealedPlan {
+            class: PlanClass::Automation,
+            manager: systemd::Manager::User,
+            unit: stem.into(),
+            issued_at: 0,
+            expires_at: u64::MAX,
+            origin_cwd: None,
+            payload: json!({
+                "action": "complete",
+                "lifecycle_snapshot": snapshot_json(&snapshot(path)),
+                "lifecycle": {
+                    "status": "completed",
+                    "completed_at": "2026-08-29T00:00:00Z",
+                    "reason": "proof complete"
+                }
+            }),
+        }
+    }
+
+    fn fake_systemctl(root: &Path, fail_verb: Option<&str>) -> (PathBuf, PathBuf) {
+        let bin = root.join("bin");
+        let log = root.join("systemctl.log");
+        fs::create_dir_all(&bin).unwrap();
+        let script = bin.join("systemctl");
+        let fail = fail_verb.unwrap_or("");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >>'{}'\nargs=\" $* \"\ncase \"$args\" in\n  *' show '*) printf 'LoadState=loaded\\n';;\n  *' {} '*) exit 23;;\nesac\n",
+                log.display(),
+                fail
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, log)
+    }
+
+    fn with_path<T>(bin: &Path, run: impl FnOnce() -> T) -> T {
+        let _guard = PATH_LOCK.lock().unwrap();
+        let previous = std::env::var_os("PATH");
+        let mut paths = vec![bin.to_path_buf()];
+        if let Some(previous) = previous.as_ref() {
+            paths.extend(std::env::split_paths(previous));
+        }
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        let result = run();
+        match previous {
+            Some(previous) => std::env::set_var("PATH", previous),
+            None => std::env::remove_var("PATH"),
+        }
+        result
+    }
 
     #[test]
     fn canonical_metadata_sorts_brain_paths() {
@@ -882,5 +1112,76 @@ mod tests {
         assert_eq!(child["lifecycle"], "completed");
         assert!(child.get("iterations").is_none());
         assert!(child.to_string().find("secret").is_none());
+    }
+
+    #[test]
+    fn brain_revision_is_stable_and_byte_sensitive() {
+        let root = tmp_root("revision");
+        let agent_root = root.join("agents");
+        let manifest = test_manifest(&root, &agent_root);
+        let stem = "managed-proof";
+        write_role(&agent_root, b"role bytes\n");
+        fs::create_dir_all(root.join("brain")).unwrap();
+        fs::write(root.join("brain/a"), b"alpha\n").unwrap();
+        fs::write(root.join("brain/z"), b"zeta\n").unwrap();
+        write_metadata(&root, stem, vec!["brain/z", "brain/a", "brain/z"]);
+
+        let first = brain_revision(&manifest, stem).unwrap();
+        let second = brain_revision(&manifest, stem).unwrap();
+        assert_eq!(first, second);
+        fs::write(root.join("brain/a"), b"alpha changed\n").unwrap();
+        assert_ne!(first, brain_revision(&manifest, stem).unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn brain_revision_requires_role_and_listed_paths() {
+        let root = tmp_root("missing-brain");
+        let agent_root = root.join("agents");
+        let manifest = test_manifest(&root, &agent_root);
+        let stem = "managed-proof";
+        write_metadata(&root, stem, vec!["brain/missing"]);
+        assert!(brain_revision(&manifest, stem)
+            .unwrap_err()
+            .0
+            .contains("agent role"));
+        write_role(&agent_root, b"role bytes\n");
+        assert!(brain_revision(&manifest, stem)
+            .unwrap_err()
+            .0
+            .contains("brain path"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn completion_persists_only_after_stop_and_disable() {
+        systemd::set_manager(systemd::Manager::User);
+        let root = tmp_root("complete-success");
+        let lifecycle = lifecycle_path(&root, "managed-proof");
+        let (bin, log) = fake_systemctl(&root, None);
+        let result = with_path(&bin, || {
+            apply(&completion_plan(&lifecycle, "managed-proof"), None)
+        });
+        assert!(result.is_ok());
+        assert!(lifecycle.exists());
+        let calls = fs::read_to_string(log).unwrap();
+        assert!(calls.contains(" stop "));
+        assert!(calls.contains(" disable "));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn completion_failure_preserves_active_lifecycle() {
+        systemd::set_manager(systemd::Manager::User);
+        let root = tmp_root("complete-failure");
+        let lifecycle = lifecycle_path(&root, "managed-proof");
+        let (bin, _) = fake_systemctl(&root, Some("disable"));
+        let error = with_path(&bin, || {
+            apply(&completion_plan(&lifecycle, "managed-proof"), None)
+        })
+        .unwrap_err();
+        assert!(error.0.contains("systemctl exited"));
+        assert!(!lifecycle.exists());
+        let _ = fs::remove_dir_all(root);
     }
 }

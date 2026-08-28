@@ -4,7 +4,6 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${SYSTEMD_OPS_BIN:-$ROOT/target/debug/systemd-ops}
-SOURCE_WRAPPER=${SOURCE_WRAPPER:-/home/sf/workspace/oh-my-pi/.systemd-ops/managed-omp-pr-9363/run}
 SOURCE_DRIVER=${SOURCE_DRIVER:-/home/sf/workspace/oh-my-pi/.systemd-ops/pr-maintainer-run}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -12,7 +11,7 @@ trap 'rm -rf "$TMP"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 command -v jq >/dev/null || fail "jq required"
 [[ -x $BIN ]] || fail "missing $BIN"
-[[ -x $SOURCE_WRAPPER ]] || fail "missing wrapper $SOURCE_WRAPPER"
+[[ -x $SOURCE_DRIVER ]] || fail "missing driver $SOURCE_DRIVER"
 
 make_case() {
   local name=$1
@@ -27,7 +26,11 @@ make_case() {
   git -C "$scope/worktree" add .proof
   git -C "$scope/worktree" commit -qm proof
   git -C "$scope/worktree" remote add fork "$scope/worktree"
-  cp "$SOURCE_WRAPPER" "$home/run"
+  cat >"$home/run" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exec "${SYSTEMD_OPS_SCOPE_ROOT}/.systemd-ops/pr-maintainer-run" 9363 fix/settings-project-scope managed-omp-pr-9363 "${WORKTREE}"
+EOF
   chmod +x "$home/run"
   cp "$SOURCE_DRIVER" "$scope/.systemd-ops/pr-maintainer-run"
   chmod +x "$scope/.systemd-ops/pr-maintainer-run"
@@ -76,6 +79,7 @@ EOF
 run_wrapper() {
   local scope=$1
   WORKTREE="$scope/worktree" \
+  SYSTEMD_OPS_SCOPE_ROOT="$scope" \
   SYSTEMD_OPS_BIN="$BIN" \
   FINGERPRINT_TOOL="$scope/.systemd-ops/pr-fingerprint" \
   OMP_BIN="$scope/fake-omp" \
@@ -89,6 +93,7 @@ run_wrapper "$success"
 success_fp=$(cat "$success/.systemd-ops/managed-omp-pr-9363/state/fingerprint")
 [[ $success_fp =~ ^[0-9a-f]{64}$ ]] || fail "success did not write combined fingerprint"
 jq -e '.iterations[0].reconsolidated == true' "$success/.systemd-ops/managed-omp-pr-9363/state/operator.json" >/dev/null || fail "success did not reconsolidate"
+
 
 missing=$(make_case missing-report)
 write_omp "$missing/fake-omp" 'exit 0'
