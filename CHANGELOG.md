@@ -5,6 +5,19 @@ dates; entries describe what changed on the wire or on disk, since that
 is what a downstream package has to care about.
 
 ## unreleased (not published)
+Automation metadata adds optional scope `[automation].agent_root`, canonical
+per-operation `automation.toml`, stable brain revisions, same-scope acyclic
+parent relations, bounded relation summaries, and completed lifecycle state.
+Automation author plans compose existing sealed OperationSpec author plans;
+completion preserves definitions, operation homes, histories, fingerprints,
+relations, and TUI rows while disabling future timer activation. Deterministic
+operations remain valid without an agent or brain revision.
+
+The OMP adapter adds hidden explicit-only `automation_agent_author` and
+`automation_author` builder surfaces. Runtime agents remain restricted to the
+bound context/report/activity tools. The TUI renders parent trees, completed
+rows, agent wiring, brain revision, and intelligent running only when an active
+iteration coincides with an objectively running service.
 
 Scope and operator substrate: the preferred manifest is now
 `.systemd-ops/scope.toml`; legacy `.systemd-ops.toml` remains readable,

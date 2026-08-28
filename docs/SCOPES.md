@@ -28,6 +28,7 @@ A scope is a project-local identity, not a security ACL.
 | owned | operation-stem globs this scope is responsible for |
 | critical | explicit owned stems that fail the scope when they fail |
 | watch | explicit stems this scope considers relevant but does not own |
+| `automation.agent_root` | optional absolute discovery root for reusable OMP agent definitions |
 
 Ownership here is operational responsibility. The hard mutation
 boundary remains the configured `--write-prefix` (typically
@@ -65,6 +66,9 @@ critical = [
 
 [[watch]]
 operation = "managed-proxy-health"
+
+[automation]
+agent_root = "/srv/automation-agents"
 ```
 
 Rules:
@@ -132,6 +136,32 @@ It does not replace the unit files, systemd enablement, or runtime state.
 Durable operational truth remains the canonical `.service` / `.timer`
 text plus systemd's live state. OperationSpec is typed authoring input.
 OperationView is a derived read of what exists.
+
+An agent-backed operation may contain `automation.toml` directly under its
+operation home:
+
+```toml
+version = 1
+agent = "pr-maintainer"
+parent = "managed-omp-capability"
+brain_paths = [".systemd-ops/pr-driver"]
+```
+
+`parent` is a producer-consumer relation, not ownership transfer, readiness,
+or scheduling. It is optional, same-scope, acyclic, and references an existing
+agent-backed operation. ScopeView derives bounded parent and direct-child
+summaries without copying logs or iteration history.
+
+The brain revision covers canonical `automation.toml`, exact resolved agent
+definition bytes, and only the listed `brain_paths`. It does not hash directory
+listings. Deterministic operations have no automation metadata or brain
+revision.
+
+Completed lifecycle state is stored at
+`<operation-home>/state/lifecycle.json`. Completion preserves the definition,
+operation home, operator history, fingerprint, relations, and TUI row, but
+stops and disables future timer activation. Retirement removes the managed
+definition. These are deliberately different operations.
 
 For systemd-ops-managed operations, OperationView includes
 `editable_spec`: a reconstruction of every durable supported authoring

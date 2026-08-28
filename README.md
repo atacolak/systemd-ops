@@ -111,6 +111,9 @@ critical = ["managed-speech-asr", "managed-speech-tts"]
 
 [[watch]]
 operation = "managed-proxy-health"
+
+[automation]
+agent_root = "/srv/automation-agents"
 ```
 
 ```
@@ -130,6 +133,20 @@ recorded in and used by the systemd unit. These are separate concepts.
 Operation homes hold advisory project state; they do not replace the
 `.service` and `.timer` files or systemd's runtime state as operational
 truth.
+
+Agent-backed operations may add `.systemd-ops/<stem>/automation.toml` with
+`version`, `agent`, optional same-scope `parent`, and explicit `brain_paths`.
+The brain revision hashes canonical metadata, the exact resolved agent file,
+and only those listed paths. Systemd remains canonical for execution, cwd,
+schedule, restart, and enablement. `automation plan-create`, `plan-update`,
+`plan-retire`, and `plan-complete` compose the existing sealed author path;
+`automation complete` is the trusted immediate completion seam. Completed
+operations keep their definition, operation home, history, fingerprint, TUI
+row, and relations while future timer activation is stopped and disabled.
+
+The OMP adapter exposes `automation_agent_author` and `automation_author` as
+hidden explicit-only builder tools. Ordinary runtime agents should receive only
+`automation_context`, `automation_report`, and `automation_activity`.
 
 `systemd-ops --json scope show` and `tui` consume the same derived
 ScopeView. Agents are the first-class author/control/operator interface;
