@@ -140,6 +140,13 @@ struct Row {
     iterations: Vec<Iteration>,
     activity: Vec<ActivityEntry>,
     definition_revision: String,
+    agent: String,
+    agent_root: String,
+    parent: String,
+    lifecycle: String,
+    brain_revision: String,
+    depth: usize,
+    last_child: bool,
 }
 
 pub(crate) fn logs_unit(stem: &str) -> String {
@@ -163,6 +170,80 @@ fn sectioned_rows(owned: Vec<Row>, watching: Vec<Row>) -> Vec<ListRow> {
     rows
 }
 
+fn hierarchy_rows(rows: Vec<Row>) -> Vec<Row> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let units: BTreeSet<String> = rows.iter().map(|row| row.unit.clone()).collect();
+    let mut by_unit: BTreeMap<String, Row> = rows
+        .into_iter()
+        .map(|row| (row.unit.clone(), row))
+        .collect();
+    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut roots = Vec::new();
+    for row in by_unit.values() {
+        if !row.parent.is_empty() && units.contains(&row.parent) {
+            children
+                .entry(row.parent.clone())
+                .or_default()
+                .push(row.unit.clone());
+        } else {
+            roots.push(row.unit.clone());
+        }
+    }
+    let order = |left: &String, right: &String, values: &BTreeMap<String, Row>| {
+        let a = values.get(left).expect("hierarchy unit");
+        let b = values.get(right).expect("hierarchy unit");
+        health_rank(&a.health)
+            .cmp(&health_rank(&b.health))
+            .then_with(|| a.title.cmp(&b.title))
+            .then_with(|| a.unit.cmp(&b.unit))
+    };
+    roots.sort_by(|a, b| order(a, b, &by_unit));
+    for siblings in children.values_mut() {
+        siblings.sort_by(|a, b| order(a, b, &by_unit));
+    }
+
+    fn visit(
+        unit: &str,
+        depth: usize,
+        last_child: bool,
+        by_unit: &mut BTreeMap<String, Row>,
+        children: &BTreeMap<String, Vec<String>>,
+        output: &mut Vec<Row>,
+    ) {
+        let Some(mut row) = by_unit.remove(unit) else {
+            return;
+        };
+        row.depth = depth;
+        row.last_child = last_child;
+        output.push(row);
+        if let Some(siblings) = children.get(unit) {
+            let last = siblings.len().saturating_sub(1);
+            for (index, child) in siblings.iter().enumerate() {
+                visit(child, depth + 1, index == last, by_unit, children, output);
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    let last_root = roots.len().saturating_sub(1);
+    for (index, root) in roots.iter().enumerate() {
+        visit(
+            root,
+            0,
+            index == last_root,
+            &mut by_unit,
+            &children,
+            &mut output,
+        );
+    }
+    for (_, mut row) in by_unit {
+        row.depth = 0;
+        row.last_child = true;
+        output.push(row);
+    }
+    output
+}
 fn health_rank(health: &str) -> u8 {
     match health {
         "failed" => 0,
@@ -212,7 +293,7 @@ impl App {
                 }
             }
         }
-        owned.sort_by_key(|r| health_rank(&r.health));
+        owned = hierarchy_rows(owned);
         let mut watching = Vec::new();
         for v in &self.view.watching {
             if let Some(r) = row_from_view(v, "watching") {
@@ -563,6 +644,33 @@ fn row_from_view(v: &Value, relationship: &'static str) -> Option<Row> {
         Some(Value::String(s)) => s.clone(),
         Some(other) => other.to_string(),
     };
+    let automation = v.get("automation");
+    let agent = automation
+        .and_then(|value| value.get("agent"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let agent_root = automation
+        .and_then(|value| value.get("agent_root"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let parent = automation
+        .and_then(|value| value.get("parent"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let lifecycle = automation
+        .and_then(|value| value.get("lifecycle"))
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("active")
+        .to_string();
+    let brain_revision = automation
+        .and_then(|value| value.get("brain_revision"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     Some(Row {
         unit,
         title,
@@ -599,6 +707,13 @@ fn row_from_view(v: &Value, relationship: &'static str) -> Option<Row> {
         iterations,
         activity,
         definition_revision: json_str(v, "definition_revision"),
+        agent,
+        agent_root,
+        parent,
+        lifecycle,
+        brain_revision,
+        depth: 0,
+        last_child: false,
     })
 }
 
@@ -714,14 +829,17 @@ fn health_style(health: &str) -> Style {
     }
 }
 
-fn mark(health: &str) -> &'static str {
+fn mark(health: &str, lifecycle: &str) -> &'static str {
+    if lifecycle == "completed" {
+        return "✓";
+    }
     match health {
         "healthy" => "●",
         "failed" => "✖",
-        _ => "?",
+        "unknown" => "?",
+        _ => "○",
     }
 }
-
 fn panel(title: impl Into<String>) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
@@ -835,9 +953,9 @@ fn event_loop(
                     KeyCode::Char('/') => app.filtering = true,
                     KeyCode::Down | KeyCode::Char('j') => app.move_sel(1),
                     KeyCode::Up | KeyCode::Char('k') => app.move_sel(-1),
-                    KeyCode::Char('l') => app.toggle_diagnostics(),
                     KeyCode::Char('d') => app.toggle_wiring(),
-                    _ => {}
+                    KeyCode::Char('l') => app.toggle_diagnostics(),
+                    _ => continue,
                 }
             }
             _ => continue,
@@ -946,7 +1064,8 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
             }
             ListRow::Op(r) => {
                 let when = when_label(r, now);
-                let line = op_line(&r.title, &r.health, &when, inner);
+                let title = tree_title(r);
+                let line = op_line(&title, &r.health, &r.lifecycle, &when, inner);
                 ListItem::new(line)
             }
         })
@@ -966,8 +1085,21 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn op_line(title: &str, health: &str, when: &str, inner: u16) -> Line<'static> {
-    let mark = mark(health);
+fn tree_title(row: &Row) -> String {
+    if row.depth == 0 {
+        return row.title.clone();
+    }
+    let connector = if row.last_child { "└─" } else { "├─" };
+    format!(
+        "{}{} {}",
+        "  ".repeat(row.depth.saturating_sub(1)),
+        connector,
+        row.title
+    )
+}
+
+fn op_line(title: &str, health: &str, lifecycle: &str, when: &str, inner: u16) -> Line<'static> {
+    let mark = mark(health, lifecycle);
     let mark_w = 2usize;
     let when_w = when.chars().count();
     let budget = inner.saturating_sub(mark_w as u16 + 1) as usize;
@@ -975,8 +1107,13 @@ fn op_line(title: &str, health: &str, when: &str, inner: u16) -> Line<'static> {
     let title = truncate(title, title_budget);
     let used = mark_w + title.chars().count() + when_w;
     let pad = (inner as usize).saturating_sub(used);
+    let state_style = if lifecycle == "completed" {
+        Style::default().fg(ACCENT)
+    } else {
+        health_style(health)
+    };
     let mut spans = vec![
-        Span::styled(format!("{mark} "), health_style(health)),
+        Span::styled(format!("{mark} "), state_style),
         Span::styled(title, Style::default().fg(TEXT)),
         Span::raw(" ".repeat(pad)),
     ];
@@ -1352,6 +1489,11 @@ fn wiring_detail_lines(r: &Row, _now: SystemTime) -> Vec<Line<'static>> {
     push_detail(&mut lines, "brief", r.operator_state.clone(), TEXT);
     push_detail(&mut lines, "basis", r.basis_revision.clone(), MUTED);
     push_detail(&mut lines, "def", r.definition_revision.clone(), MUTED);
+    push_detail(&mut lines, "agent", r.agent.clone(), TEXT);
+    push_detail(&mut lines, "agent root", short_path(&r.agent_root), MUTED);
+    push_detail(&mut lines, "parent", r.parent.clone(), TEXT);
+    push_detail(&mut lines, "lifecycle", r.lifecycle.clone(), TEXT);
+    push_detail(&mut lines, "brain", r.brain_revision.clone(), MUTED);
 
     lines.push(Line::from(""));
     lines.push(section_heading("EXECUTION"));
@@ -1501,19 +1643,28 @@ fn result_word(s: &str) -> &str {
 }
 
 fn when_label(r: &Row, now: SystemTime) -> String {
+    if r.lifecycle == "completed" {
+        return "completed".into();
+    }
     if r.health == "failed" {
         if !r.last.is_empty() {
             return relative_label(&r.last, now);
         }
         return "failed".into();
     }
-    if r.sub == "running" || r.sub == "start" {
+    let intelligent_running = r.active_iteration.is_some()
+        && r.state == "active"
+        && (r.sub == "running" || r.sub == "start");
+    if intelligent_running {
         return "running".into();
     }
     if (r.activation == "direct" || r.kind == "simple")
+        && r.active_iteration.is_none()
         && !r.sub.is_empty()
         && r.sub != "dead"
         && r.sub != "exited"
+        && r.sub != "running"
+        && r.sub != "start"
     {
         return r.sub.clone();
     }
@@ -1759,12 +1910,20 @@ mod tests {
             basis_revision: String::new(),
             activity: Vec::new(),
             definition_revision: String::new(),
+            agent: String::new(),
+            agent_root: String::new(),
+            parent: String::new(),
+            lifecycle: "active".into(),
+            brain_revision: String::new(),
+            depth: 0,
+            last_child: false,
         }
     }
 
     fn empty_view() -> ScopeView {
         let mut view = ScopeView {
             id: "personal".into(),
+            automation_agent_root: None,
             root: PathBuf::from("/tmp/personal"),
             health: ScopeHealth::Healthy,
             owned: vec![serde_json::json!({
@@ -1997,13 +2156,22 @@ mod tests {
     }
 
     #[test]
-    fn running_simple_says_running() {
+    fn running_requires_active_iteration_and_service() {
         let mut r = dummy("managed-personal-wa-sync", "owned");
         r.health = "healthy".into();
         r.kind = "simple".into();
         r.activation = "direct".into();
+        r.state = "active".into();
         r.sub = "running".into();
+        assert_eq!(when_label(&r, SystemTime::now()), "");
+        r.active_iteration = Some(ActiveIteration {
+            id: "iteration-1".into(),
+            started_at: String::new(),
+            observed_updated_at: String::new(),
+        });
         assert_eq!(when_label(&r, SystemTime::now()), "running");
+        r.state = "inactive".into();
+        assert_eq!(when_label(&r, SystemTime::now()), "");
     }
 
     #[test]
