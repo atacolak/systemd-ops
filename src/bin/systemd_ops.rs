@@ -3,6 +3,7 @@
 use std::process::ExitCode;
 
 use serde_json::{json, Value};
+use systemd_ops::automation;
 use systemd_ops::config::OpsConfig;
 use systemd_ops::json;
 use systemd_ops::operations;
@@ -61,7 +62,14 @@ Commands:
   automation context
   automation report --headline TEXT --summary JSON_ARRAY
   automation activity --text TEXT
-
+  automation revision --unit STEM
+  automation inspect --unit STEM
+  automation plan-create --spec JSON
+  automation plan-update --spec JSON
+  automation plan-complete --unit STEM --reason TEXT
+  automation plan-retire --unit STEM
+  automation apply --plan-token TOKEN
+  automation complete --unit STEM --reason TEXT
   tui
 ";
 fn take_flag_value(
@@ -633,6 +641,59 @@ fn run_automation(
             let text = require_opt(args, "--text").map_err(BackendError)?;
             remaining_flags(args).map_err(BackendError)?;
             operator::automation_activity(scope_root, cwd, &text)
+        }
+        "revision" => {
+            let unit = require_opt(args, "--unit").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            let env_root = std::env::var("SYSTEMD_OPS_SCOPE_ROOT").ok();
+            let manifest = scope::resolve(scope_root, env_root.as_deref(), cwd)?;
+            Ok(
+                json!({ "unit": unit, "brain_revision": automation::brain_revision(&manifest, &unit)? }),
+            )
+        }
+        "inspect" => {
+            let unit = require_opt(args, "--unit").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            automation::inspect(&unit, scope_root, cwd)
+        }
+        "plan-create" | "plan-update" => {
+            let spec = json_arg(args, "--spec")
+                .map_err(BackendError)?
+                .ok_or_else(|| BackendError("missing --spec".into()))?;
+            remaining_flags(args).map_err(BackendError)?;
+            let payload = json!({ "spec": spec });
+            if cmd == "plan-create" {
+                automation::plan_create(&payload, scope_root, cwd)
+            } else {
+                automation::plan_update(&payload, scope_root, cwd)
+            }
+        }
+        "plan-complete" => {
+            let unit = require_opt(args, "--unit").map_err(BackendError)?;
+            let reason = require_opt(args, "--reason").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            automation::plan_complete(&unit, &reason, scope_root, cwd)
+        }
+        "plan-retire" => {
+            let unit = require_opt(args, "--unit").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            automation::plan_retire(&unit, scope_root, cwd)
+        }
+        "apply" => {
+            let token = require_opt(args, "--plan-token")
+                .or_else(|_| require_opt(args, "--token"))
+                .map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            let cfg = systemd_ops::config::current_or_load()?;
+            let plan = token::parse(&cfg, &token)?;
+            token::require_class(&plan, PlanClass::Automation)?;
+            write::apply_with_context(&token, cwd)
+        }
+        "complete" => {
+            let unit = require_opt(args, "--unit").map_err(BackendError)?;
+            let reason = require_opt(args, "--reason").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            automation::complete_now(&unit, &reason, scope_root, cwd)
         }
         other => Err(BackendError(format!(
             "unknown automation command '{other}'"

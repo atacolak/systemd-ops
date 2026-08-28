@@ -17,6 +17,7 @@ const TOKEN_VERSION: &str = "v1";
 pub enum PlanClass {
     Control,
     Author,
+    Automation,
 }
 
 impl PlanClass {
@@ -24,6 +25,7 @@ impl PlanClass {
         match self {
             PlanClass::Control => "control",
             PlanClass::Author => "author",
+            PlanClass::Automation => "automation",
         }
     }
 
@@ -31,6 +33,7 @@ impl PlanClass {
         match s {
             "control" => Ok(PlanClass::Control),
             "author" => Ok(PlanClass::Author),
+            "automation" => Ok(PlanClass::Automation),
             other => Err(BackendError(format!("unknown plan class '{other}'"))),
         }
     }

@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod automation;
 pub mod config;
 pub mod json;
 pub mod mcp;

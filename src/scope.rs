@@ -23,6 +23,7 @@ pub struct ScopeManifest {
     pub owned: Vec<String>,
     pub critical: Vec<String>,
     pub watch: Vec<String>,
+    pub automation_agent_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +73,7 @@ pub struct Attention {
 #[derive(Clone, Debug)]
 pub struct ScopeView {
     pub id: String,
+    pub automation_agent_root: Option<PathBuf>,
     pub root: PathBuf,
     pub health: ScopeHealth,
     pub owned: Vec<Value>,
@@ -85,6 +87,9 @@ impl ScopeView {
         json!({
             "id": self.id,
             "root": self.root.to_string_lossy(),
+            "automation": {
+                "agent_root": self.automation_agent_root.as_ref().map(|path| path.to_string_lossy()),
+            },
             "health": self.health.as_str(),
             "owned": self.owned,
             "watching": self.watching,
@@ -103,6 +108,7 @@ impl ScopeView {
 #[serde(deny_unknown_fields)]
 struct RawFile {
     scope: Option<RawScope>,
+    automation: Option<RawAutomation>,
     watch: Option<Vec<RawWatch>>,
 }
 
@@ -112,6 +118,12 @@ struct RawScope {
     id: Option<String>,
     owned: Option<Vec<String>>,
     critical: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawAutomation {
+    agent_root: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -275,12 +287,31 @@ fn parse_manifest_named(
     }
     watch.sort();
     watch.dedup();
+    let automation_agent_root = match raw.automation.and_then(|automation| automation.agent_root) {
+        Some(value) => {
+            let path = PathBuf::from(&value);
+            if !path.is_absolute() {
+                return Err(BackendError(
+                    "automation.agent_root must be an absolute path".into(),
+                ));
+            }
+            if !path.is_dir() {
+                return Err(BackendError(format!(
+                    "automation.agent_root '{}' is not a directory",
+                    path.display()
+                )));
+            }
+            Some(path)
+        }
+        None => None,
+    };
     Ok(ScopeManifest {
         id,
         root,
         owned,
         critical,
         watch,
+        automation_agent_root,
     })
 }
 
@@ -361,7 +392,17 @@ pub fn aggregate(
             .unwrap_or("")
             .to_string();
         let critical = manifest.critical.iter().any(|c| c == &unit);
-        let op_health = operations::operation_health(&view);
+        let (automation, automation_warning) = crate::automation::join_operation(manifest, &unit);
+        let completed = automation
+            .get("lifecycle")
+            .and_then(|lifecycle| lifecycle.get("status"))
+            .and_then(Value::as_str)
+            == Some("completed");
+        let op_health = if completed {
+            "healthy"
+        } else {
+            operations::operation_health(&view)
+        };
         view["health"] = json!(op_health);
         view["relationship"] = json!("owned");
         view["critical"] = json!(critical);
@@ -372,6 +413,7 @@ pub fn aggregate(
             .join(".systemd-ops")
             .join(&unit)
             .to_string_lossy());
+        view["automation"] = automation;
         if view.get("definition_revision").is_none() {
             view["definition_revision"] = Value::Null;
         }
@@ -388,6 +430,9 @@ pub fn aggregate(
             .and_then(|operator| operator.get("basis_revision"))
             .cloned()
             .unwrap_or(Value::Null);
+        if let Some(w) = automation_warning {
+            warnings.push(w);
+        }
         if let Some(w) = warn {
             warnings.push(w);
         }
@@ -423,6 +468,7 @@ pub fn aggregate(
         }
         owned.push(view);
     }
+    crate::automation::attach_relations(&mut owned);
     let mut watching = Vec::new();
     for mut view in watching_ops {
         let unit = view
@@ -463,6 +509,7 @@ pub fn aggregate(
     }
     ScopeView {
         id: manifest.id.clone(),
+        automation_agent_root: manifest.automation_agent_root.clone(),
         root: manifest.root.clone(),
         health,
         owned,

@@ -576,6 +576,13 @@ pub fn automation_context(
             ))
         })?;
     let operator = operation.get("operator").cloned().unwrap_or(Value::Null);
+    let automation = operation.get("automation").cloned().unwrap_or(Value::Null);
+    let relations = operation.get("relations").cloned().unwrap_or_else(|| {
+        json!({
+            "parent": Value::Null,
+            "children": [],
+        })
+    });
     Ok(json!({
         "scope": {
             "id": manifest.id,
@@ -589,6 +596,14 @@ pub fn automation_context(
             "operator_state": operation.get("operator_state").cloned().unwrap_or(Value::Null),
             "definition_revision": operation.get("definition_revision").cloned().unwrap_or(Value::Null),
         },
+        "automation": {
+            "agent": automation.get("agent").cloned().unwrap_or(Value::Null),
+            "agent_root": automation.get("agent_root").cloned().unwrap_or(Value::Null),
+            "brain_revision": automation.get("brain_revision").cloned().unwrap_or(Value::Null),
+            "lifecycle": automation.get("lifecycle").cloned().unwrap_or(Value::Null),
+            "parent": automation.get("parent").cloned().unwrap_or(Value::Null),
+        },
+        "relations": relations,
         "runtime": {
             "state": operation.get("state").cloned().unwrap_or(Value::Null),
             "substate": operation.get("sub").cloned().unwrap_or(Value::Null),
@@ -1049,6 +1064,7 @@ mod tests {
             owned: vec!["managed-personal-*".into()],
             critical: Vec::new(),
             watch: vec!["managed-proxy-health".into()],
+            automation_agent_root: None,
         }
     }
 

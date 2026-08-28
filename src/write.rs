@@ -317,6 +317,7 @@ pub fn apply_with_context(token: &str, cwd: Option<&str>) -> Result<Value, Backe
     match plan.class {
         PlanClass::Control => apply_control(&plan),
         PlanClass::Author => apply_author(&plan, cwd),
+        PlanClass::Automation => crate::automation::apply(&plan, cwd),
     }
 }
 
