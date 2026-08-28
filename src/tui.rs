@@ -2175,6 +2175,36 @@ mod tests {
     }
 
     #[test]
+    fn hierarchy_orders_parent_before_children() {
+        let mut parent = dummy("managed-parent", "owned");
+        parent.title = "Parent".into();
+        let mut child_a = dummy("managed-child-a", "owned");
+        child_a.title = "A child".into();
+        child_a.parent = parent.unit.clone();
+        let mut child_b = dummy("managed-child-b", "owned");
+        child_b.title = "B child".into();
+        child_b.parent = parent.unit.clone();
+        let rows = hierarchy_rows(vec![child_b, parent, child_a]);
+        assert_eq!(
+            rows.iter().map(|row| row.unit.as_str()).collect::<Vec<_>>(),
+            vec!["managed-parent", "managed-child-a", "managed-child-b"]
+        );
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(tree_title(&rows[1]), "├─ A child");
+        assert_eq!(tree_title(&rows[2]), "└─ B child");
+    }
+
+    #[test]
+    fn completed_row_is_distinct_and_idle() {
+        let mut row = dummy("managed-completed", "owned");
+        row.lifecycle = "completed".into();
+        row.state = "inactive".into();
+        row.sub = "dead".into();
+        assert_eq!(mark(&row.health, &row.lifecycle), "✓");
+        assert_eq!(when_label(&row, SystemTime::now()), "completed");
+    }
+
+    #[test]
     fn short_exec_uses_basename() {
         assert_eq!(
             short_exec("/home/sf/worlds/personal/.omp/bin/wa-self harvest"),
