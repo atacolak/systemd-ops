@@ -1910,6 +1910,12 @@ pub fn apply_authoring(
             let mut changes = systemd::daemon_reload()?;
             if let Some(unit) = spec.enable_unit() {
                 changes.extend(systemd::apply_verb("enable", &unit, None)?);
+            } else if work.verb == AuthoringVerb::Update {
+                if let Some(timer) = spec.timer_name() {
+                    changes.extend(systemd::try_disable(&timer)?);
+                } else if spec.has_install() {
+                    changes.extend(systemd::try_disable(&spec.service_name())?);
+                }
             }
             if let Some(unit) = spec.start_unit() {
                 changes.extend(systemd::apply_verb("start", &unit, None)?);
