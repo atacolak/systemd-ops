@@ -35,6 +35,36 @@ async function fakeAgentAuthorScope(): Promise<{ root: string; scope: string }> 
 	return { root, scope };
 }
 
+async function fakeAutomationAuthorScope(): Promise<{ root: string; scope: string; log: string }> {
+	const root = await fs.mkdtemp(join(tmpdir(), "systemd-ops-automation-author-"));
+	const scope = join(root, "scope");
+	const bin = join(root, "systemd-ops");
+	const log = join(root, "calls.log");
+	await fs.mkdir(scope, { recursive: true });
+	const ok = (data: Record<string, unknown>) => JSON.stringify({ ok: true, data });
+	await fs.writeFile(
+		bin,
+		`#!/bin/sh
+printf '%s\n' "$*" >>'${log}'
+case " $* " in
+  *" automation inspect-plan "*) printf '%s\n' '${ok({ unit: "managed-child", action: "create", agent: "pr-maintainer", parent: "managed-runtime" })}' ;;
+  *" automation inspect --unit managed-runtime "*) printf '%s\n' '${ok({ unit: "managed-runtime", automation: { agent: "runtime-maintainer", parent: null } })}' ;;
+  *" automation inspect --unit managed-child "*) printf '%s\n' '${ok({ unit: "managed-child", automation: { agent: "pr-maintainer", parent: "managed-runtime" } })}' ;;
+  *" automation inspect --unit managed-outside "*) printf '%s\n' '${ok({ unit: "managed-outside", automation: { agent: "pr-maintainer", parent: null } })}' ;;
+  *" scope show "*) printf '%s\n' '${ok({ owned: [
+		{ unit: "managed-runtime", automation: { agent: "runtime-maintainer", parent: null } },
+		{ unit: "managed-child", automation: { agent: "pr-maintainer", parent: "managed-runtime" } },
+		{ unit: "managed-outside", automation: { agent: "pr-maintainer", parent: null } },
+	] })}' ;;
+  *) printf '%s\n' '${ok({ applied: true })}' ;;
+esac
+`,
+		{ mode: 0o755 },
+	);
+	process.env.SYSTEMD_OPS_BIN = bin;
+	return { root, scope, log };
+}
+
 type AgentAuthorResult = {
 	isError?: boolean;
 	content: Array<{ text: string }>;
@@ -45,7 +75,14 @@ type AgentAuthorExecute = (
 	id: string,
 	params: Record<string, unknown>,
 	update?: unknown,
-	ctx?: { cwd?: string },
+	ctx?: {
+		cwd?: string;
+		rootAgentName?: string;
+		automationAuthor?: {
+			allowedAgents: string[] | "*";
+			jurisdiction: "descendants" | "scope";
+		};
+	},
 ) => Promise<AgentAuthorResult>;
 
 function detailsRecord(result: AgentAuthorResult): Record<string, unknown> {
@@ -247,6 +284,24 @@ test("automation author argv carries typed metadata", () => {
 	})).toEqual([
 		"automation", "plan-complete", "--unit", "managed-omp-pr-9969", "--reason", "merged upstream",
 	]);
+	expect(automationAuthorArgv("inspect_plan", { plan_token: "v1.abc.def" })).toEqual([
+		"automation", "inspect-plan", "--plan-token", "v1.abc.def",
+	]);
+	expect(automationAuthorArgv("request_capability", {
+		summary: "need capability maintainer",
+		reason: "durable local source has no class",
+		suggested_agent: "capability-maintainer",
+	})).toEqual([
+		"automation",
+		"request-capability",
+		"--summary",
+		"need capability maintainer",
+		"--reason",
+		"durable local source has no class",
+		"--suggested-agent",
+		"capability-maintainer",
+	]);
+
 });
 
 test("agent author serialization uses canonical OMP field names", () => {
@@ -259,6 +314,10 @@ test("agent author serialization uses canonical OMP field names", () => {
 		readSummarize: false,
 		autoloadSkills: ["hcom"],
 		advisor: false,
+		automationAuthor: {
+			allowedAgents: ["pr-maintainer", "capability-maintainer"],
+			jurisdiction: "descendants",
+		},
 		systemPrompt: "maintain exactly one PR.",
 	});
 	expect(text).toContain("thinkingLevel: high");
@@ -266,6 +325,9 @@ test("agent author serialization uses canonical OMP field names", () => {
 	expect(text).not.toContain("thinking-level");
 	expect(text).not.toContain("read-summarize");
 	expect(text).toContain("maintain exactly one PR.");
+	expect(text).toContain("automationAuthor:");
+	expect(text).toContain("jurisdiction: descendants");
+
 });
 
 test("privileged automation author tools are hidden", () => {
@@ -275,6 +337,103 @@ test("privileged automation author tools are hidden", () => {
 	expect(byName.get("automation_author")?.hidden).toBe(true);
 	expect(byName.get("automation_context")?.hidden).toBe(true);
 });
+
+test("automation_author fails closed without session policy", async () => {
+	const tools = systemdTools({});
+	const author = tools.find((tool) => tool.name === "automation_author");
+	expect(author).toBeDefined();
+	const result = await (author!.execute as AgentAuthorExecute)("1", {
+		action: "plan_create",
+		unit: "managed-x",
+		agent: "pr-maintainer",
+	});
+	expect(result.isError).toBe(true);
+	expect(result.content[0]?.text).toContain("effective root automationAuthor policy");
+});
+
+test("descendant author permits children and rejects unrelated roots", async () => {
+	const { root, scope } = await fakeAutomationAuthorScope();
+	const previousOperation = process.env.SYSTEMD_OPS_OPERATION;
+	process.env.SYSTEMD_OPS_OPERATION = "managed-runtime";
+	try {
+		const tool = systemdTools({ cwd: scope }).find((candidate) => candidate.name === "automation_author");
+		const execute = tool!.execute as AgentAuthorExecute;
+		const ctx = {
+			cwd: scope,
+			rootAgentName: "runtime-maintainer",
+			automationAuthor: {
+				allowedAgents: ["pr-maintainer", "capability-maintainer"],
+				jurisdiction: "descendants" as const,
+			},
+		};
+		const allowed = await execute("allowed", {
+			action: "plan_create",
+			unit: "managed-new-child",
+			agent: "capability-maintainer",
+			parent: "managed-runtime",
+		}, undefined, ctx);
+		expect(allowed.isError).toBeUndefined();
+
+		const unrelated = await execute("outside", {
+			action: "plan_update",
+			unit: "managed-outside",
+			agent: "pr-maintainer",
+		}, undefined, ctx);
+		expect(unrelated.isError).toBe(true);
+		expect(unrelated.content[0]?.text).toContain("outside the caller subtree");
+
+		const forbidden = await execute("forbidden", {
+			action: "plan_create",
+			unit: "managed-bad-child",
+			agent: "automation-builder",
+			parent: "managed-runtime",
+		}, undefined, ctx);
+		expect(forbidden.isError).toBe(true);
+		expect(forbidden.content[0]?.text).toContain("outside allowedAgents");
+	} finally {
+		if (previousOperation === undefined) delete process.env.SYSTEMD_OPS_OPERATION;
+		else process.env.SYSTEMD_OPS_OPERATION = previousOperation;
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("scope author and signed apply follow policy", async () => {
+	const { root, scope, log } = await fakeAutomationAuthorScope();
+	try {
+		const tool = systemdTools({ cwd: scope }).find((candidate) => candidate.name === "automation_author");
+		const execute = tool!.execute as AgentAuthorExecute;
+		const scopeContext = {
+			cwd: scope,
+			rootAgentName: "automation-builder",
+			automationAuthor: { allowedAgents: "*" as const, jurisdiction: "scope" as const },
+		};
+		const applied = await execute("apply", { action: "apply", plan_token: "v1.proof" }, undefined, scopeContext);
+		expect(applied.isError).toBeUndefined();
+		const calls = await fs.readFile(log, "utf8");
+		expect(calls).toContain("automation inspect-plan --plan-token v1.proof");
+		expect(calls).toContain("automation apply --plan-token v1.proof");
+
+		const descendantContext = {
+			cwd: scope,
+			rootAgentName: "runtime-maintainer",
+			automationAuthor: {
+				allowedAgents: ["capability-maintainer"],
+				jurisdiction: "descendants" as const,
+			},
+		};
+		const unresolved = await execute("resolve", {
+			action: "resolve_request",
+			id: "req-20260829-abcdef",
+			resolution: "created",
+		}, undefined, descendantContext);
+		expect(unresolved.isError).toBe(true);
+		expect(unresolved.content[0]?.text).toContain("scope jurisdiction");
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+
 
 test("agent author create update list inspect and retire use configured root", async () => {
 	const { root, scope } = await fakeAgentAuthorScope();

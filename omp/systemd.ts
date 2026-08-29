@@ -73,6 +73,7 @@ const AGENT_FIELDS = [
 	"readSummarize",
 	"autoloadSkills",
 	"spawns",
+	"automationAuthor",
 	"advisor",
 	"systemPrompt",
 ] as const;
@@ -107,6 +108,10 @@ function validateAgentDefinition(input: Json): Json {
 			throw new Error(`${key} must be boolean`);
 		}
 	}
+	if (input.automationAuthor !== undefined) {
+		input.automationAuthor = validateAutomationAuthor(input.automationAuthor);
+	}
+
 	return pick(input, AGENT_FIELDS);
 }
 
@@ -159,8 +164,9 @@ export async function agentRootFromScope(cwd?: string): Promise<string> {
 export function automationAuthorArgv(action: string, params: Json): string[] {
 	switch (action) {
 		case "inspect":
-
 			return ["automation", "inspect", "--unit", String(params.unit ?? "")];
+		case "inspect_plan":
+			return ["automation", "inspect-plan", "--plan-token", String(tokenOf(params) ?? "")];
 		case "plan_create":
 		case "plan_update": {
 			const spec = params.spec && typeof params.spec === "object"
@@ -179,16 +185,184 @@ export function automationAuthorArgv(action: string, params: Json): string[] {
 			return ["automation", "plan-retire", "--unit", String(params.unit ?? "")];
 		case "apply":
 			return ["automation", "apply", "--plan-token", String(tokenOf(params) ?? "")];
+		case "request_capability": {
+			const argv = [
+				"automation",
+				"request-capability",
+				"--summary",
+				String(params.summary ?? ""),
+				"--reason",
+				String(params.reason ?? ""),
+			];
+			if (typeof params.target_agent === "string" && params.target_agent.length > 0) {
+				argv.push("--target-agent", params.target_agent);
+			}
+			if (typeof params.suggested_agent === "string" && params.suggested_agent.length > 0) {
+				argv.push("--suggested-agent", params.suggested_agent);
+			}
+			return argv;
+		}
+		case "list_requests":
+			return ["automation", "list-requests"];
+		case "inspect_request":
+			return ["automation", "inspect-request", "--id", String(params.id ?? "")];
+		case "resolve_request":
+			return ["automation", "resolve-request", "--id", String(params.id ?? ""), "--resolution", String(params.resolution ?? "")];
 		default:
 			throw new Error(`unknown automation author action '${action}'`);
 	}
 }
 
+
 type Json = Record<string, unknown>;
+type AutomationAuthorPolicy = {
+	allowedAgents: string[] | "*";
+	jurisdiction: "descendants" | "scope";
+};
 
 type SessionLike = {
 	cwd?: string;
+	rootAgentName?: string;
+	automationAuthor?: AutomationAuthorPolicy;
 };
+
+function validateAutomationAuthor(value: unknown): AutomationAuthorPolicy {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("automationAuthor must be an object");
+	}
+	const record = value as Json;
+	const jurisdiction = record.jurisdiction;
+	if (jurisdiction !== "descendants" && jurisdiction !== "scope") {
+		throw new Error("automationAuthor.jurisdiction must be descendants or scope");
+	}
+	const allowed = record.allowedAgents;
+	if (allowed === "*") return { allowedAgents: "*", jurisdiction };
+	if (
+		!Array.isArray(allowed) ||
+		allowed.length === 0 ||
+		allowed.some((item) => typeof item !== "string" || item.trim().length === 0)
+	) {
+		throw new Error("automationAuthor.allowedAgents must be '*' or a non-empty string array");
+	}
+	return { allowedAgents: allowed.map((item) => String(item).trim()), jurisdiction };
+}
+
+function requireAuthorPolicy(ctx: SessionLike | undefined): AutomationAuthorPolicy {
+	if (!ctx?.automationAuthor) {
+		throw new Error("automation_author requires an effective root automationAuthor policy");
+	}
+	return ctx.automationAuthor;
+}
+
+function agentAllowed(policy: AutomationAuthorPolicy, agent: string | undefined): boolean {
+	if (!agent) return false;
+	if (policy.allowedAgents === "*") return true;
+	return policy.allowedAgents.includes(agent);
+}
+
+function envelopeData(env: Json): Json {
+	if (env.ok !== true) {
+		const err = (env.error ?? {}) as Json;
+		throw new Error(typeof err.message === "string" ? err.message : JSON.stringify(env));
+	}
+	return (env.data ?? {}) as Json;
+}
+
+function isDescendantOf(child: string, ancestor: string, operations: Json[]): boolean {
+	const parents = new Map<string, string>();
+	for (const operation of operations) {
+		const unit = typeof operation.unit === "string" ? operation.unit : "";
+		const parent = (operation.automation as Json | undefined)?.parent;
+		if (unit && typeof parent === "string" && parent.length > 0) parents.set(unit, parent);
+	}
+	const seen = new Set<string>();
+	let current = child;
+	while (parents.has(current)) {
+		const parent = parents.get(current);
+		if (!parent || seen.has(parent)) break;
+		if (parent === ancestor) return true;
+		seen.add(parent);
+		current = parent;
+	}
+	return false;
+}
+
+async function authorizeAuthorAction(
+	action: string,
+	params: Json,
+	ctx: SessionLike | undefined,
+	cwd: string | undefined,
+): Promise<void> {
+	const policy = requireAuthorPolicy(ctx);
+	const caller = typeof ctx?.rootAgentName === "string" ? ctx.rootAgentName : "";
+	if (action === "inspect" || action === "list_requests" || action === "inspect_request" || action === "inspect_plan") {
+		return;
+	}
+	if (action === "request_capability") {
+		const target = typeof params.target_agent === "string" ? params.target_agent : undefined;
+		const suggested = typeof params.suggested_agent === "string" ? params.suggested_agent : undefined;
+		if (!target && !suggested) throw new Error("request_capability requires target_agent or suggested_agent");
+		if (target && !agentAllowed(policy, target)) {
+			throw new Error(`request_capability target_agent '${target}' is outside allowedAgents`);
+		}
+		return;
+	}
+	if (action === "resolve_request" && policy.jurisdiction !== "scope") {
+		throw new Error("resolve_request requires scope jurisdiction");
+	}
+	if (action === "resolve_request") return;
+	let unit = typeof params.unit === "string" ? params.unit : "";
+	let agent = typeof params.agent === "string" ? params.agent : undefined;
+	let parent = typeof params.parent === "string" ? params.parent : undefined;
+	if (params.spec && typeof params.spec === "object") {
+		const spec = params.spec as Json;
+		if (!unit && typeof spec.unit === "string") unit = spec.unit;
+		if (!agent && typeof spec.agent === "string") agent = spec.agent;
+		if (!parent && typeof spec.parent === "string") parent = spec.parent;
+	}
+	if (action === "apply") {
+		const inspected = envelopeData(await runOps(["automation", "inspect-plan", "--plan-token", String(tokenOf(params) ?? "")], cwd));
+		unit = typeof inspected.unit === "string" ? inspected.unit : unit;
+		agent = typeof inspected.agent === "string" ? inspected.agent : agent;
+		parent = typeof inspected.parent === "string" ? inspected.parent : parent;
+	}
+	if (!unit) throw new Error(`${action} requires a target unit`);
+	if (policy.jurisdiction === "scope") {
+		if (agent && !agentAllowed(policy, agent)) {
+			throw new Error(`agent '${agent}' is outside allowedAgents`);
+		}
+		return;
+	}
+	if (!caller) throw new Error("descendants jurisdiction requires a resolved rootAgentName");
+	if (unit === process.env.SYSTEMD_OPS_OPERATION) {
+		throw new Error("descendants jurisdiction cannot mutate the caller");
+	}
+	const inspected = envelopeData(await runOps(["automation", "inspect", "--unit", unit], cwd));
+	const currentAgent = ((inspected.automation as Json | undefined)?.agent as string | undefined) ?? agent;
+	const currentParent = ((inspected.automation as Json | undefined)?.parent as string | undefined) ?? parent;
+	const effectiveAgent = agent ?? currentAgent;
+	const effectiveParent = parent ?? currentParent;
+	if (!agentAllowed(policy, effectiveAgent)) {
+		throw new Error(`agent '${effectiveAgent ?? ""}' is outside allowedAgents`);
+	}
+	const scope = envelopeData(await runOps(["scope", "show"], cwd));
+	const owned = Array.isArray(scope.owned) ? (scope.owned as Json[]) : [];
+	const callerUnit = owned.find((operation) => (operation.automation as Json | undefined)?.agent === caller);
+	const callerStem = typeof callerUnit?.unit === "string" ? callerUnit.unit : process.env.SYSTEMD_OPS_OPERATION;
+	if (!callerStem) throw new Error("cannot resolve caller unit for descendants jurisdiction");
+	if (action === "plan_create") {
+		if (effectiveParent !== callerStem && !isDescendantOf(effectiveParent ?? "", callerStem, owned)) {
+			throw new Error("descendants jurisdiction cannot parent outside the caller subtree");
+		}
+		return;
+	}
+	if (!isDescendantOf(unit, callerStem, owned) && currentParent !== callerStem) {
+		throw new Error("descendants jurisdiction cannot mutate units outside the caller subtree");
+	}
+}
+
+
+
 
 function textResult(text: string, extra?: { isError?: boolean; details?: unknown }) {
 	return {
@@ -727,14 +901,29 @@ export default function systemdTools(pi: { cwd?: string }) {
 			approval: "write" as const,
 			strict: true as const,
 			description:
-				"Privileged explicit-only automation instance author. Composes existing sealed systemd author plans " +
-				"with generic agent metadata and completed lifecycle state. Not for ordinary runtime maintainers.",
+				"Policy-bound automation instance author. Inspects existing instances and signed plans; creates, updates, completes, or retires only authorized instances of existing agent classes. " +
+				"Capability requests are durable advisory records, not delivery. Apply accepts only a signed plan whose unit, agent, and parent satisfy the resolved root agent's automationAuthor policy. Not for delegated workers or child maintainers.",
 			parameters: {
 				type: "object",
 				additionalProperties: false,
 				required: ["action"],
 				properties: {
-					action: { type: "string", enum: ["inspect", "plan_create", "plan_update", "plan_complete", "plan_retire", "apply"] },
+					action: {
+						type: "string",
+						enum: [
+							"inspect",
+							"inspect_plan",
+							"plan_create",
+							"plan_update",
+							"plan_complete",
+							"plan_retire",
+							"apply",
+							"request_capability",
+							"list_requests",
+							"inspect_request",
+							"resolve_request",
+						],
+					},
 					unit: { type: "string" },
 					title: { type: "string" },
 					purpose: { type: "string" },
@@ -758,12 +947,19 @@ export default function systemdTools(pi: { cwd?: string }) {
 					reason: { type: "string" },
 					spec: { type: "object" },
 					plan_token: { type: "string" },
+					summary: { type: "string" },
+					target_agent: { type: "string" },
+					suggested_agent: { type: "string" },
+					id: { type: "string" },
+					resolution: { type: "string" },
 				},
 			},
 			async execute(_id: string, params: Json, _onUpdate?: unknown, ctx?: SessionLike) {
 				try {
 					const action = String(params.action ?? "");
-					return envelopeResult(await runOps(automationAuthorArgv(action, params), sessionCwd(ctx, factoryCwd)));
+					const cwd = sessionCwd(ctx, factoryCwd);
+					await authorizeAuthorAction(action, params, ctx, cwd);
+					return envelopeResult(await runOps(automationAuthorArgv(action, params), cwd));
 				} catch (e) {
 					return textResult(e instanceof Error ? e.message : String(e), { isError: true });
 				}

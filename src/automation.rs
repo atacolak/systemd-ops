@@ -17,9 +17,13 @@ use crate::systemd::{self, BackendError};
 use crate::token::{self, PlanClass};
 
 pub const AUTOMATION_VERSION: u32 = 1;
+
 const DIR_NAME: &str = ".systemd-ops";
+const REQUESTS_DIR: &str = "requests";
 const MAX_BRAIN_PATHS: usize = 32;
 const MAX_REASON: usize = 500;
+const MAX_REQUEST_SUMMARY: usize = 120;
+const MAX_REQUEST_REASON: usize = 2000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -363,10 +367,16 @@ fn relation_summary(operation: &Value) -> Value {
     json!({
         "unit": operation.get("unit").cloned().unwrap_or(Value::Null),
         "title": operation.get("title").cloned().unwrap_or(Value::Null),
+        "agent": operation
+            .get("automation")
+            .and_then(|value| value.get("agent"))
+            .cloned()
+            .unwrap_or(Value::Null),
         "health": operation.get("health").cloned().unwrap_or(Value::Null),
         "lifecycle": lifecycle,
         "running": state == "active" && sub == "running",
         "headline": operator.get("headline").cloned().unwrap_or(Value::Null),
+        "checkpoint": checkpoint_summary(operation),
     })
 }
 
@@ -792,6 +802,332 @@ pub fn apply(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Backe
     }
 }
 
+pub fn inspect_plan(token: &str) -> Result<Value, BackendError> {
+    let cfg = crate::config::current_or_load()?;
+    let plan = token::parse(&cfg, token)?;
+    let action = plan
+        .payload
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let agent = plan
+        .payload
+        .get("metadata")
+        .and_then(Value::as_str)
+        .and_then(|text| parse_metadata(text).ok())
+        .map(|metadata| metadata.agent);
+    let parent = plan
+        .payload
+        .get("metadata")
+        .and_then(Value::as_str)
+        .and_then(|text| parse_metadata(text).ok())
+        .and_then(|metadata| metadata.parent);
+    Ok(json!({
+        "class": plan.class.as_str(),
+        "unit": plan.unit,
+        "action": action,
+        "agent": agent,
+        "parent": parent,
+        "scope_root": plan.payload.get("scope_root").cloned().unwrap_or(Value::Null),
+        "issued_at": crate::config::unix_to_rfc3339(plan.issued_at),
+        "expires_at": crate::config::unix_to_rfc3339(plan.expires_at),
+        "origin_cwd": plan.origin_cwd,
+    }))
+}
+
+fn requests_dir(root: &Path) -> PathBuf {
+    root.join(DIR_NAME).join(REQUESTS_DIR)
+}
+
+fn request_path(root: &Path, id: &str) -> PathBuf {
+    requests_dir(root).join(format!("{id}.json"))
+}
+
+fn validate_request_id(id: &str) -> Result<(), BackendError> {
+    let rest = id
+        .strip_prefix("req-")
+        .ok_or_else(|| BackendError("request id must match req-YYYYMMDD-xxxxxx".into()))?;
+    let valid = rest.len() == 15
+        && rest.as_bytes().get(8) == Some(&b'-')
+        && rest.bytes().enumerate().all(|(index, byte)| {
+            if index == 8 {
+                byte == b'-'
+            } else {
+                byte.is_ascii_alphanumeric()
+            }
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(BackendError(
+            "request id must match req-YYYYMMDD-xxxxxx".into(),
+        ))
+    }
+}
+
+fn new_request_id() -> Result<String, BackendError> {
+    let now = crate::config::now_unix();
+    let date = crate::config::unix_to_rfc3339(now);
+    let ymd = date.get(..10).unwrap_or("19700101").replace('-', "");
+    let mut bytes = [0u8; 3];
+    let mut random = std::fs::File::open("/dev/urandom")
+        .map_err(|error| BackendError(format!("cannot open /dev/urandom: {error}")))?;
+    use std::io::Read;
+    random
+        .read_exact(&mut bytes)
+        .map_err(|error| BackendError(format!("cannot read /dev/urandom: {error}")))?;
+    Ok(format!(
+        "req-{ymd}-{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2]
+    ))
+}
+
+fn write_new_request(path: &Path, bytes: &[u8]) -> Result<bool, BackendError> {
+    refuse_symlink(path)?;
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => {
+            return Err(BackendError(format!(
+                "cannot create {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(path);
+        return Err(BackendError(format!(
+            "cannot write {}: {error}",
+            path.display()
+        )));
+    }
+    if let Err(error) =
+        fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+    {
+        let _ = fs::remove_file(path);
+        return Err(BackendError(format!(
+            "cannot chmod {}: {error}",
+            path.display()
+        )));
+    }
+    Ok(true)
+}
+
+fn load_request(root: &Path, id: &str) -> Result<Value, BackendError> {
+    validate_request_id(id)?;
+    let path = request_path(root, id);
+    let bytes = fs::read(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            BackendError(format!("request '{id}' does not exist"))
+        } else {
+            BackendError(format!("cannot read {}: {error}", path.display()))
+        }
+    })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| BackendError(format!("malformed {}: {error}", path.display())))
+}
+
+pub fn request_capability(
+    summary: &str,
+    reason: &str,
+    target_agent: Option<&str>,
+    suggested_agent: Option<&str>,
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let summary = crate::operator::strict_line("summary", summary, MAX_REQUEST_SUMMARY)?;
+    let reason = crate::operator::strict_line("reason", reason, MAX_REQUEST_REASON)?;
+    if let Some(agent) = target_agent {
+        validate_agent_name(agent)?;
+    }
+    if let Some(agent) = suggested_agent {
+        validate_agent_name(agent)?;
+    }
+    if target_agent.is_some() == suggested_agent.is_some() {
+        return Err(BackendError(
+            "exactly one of target_agent or suggested_agent is required".into(),
+        ));
+    }
+    let (manifest, stem) = crate::operator::bound_operation_manifest(explicit_root, cwd)?;
+    let requester_agent = load_metadata(&manifest.root, &stem)?
+        .map(|metadata| metadata.agent)
+        .unwrap_or_default();
+    let directory = requests_dir(&manifest.root);
+    fs::create_dir_all(&directory)
+        .map_err(|error| BackendError(format!("cannot create {}: {error}", directory.display())))?;
+    for _ in 0..16 {
+        let id = new_request_id()?;
+        let record = json!({
+            "version": 1,
+            "id": id,
+            "kind": "automation-capability",
+            "status": "open",
+            "created_at": crate::config::unix_to_rfc3339(crate::config::now_unix()),
+            "requester_unit": stem,
+            "requester_agent": requester_agent,
+            "summary": summary,
+            "reason": reason,
+            "target_agent": target_agent,
+            "suggested_agent": suggested_agent,
+            "resolved_at": Value::Null,
+            "resolution": Value::Null,
+        });
+        let bytes = serde_json::to_vec_pretty(&record)
+            .map_err(|error| BackendError(format!("cannot serialize request: {error}")))?;
+        if write_new_request(&request_path(&manifest.root, &id), &bytes)? {
+            return Ok(record);
+        }
+    }
+    Err(BackendError(
+        "cannot allocate a unique request id after 16 attempts".into(),
+    ))
+}
+
+pub fn list_requests(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let manifest = resolved_manifest(explicit_root, cwd)?;
+    let directory = requests_dir(&manifest.root);
+    let mut requests = Vec::new();
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({ "requests": [] }));
+        }
+        Err(error) => {
+            return Err(BackendError(format!(
+                "cannot read {}: {error}",
+                directory.display()
+            )))
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            BackendError(format!("cannot read {}: {error}", directory.display()))
+        })?;
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+            continue;
+        };
+        if validate_request_id(id).is_ok() {
+            requests.push(load_request(&manifest.root, id)?);
+        }
+    }
+    requests.sort_by(|a, b| {
+        a.get("id")
+            .and_then(Value::as_str)
+            .cmp(&b.get("id").and_then(Value::as_str))
+    });
+    Ok(json!({ "requests": requests }))
+}
+
+pub fn inspect_request(
+    id: &str,
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let manifest = resolved_manifest(explicit_root, cwd)?;
+    load_request(&manifest.root, id)
+}
+
+pub fn resolve_request(
+    id: &str,
+    resolution: &str,
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let resolution = crate::operator::strict_line("resolution", resolution, MAX_REQUEST_REASON)?;
+    let manifest = resolved_manifest(explicit_root, cwd)?;
+    let mut record = load_request(&manifest.root, id)?;
+    if record.get("status").and_then(Value::as_str) != Some("open") {
+        return Err(BackendError(format!("request '{id}' is not open")));
+    }
+    record["status"] = json!("resolved");
+    record["resolved_at"] = json!(crate::config::unix_to_rfc3339(crate::config::now_unix()));
+    record["resolution"] = json!(resolution);
+    let bytes = serde_json::to_vec_pretty(&record)
+        .map_err(|error| BackendError(format!("cannot serialize request: {error}")))?;
+    atomic_write(&request_path(&manifest.root, id), &bytes)?;
+    Ok(record)
+}
+
+fn checkpoint_summary(operation: &Value) -> Value {
+    let operator = operation.get("operator").unwrap_or(&Value::Null);
+    let latest = operator
+        .get("iterations")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first());
+    let exit_zero = latest
+        .and_then(|item| item.get("exit_code"))
+        .and_then(Value::as_i64)
+        == Some(0);
+    let reconsolidated = latest
+        .and_then(|item| item.get("reconsolidated"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let fingerprint = operation_home_from_unit(operation)
+        .and_then(|home| fs::read_to_string(home.join("state/fingerprint")).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    json!({
+        "exit_zero": exit_zero,
+        "reconsolidated": reconsolidated,
+        "fingerprint": fingerprint,
+        "stable": exit_zero && reconsolidated && fingerprint.is_some(),
+    })
+}
+
+fn operation_home_from_unit(operation: &Value) -> Option<PathBuf> {
+    operation
+        .get("operation_home")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+}
+
+pub fn notify_parent(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let (manifest, stem) = crate::operator::bound_operation_manifest(explicit_root, cwd)?;
+    let view = crate::scope::show_manifest(&manifest)?;
+    let operation = view
+        .owned
+        .iter()
+        .find(|operation| operation.get("unit").and_then(Value::as_str) == Some(stem.as_str()))
+        .ok_or_else(|| {
+            BackendError(format!(
+                "bound operation '{stem}' is not present in the scope"
+            ))
+        })?;
+    let parent = operation
+        .get("automation")
+        .and_then(|value| value.get("parent"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError(format!("'{stem}' has no parent to notify")))?;
+    let checkpoint = checkpoint_summary(operation);
+    if checkpoint.get("stable").and_then(Value::as_bool) != Some(true) {
+        return Err(BackendError(format!(
+            "parent notification requires a stable successful checkpoint for '{stem}'"
+        )));
+    }
+    let timer = format!("{parent}.timer");
+    let planned = crate::write::plan(crate::write::Action::Start, &timer, None)?;
+    let token = planned
+        .get("plan_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("parent notification plan did not return a token".into()))?;
+    let applied = crate::write::apply_with_context(token, cwd)?;
+    Ok(json!({
+        "notified": true,
+        "child": stem,
+        "parent": parent,
+        "checkpoint": checkpoint,
+        "systemd": applied,
+    }))
+}
+
 pub fn inspect(
     stem: &str,
     explicit_root: Option<&str>,
@@ -1088,6 +1424,167 @@ mod tests {
             .unwrap_err()
             .0
             .contains("traversal"));
+    }
+
+    #[test]
+    fn inspect_plan_exposes_action_unit_and_agent() {
+        let dir = std::env::temp_dir().join(format!(
+            "systemd-ops-inspect-plan-{}-{}",
+            std::process::id(),
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let cfg = crate::config::OpsConfig {
+            manager: systemd::Manager::User,
+            write_prefix: Some("managed-*".into()),
+            plan_ttl_secs: 600,
+            state_dir: dir.clone(),
+        };
+        crate::config::set_current(cfg.clone());
+        let metadata = canonical_metadata(&AutomationMetadata {
+            version: 1,
+            agent: "pr-maintainer".into(),
+            parent: Some("managed-runtime".into()),
+            brain_paths: Vec::new(),
+        })
+        .unwrap();
+        let (token, _) = token::mint(
+            &cfg,
+            PlanClass::Automation,
+            "managed-child",
+            None,
+            json!({
+                "action": "create",
+                "metadata": metadata,
+                "scope_root": "/tmp/scope",
+            }),
+        )
+        .unwrap();
+        let inspected = inspect_plan(&token).unwrap();
+        assert_eq!(inspected["class"], "automation");
+        assert_eq!(inspected["unit"], "managed-child");
+        assert_eq!(inspected["action"], "create");
+        assert_eq!(inspected["agent"], "pr-maintainer");
+        assert_eq!(inspected["parent"], "managed-runtime");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn request_lifecycle_is_durable_and_compact() {
+        let root = tmp_root("requests");
+        let previous_root = std::env::var_os("SYSTEMD_OPS_SCOPE_ROOT");
+        let previous_op = std::env::var_os("SYSTEMD_OPS_OPERATION");
+        std::env::set_var("SYSTEMD_OPS_SCOPE_ROOT", &root);
+        std::env::set_var("SYSTEMD_OPS_OPERATION", "managed-proof");
+        fs::create_dir_all(root.join("agents")).unwrap();
+
+        fs::create_dir_all(root.join(".systemd-ops")).unwrap();
+        fs::write(
+            root.join(".systemd-ops/scope.toml"),
+            format!(
+                "[scope]\nid = \"proof\"\nowned = [\"managed-*\"]\n[automation]\nagent_root = \"{}\"\n",
+                root.join("agents").display()
+            ),
+        )
+        .unwrap();
+
+        write_metadata(&root, "managed-proof", vec![]);
+        let created = request_capability(
+            "need capability maintainer",
+            "durable local source has no class",
+            None,
+            Some("capability-maintainer"),
+            Some(root.to_str().unwrap()),
+            Some(root.to_str().unwrap()),
+        )
+        .unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+        assert!(id.starts_with("req-"));
+        assert_eq!(id.len(), 19);
+        assert_eq!(created["status"], "open");
+        let listed =
+            list_requests(Some(root.to_str().unwrap()), Some(root.to_str().unwrap())).unwrap();
+        assert_eq!(listed["requests"][0]["id"], id);
+        let resolved = resolve_request(
+            &id,
+            "created capability-maintainer",
+            Some(root.to_str().unwrap()),
+            Some(root.to_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(resolved["status"], "resolved");
+        match previous_root {
+            Some(value) => std::env::set_var("SYSTEMD_OPS_SCOPE_ROOT", value),
+            None => std::env::remove_var("SYSTEMD_OPS_SCOPE_ROOT"),
+        }
+        match previous_op {
+            Some(value) => std::env::set_var("SYSTEMD_OPS_OPERATION", value),
+            None => std::env::remove_var("SYSTEMD_OPS_OPERATION"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn request_create_never_overwrites_an_existing_record() {
+        let root = tmp_root("request-collision");
+        let directory = requests_dir(&root);
+        fs::create_dir_all(&directory).unwrap();
+        let id = new_request_id().unwrap();
+        let path = request_path(&root, &id);
+        fs::write(&path, b"existing\n").unwrap();
+        assert!(!write_new_request(&path, b"replacement\n").unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"existing\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_request_record_is_reported() {
+        let root = tmp_root("request-malformed");
+        let id = "req-20260829-abcdef";
+        let path = request_path(&root, id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"{not-json").unwrap();
+        let error = load_request(&root, id).unwrap_err();
+        assert!(error.0.contains("malformed"), "{}", error.0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn notify_parent_requires_stable_checkpoint() {
+        let root = tmp_root("notify");
+        let previous_root = std::env::var_os("SYSTEMD_OPS_SCOPE_ROOT");
+        let previous_op = std::env::var_os("SYSTEMD_OPS_OPERATION");
+        std::env::set_var("SYSTEMD_OPS_SCOPE_ROOT", &root);
+        std::env::set_var("SYSTEMD_OPS_OPERATION", "managed-child");
+        fs::create_dir_all(root.join("agents")).unwrap();
+        fs::create_dir_all(root.join(".systemd-ops")).unwrap();
+        fs::write(
+            root.join(".systemd-ops/scope.toml"),
+            format!(
+                "[scope]\nid = \"proof\"\nowned = [\"managed-*\"]\n[automation]\nagent_root = \"{}\"\n",
+                root.join("agents").display()
+            ),
+        )
+        .unwrap();
+        let error = with_user_unit_dir(&root, &["managed-child", "managed-parent"], || {
+            write_parent_fixture(&root, "managed-parent", None);
+            write_parent_fixture(&root, "managed-child", Some("managed-parent"));
+            notify_parent(Some(root.to_str().unwrap()), Some(root.to_str().unwrap())).unwrap_err()
+        });
+        assert!(
+            error.0.contains("stable successful checkpoint") || error.0.contains("no parent"),
+            "{}",
+            error.0
+        );
+        match previous_root {
+            Some(value) => std::env::set_var("SYSTEMD_OPS_SCOPE_ROOT", value),
+            None => std::env::remove_var("SYSTEMD_OPS_SCOPE_ROOT"),
+        }
+        match previous_op {
+            Some(value) => std::env::set_var("SYSTEMD_OPS_OPERATION", value),
+            None => std::env::remove_var("SYSTEMD_OPS_OPERATION"),
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

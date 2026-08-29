@@ -501,7 +501,7 @@ fn bound_operation() -> Result<String, BackendError> {
     Ok(stem)
 }
 
-fn bound_manifest(
+pub fn bound_operation_manifest(
     explicit_root: Option<&str>,
     cwd: Option<&str>,
 ) -> Result<(ScopeManifest, String), BackendError> {
@@ -509,6 +509,10 @@ fn bound_manifest(
     let stem = bound_operation()?;
     require_owned(&manifest, &stem)?;
     Ok((manifest, stem))
+}
+
+pub fn strict_line(label: &str, value: &str, max: usize) -> Result<String, BackendError> {
+    strict_single_line(label, value, max)
 }
 
 fn strict_single_line(label: &str, value: &str, max: usize) -> Result<String, BackendError> {
@@ -564,7 +568,8 @@ pub fn automation_context(
     explicit_root: Option<&str>,
     cwd: Option<&str>,
 ) -> Result<Value, BackendError> {
-    let (manifest, stem) = bound_manifest(explicit_root, cwd)?;
+    let (manifest, stem) = bound_operation_manifest(explicit_root, cwd)?;
+
     let view = crate::scope::show_manifest(&manifest)?;
     let operation = view
         .owned
@@ -634,7 +639,8 @@ pub fn automation_report(
     let headline = strict_single_line("headline", headline, MAX_AUTOMATION_HEADLINE)?;
     let summary = strict_summary(summary)?;
     let body = summary.join("\n\n");
-    let (manifest, stem) = bound_manifest(explicit_root, cwd)?;
+    let (manifest, stem) = bound_operation_manifest(explicit_root, cwd)?;
+
     let (load, warning) = load_with_warning(&manifest.root, &stem);
     let mut surface = match load {
         OperatorLoad::Ready(surface) => surface,
@@ -670,7 +676,8 @@ pub fn automation_activity(
     text: &str,
 ) -> Result<Value, BackendError> {
     let text = strict_single_line("activity text", text, MAX_AUTOMATION_ACTIVITY)?;
-    let (manifest, stem) = bound_manifest(explicit_root, cwd)?;
+    let (manifest, stem) = bound_operation_manifest(explicit_root, cwd)?;
+
     let (load, warning) = load_with_warning(&manifest.root, &stem);
     let mut surface = match load {
         OperatorLoad::Ready(surface) => surface,

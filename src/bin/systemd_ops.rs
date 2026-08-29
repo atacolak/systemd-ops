@@ -63,6 +63,13 @@ Commands:
   automation report --headline TEXT --summary JSON_ARRAY
   automation activity --text TEXT
   automation revision --unit STEM
+  automation inspect-plan --plan-token TOKEN
+  automation request-capability --summary TEXT --reason TEXT [--target-agent NAME | --suggested-agent NAME]
+  automation list-requests
+  automation inspect-request --id ID
+  automation resolve-request --id ID --resolution TEXT
+  automation notify-parent
+
   automation inspect --unit STEM
   automation plan-create --spec JSON
   automation plan-update --spec JSON
@@ -695,6 +702,48 @@ fn run_automation(
             remaining_flags(args).map_err(BackendError)?;
             automation::complete_now(&unit, &reason, scope_root, cwd)
         }
+        "inspect-plan" => {
+            let token = require_opt(args, "--plan-token")
+                .or_else(|_| require_opt(args, "--token"))
+                .map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            automation::inspect_plan(&token)
+        }
+        "request-capability" => {
+            let summary = require_opt(args, "--summary").map_err(BackendError)?;
+            let reason = require_opt(args, "--reason").map_err(BackendError)?;
+            let target_agent = take_opt(args, "--target-agent").map_err(BackendError)?;
+            let suggested_agent = take_opt(args, "--suggested-agent").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            automation::request_capability(
+                &summary,
+                &reason,
+                target_agent.as_deref(),
+                suggested_agent.as_deref(),
+                scope_root,
+                cwd,
+            )
+        }
+        "list-requests" => {
+            remaining_flags(args).map_err(BackendError)?;
+            automation::list_requests(scope_root, cwd)
+        }
+        "inspect-request" => {
+            let id = require_opt(args, "--id").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            automation::inspect_request(&id, scope_root, cwd)
+        }
+        "resolve-request" => {
+            let id = require_opt(args, "--id").map_err(BackendError)?;
+            let resolution = require_opt(args, "--resolution").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            automation::resolve_request(&id, &resolution, scope_root, cwd)
+        }
+        "notify-parent" => {
+            remaining_flags(args).map_err(BackendError)?;
+            automation::notify_parent(scope_root, cwd)
+        }
+
         other => Err(BackendError(format!(
             "unknown automation command '{other}'"
         ))),

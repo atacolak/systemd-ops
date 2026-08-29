@@ -285,6 +285,8 @@ impl App {
     }
 
     fn rebuild_rows(&mut self) {
+        let keep = self.selected().map(|r| r.unit.clone());
+        let previous_scroll = self.detail_scroll;
         let mut owned = Vec::new();
         for v in &self.view.owned {
             if let Some(r) = row_from_view(v, "owned") {
@@ -303,20 +305,21 @@ impl App {
             }
         }
         watching.sort_by_key(|r| health_rank(&r.health));
-        let keep = self.selected().map(|r| r.unit.clone());
         self.rows = sectioned_rows(owned, watching);
-        self.reset_detail_scroll();
         if let Some(unit) = keep {
             if let Some(i) = self.rows.iter().position(|r| match r {
                 ListRow::Op(op) => op.unit == unit,
                 ListRow::Header(_) => false,
             }) {
                 self.list.select(Some(i));
+                self.detail_scroll = previous_scroll;
             } else {
                 self.select_first_op();
+                self.reset_detail_scroll();
             }
         } else {
             self.select_first_op();
+            self.reset_detail_scroll();
         }
     }
 
@@ -432,7 +435,6 @@ impl App {
         self.view = view;
         self.last_error = None;
         self.rebuild_rows();
-        self.reset_detail_scroll();
         if self.diagnostics_open {
             self.reload_logs();
         }
@@ -2645,7 +2647,8 @@ mod tests {
         app.set_detail_extent(40, 10);
         app.detail_end();
         app.rebuild_rows();
-        assert_eq!(app.detail_scroll, 0);
+        assert_eq!(app.detail_scroll, 30);
+
         app.set_detail_extent(40, 10);
         app.detail_end();
         app.toggle_wiring();
@@ -2653,7 +2656,9 @@ mod tests {
         app.set_detail_extent(40, 10);
         app.detail_end();
         app.replace_view(empty_view());
-        assert_eq!(app.detail_scroll, 0);
+        assert_eq!(app.detail_scroll, 30);
+        app.set_detail_extent(18, 10);
+        assert_eq!(app.detail_scroll, 8);
     }
 
     #[test]
