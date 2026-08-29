@@ -62,6 +62,22 @@ const SPEC_KEYS = [
 ] as const;
 
 const AUTOMATION_SPEC_KEYS = [...SPEC_KEYS, "agent", "parent", "brain_paths"] as const;
+function automationSpecFromParams(params: Json): Json {
+	const topLevel = pick(params, AUTOMATION_SPEC_KEYS);
+	if (!params.spec || typeof params.spec !== "object" || Array.isArray(params.spec)) return topLevel;
+	const nested = params.spec as Json;
+	for (const key of AUTOMATION_SPEC_KEYS) {
+		if (
+			Object.prototype.hasOwnProperty.call(topLevel, key) &&
+			Object.prototype.hasOwnProperty.call(nested, key) &&
+			JSON.stringify(topLevel[key]) !== JSON.stringify(nested[key])
+		) {
+			throw new Error(`conflicting automation spec field '${key}'`);
+		}
+	}
+	return { ...nested, ...topLevel };
+}
+
 
 const AGENT_FIELDS = [
 	"name",
@@ -169,9 +185,7 @@ export function automationAuthorArgv(action: string, params: Json): string[] {
 			return ["automation", "inspect-plan", "--plan-token", String(tokenOf(params) ?? "")];
 		case "plan_create":
 		case "plan_update": {
-			const spec = params.spec && typeof params.spec === "object"
-				? (params.spec as Json)
-				: pick(params, AUTOMATION_SPEC_KEYS);
+			const spec = automationSpecFromParams(params);
 			return [
 				"automation",
 				action === "plan_create" ? "plan-create" : "plan-update",
@@ -311,15 +325,10 @@ async function authorizeAuthorAction(
 		throw new Error("resolve_request requires scope jurisdiction");
 	}
 	if (action === "resolve_request") return;
-	let unit = typeof params.unit === "string" ? params.unit : "";
-	let agent = typeof params.agent === "string" ? params.agent : undefined;
-	let parent = typeof params.parent === "string" ? params.parent : undefined;
-	if (params.spec && typeof params.spec === "object") {
-		const spec = params.spec as Json;
-		if (!unit && typeof spec.unit === "string") unit = spec.unit;
-		if (!agent && typeof spec.agent === "string") agent = spec.agent;
-		if (!parent && typeof spec.parent === "string") parent = spec.parent;
-	}
+	const spec = automationSpecFromParams(params);
+	let unit = typeof spec.unit === "string" ? spec.unit : "";
+	let agent = typeof spec.agent === "string" ? spec.agent : undefined;
+	let parent = typeof spec.parent === "string" ? spec.parent : undefined;
 	if (action === "apply") {
 		const inspected = envelopeData(await runOps(["automation", "inspect-plan", "--plan-token", String(tokenOf(params) ?? "")], cwd));
 		unit = typeof inspected.unit === "string" ? inspected.unit : unit;

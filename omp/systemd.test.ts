@@ -278,6 +278,31 @@ test("automation author argv carries typed metadata", () => {
 			brain_paths: [".systemd-ops/pr-maintainer-run"],
 		}),
 	]);
+	expect(automationAuthorArgv("plan_update", {
+		agent: "pr-maintainer",
+		parent: "managed-omp-cap-hindsight",
+		spec: {
+			unit: "managed-omp-pr-9365",
+			enabled: false,
+		},
+	})).toEqual([
+		"automation",
+		"plan-update",
+		"--spec",
+		JSON.stringify({
+			unit: "managed-omp-pr-9365",
+			enabled: false,
+			agent: "pr-maintainer",
+			parent: "managed-omp-cap-hindsight",
+		}),
+	]);
+	expect(() => automationAuthorArgv("plan_update", {
+		parent: "managed-omp-cap-hindsight",
+		spec: {
+			unit: "managed-omp-pr-9365",
+			parent: "managed-runtime",
+		},
+	})).toThrow("conflicting automation spec field 'parent'");
 	expect(automationAuthorArgv("plan_complete", {
 		unit: "managed-omp-pr-9969",
 		reason: "merged upstream",
