@@ -34,6 +34,8 @@ EOF
   chmod +x "$home/run"
   cp "$SOURCE_DRIVER" "$scope/.systemd-ops/pr-maintainer-run"
   chmod +x "$scope/.systemd-ops/pr-maintainer-run"
+  cp "$(dirname "$SOURCE_DRIVER")/automation-wrapper-lib" "$scope/.systemd-ops/automation-wrapper-lib"
+  chmod +x "$scope/.systemd-ops/automation-wrapper-lib"
   cat >"$scope/.systemd-ops/scope.toml" <<EOF
 [scope]
 id = "omp-proof"
@@ -84,16 +86,19 @@ run_wrapper() {
   FINGERPRINT_TOOL="$scope/.systemd-ops/pr-fingerprint" \
   OMP_BIN="$scope/fake-omp" \
   AGENT_CWD="$scope/agents" \
+  UPSTREAM_GENERATION="${UPSTREAM_GENERATION:-deadbeef}" \
+  PROOF_SKIP_GH=1 \
   "$scope/.systemd-ops/managed-omp-pr-9363/run"
 }
-
 success=$(make_case success)
 write_omp "$success/fake-omp" '"$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "proof current" --summary '\''["report accepted"]'\'' >/dev/null'
 run_wrapper "$success"
 success_fp=$(cat "$success/.systemd-ops/managed-omp-pr-9363/state/fingerprint")
 [[ $success_fp =~ ^[0-9a-f]{64}$ ]] || fail "success did not write combined fingerprint"
 jq -e '.iterations[0].reconsolidated == true' "$success/.systemd-ops/managed-omp-pr-9363/state/operator.json" >/dev/null || fail "success did not reconsolidate"
-
+jq -e '.version==1 and .generation=="deadbeef" and (.output_revision|length==40)' \
+  "$success/.systemd-ops/managed-omp-pr-9363/state/checkpoint.json" >/dev/null \
+  || fail "success did not write structured checkpoint"
 
 missing=$(make_case missing-report)
 write_omp "$missing/fake-omp" 'exit 0'
@@ -103,6 +108,7 @@ code=$?
 set -e
 [[ $code -eq 3 ]] || fail "missing report exited $code, want 3"
 [[ ! -e $missing/.systemd-ops/managed-omp-pr-9363/state/fingerprint ]] || fail "missing report advanced fingerprint"
+[[ ! -e $missing/.systemd-ops/managed-omp-pr-9363/state/checkpoint.json ]] || fail "missing report wrote checkpoint"
 jq -e '.iterations[0].reconsolidated == false' "$missing/.systemd-ops/managed-omp-pr-9363/state/operator.json" >/dev/null || fail "missing report was reconsolidated"
 
 omp_failure=$(make_case omp-failure)
@@ -113,6 +119,7 @@ code=$?
 set -e
 [[ $code -eq 7 ]] || fail "OMP failure exited $code, want 7"
 [[ ! -e $omp_failure/.systemd-ops/managed-omp-pr-9363/state/fingerprint ]] || fail "OMP failure advanced fingerprint"
+[[ ! -e $omp_failure/.systemd-ops/managed-omp-pr-9363/state/checkpoint.json ]] || fail "OMP failure wrote checkpoint"
 write_omp "$omp_failure/fake-omp" '"$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "retry current" --summary '\''["retry accepted"]'\'' >/dev/null'
 run_wrapper "$omp_failure"
 [[ $(cat "$omp_failure/.systemd-ops/managed-omp-pr-9363/state/fingerprint") =~ ^[0-9a-f]{64}$ ]] || fail "failed iteration was not retried"

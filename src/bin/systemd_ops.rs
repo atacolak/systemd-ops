@@ -68,7 +68,10 @@ Commands:
   automation list-requests
   automation inspect-request --id ID
   automation resolve-request --id ID --resolution TEXT
-  automation notify-parent
+  automation checkpoint --fingerprint HASH [--generation VALUE] [--output-revision VALUE]
+  automation blocker --kind KIND --summary TEXT [--iteration ID] [--code N]
+  automation clear-blocker
+  automation notify-parent [--event checkpoint|blocked|completed]
 
   automation inspect --unit STEM
   automation plan-create --spec JSON
@@ -739,9 +742,41 @@ fn run_automation(
             remaining_flags(args).map_err(BackendError)?;
             automation::resolve_request(&id, &resolution, scope_root, cwd)
         }
-        "notify-parent" => {
+        "checkpoint" => {
+            let fingerprint = require_opt(args, "--fingerprint").map_err(BackendError)?;
+            let generation = take_opt(args, "--generation").map_err(BackendError)?;
+            let output_revision = take_opt(args, "--output-revision").map_err(BackendError)?;
             remaining_flags(args).map_err(BackendError)?;
-            automation::notify_parent(scope_root, cwd)
+            automation::write_checkpoint(
+                scope_root,
+                cwd,
+                &fingerprint,
+                generation.as_deref(),
+                output_revision.as_deref(),
+            )
+        }
+        "blocker" => {
+            let kind = require_opt(args, "--kind").map_err(BackendError)?;
+            let summary = require_opt(args, "--summary").map_err(BackendError)?;
+            let iteration = take_opt(args, "--iteration").map_err(BackendError)?;
+            let code = take_opt(args, "--code").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            let code = match code {
+                Some(raw) => Some(raw.parse::<i32>().map_err(|error| {
+                    BackendError(format!("--code must be a 32-bit integer: {error}"))
+                })?),
+                None => None,
+            };
+            automation::write_blocker(scope_root, cwd, &kind, iteration.as_deref(), code, &summary)
+        }
+        "clear-blocker" => {
+            remaining_flags(args).map_err(BackendError)?;
+            automation::clear_blocker(scope_root, cwd)
+        }
+        "notify-parent" => {
+            let event = take_opt(args, "--event").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            automation::notify_parent(scope_root, cwd, event.as_deref())
         }
 
         other => Err(BackendError(format!(

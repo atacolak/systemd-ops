@@ -145,6 +145,10 @@ struct Row {
     parent: String,
     lifecycle: String,
     brain_revision: String,
+    processed: String,
+    checkpoint_generation: String,
+    checkpoint_output: String,
+    blocker: String,
     depth: usize,
     last_child: bool,
 }
@@ -673,6 +677,39 @@ fn row_from_view(v: &Value, relationship: &'static str) -> Option<Row> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let processed = automation
+        .and_then(|value| value.get("processed"))
+        .and_then(|value| value.get("fingerprint"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let checkpoint = automation.and_then(|value| value.get("checkpoint"));
+    let checkpoint_generation = checkpoint
+        .and_then(|value| value.get("generation"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let checkpoint_output = checkpoint
+        .and_then(|value| value.get("output_revision"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let blocker = automation
+        .and_then(|value| value.get("blocker"))
+        .and_then(|value| {
+            if value.is_null() {
+                return None;
+            }
+            let kind = value.get("kind").and_then(Value::as_str).unwrap_or("");
+            let summary = value.get("summary").and_then(Value::as_str).unwrap_or("");
+            match (kind.is_empty(), summary.is_empty()) {
+                (true, true) => None,
+                (false, true) => Some(kind.to_string()),
+                (true, false) => Some(summary.to_string()),
+                (false, false) => Some(format!("{kind}: {summary}")),
+            }
+        })
+        .unwrap_or_default();
     Some(Row {
         unit,
         title,
@@ -714,6 +751,10 @@ fn row_from_view(v: &Value, relationship: &'static str) -> Option<Row> {
         parent,
         lifecycle,
         brain_revision,
+        processed,
+        checkpoint_generation,
+        checkpoint_output,
+        blocker,
         depth: 0,
         last_child: false,
     })
@@ -1496,6 +1537,15 @@ fn wiring_detail_lines(r: &Row, _now: SystemTime) -> Vec<Line<'static>> {
     push_detail(&mut lines, "parent", r.parent.clone(), TEXT);
     push_detail(&mut lines, "lifecycle", r.lifecycle.clone(), TEXT);
     push_detail(&mut lines, "brain", r.brain_revision.clone(), MUTED);
+    push_detail(&mut lines, "processed", r.processed.clone(), MUTED);
+    push_detail(
+        &mut lines,
+        "generation",
+        r.checkpoint_generation.clone(),
+        TEXT,
+    );
+    push_detail(&mut lines, "output", r.checkpoint_output.clone(), TEXT);
+    push_detail(&mut lines, "blocker", r.blocker.clone(), TEXT);
 
     lines.push(Line::from(""));
     lines.push(section_heading("EXECUTION"));
@@ -1917,6 +1967,10 @@ mod tests {
             parent: String::new(),
             lifecycle: "active".into(),
             brain_revision: String::new(),
+            processed: String::new(),
+            checkpoint_generation: String::new(),
+            checkpoint_output: String::new(),
+            blocker: String::new(),
             depth: 0,
             last_child: false,
         }

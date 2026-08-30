@@ -24,6 +24,75 @@ const MAX_BRAIN_PATHS: usize = 32;
 const MAX_REASON: usize = 500;
 const MAX_REQUEST_SUMMARY: usize = 120;
 const MAX_REQUEST_REASON: usize = 2000;
+const MAX_OPAQUE: usize = 128;
+const MAX_BLOCKER_KIND: usize = 64;
+const MAX_BLOCKER_SUMMARY: usize = 200;
+const MAX_ITERATION_ID: usize = 80;
+
+const BLOCKER_KINDS: &[&str] = &[
+    "iteration-failed",
+    "worktree-dirty",
+    "worktree-diverged",
+    "worktree-detached",
+    "worktree-missing",
+    "contract-failure",
+    "stale-generation",
+    "postcondition-failed",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Checkpoint {
+    pub version: u32,
+    pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_revision: Option<String>,
+    pub checkpointed_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Blocker {
+    pub version: u32,
+    pub id: String,
+    pub kind: String,
+    pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<i32>,
+    pub summary: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotifyEvent {
+    Checkpoint,
+    Blocked,
+    Completed,
+}
+
+impl NotifyEvent {
+    fn parse(raw: Option<&str>) -> Result<Self, BackendError> {
+        match raw.unwrap_or("checkpoint") {
+            "checkpoint" => Ok(Self::Checkpoint),
+            "blocked" => Ok(Self::Blocked),
+            "completed" => Ok(Self::Completed),
+            other => Err(BackendError(format!(
+                "unknown notify event '{other}' (known: checkpoint, blocked, completed)"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Checkpoint => "checkpoint",
+            Self::Blocked => "blocked",
+            Self::Completed => "completed",
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,6 +129,18 @@ pub fn metadata_path(root: &Path, stem: &str) -> PathBuf {
 
 pub fn lifecycle_path(root: &Path, stem: &str) -> PathBuf {
     operation_home(root, stem).join("state/lifecycle.json")
+}
+
+pub fn checkpoint_path(root: &Path, stem: &str) -> PathBuf {
+    operation_home(root, stem).join("state/checkpoint.json")
+}
+
+pub fn blocker_path(root: &Path, stem: &str) -> PathBuf {
+    operation_home(root, stem).join("state/blocker.json")
+}
+
+pub fn fingerprint_path(root: &Path, stem: &str) -> PathBuf {
+    operation_home(root, stem).join("state/fingerprint")
 }
 
 fn validate_agent_name(name: &str) -> Result<(), BackendError> {
@@ -253,6 +334,334 @@ pub fn load_lifecycle(root: &Path, stem: &str) -> Result<Option<Lifecycle>, Back
     Ok(Some(lifecycle))
 }
 
+fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>, BackendError> {
+    refuse_symlink(path)?;
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(BackendError(format!(
+            "cannot read {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn validate_opaque(label: &str, value: &str) -> Result<String, BackendError> {
+    crate::operator::strict_line(label, value, MAX_OPAQUE)
+}
+
+fn optional_opaque(label: &str, value: Option<&str>) -> Result<Option<String>, BackendError> {
+    match value {
+        None => Ok(None),
+        Some(value) if value.trim().is_empty() => Ok(None),
+        Some(value) => Ok(Some(validate_opaque(label, value)?)),
+    }
+}
+
+fn validate_checkpoint(checkpoint: Checkpoint) -> Result<Checkpoint, BackendError> {
+    if checkpoint.version != 1 {
+        return Err(BackendError("checkpoint version must be 1".into()));
+    }
+    let fingerprint = validate_opaque("checkpoint fingerprint", &checkpoint.fingerprint)?;
+    let generation = match checkpoint.generation {
+        Some(value) => optional_opaque("checkpoint generation", Some(&value))?,
+        None => None,
+    };
+    let output_revision = match checkpoint.output_revision {
+        Some(value) => optional_opaque("checkpoint output_revision", Some(&value))?,
+        None => None,
+    };
+    let checkpointed_at =
+        crate::operator::strict_line("checkpointed_at", &checkpoint.checkpointed_at, MAX_OPAQUE)?;
+    Ok(Checkpoint {
+        version: 1,
+        fingerprint,
+        generation,
+        output_revision,
+        checkpointed_at,
+    })
+}
+
+fn validate_blocker(blocker: Blocker) -> Result<Blocker, BackendError> {
+    if blocker.version != 1 {
+        return Err(BackendError("blocker version must be 1".into()));
+    }
+    let id = validate_opaque("blocker id", &blocker.id)?;
+    let kind = crate::operator::strict_line("blocker kind", &blocker.kind, MAX_BLOCKER_KIND)?;
+    if !BLOCKER_KINDS.contains(&kind.as_str()) {
+        return Err(BackendError(format!(
+            "unknown blocker kind '{kind}' (known: {})",
+            BLOCKER_KINDS.join(", ")
+        )));
+    }
+    let at = crate::operator::strict_line("blocker at", &blocker.at, MAX_OPAQUE)?;
+    let iteration_id = match blocker.iteration_id {
+        Some(value) if value.trim().is_empty() => None,
+        Some(value) => Some(crate::operator::strict_line(
+            "blocker iteration_id",
+            &value,
+            MAX_ITERATION_ID,
+        )?),
+        None => None,
+    };
+    let summary =
+        crate::operator::strict_line("blocker summary", &blocker.summary, MAX_BLOCKER_SUMMARY)?;
+    Ok(Blocker {
+        version: 1,
+        id,
+        kind,
+        at,
+        iteration_id,
+        code: blocker.code,
+        summary,
+    })
+}
+
+pub fn load_checkpoint(root: &Path, stem: &str) -> Result<Option<Checkpoint>, BackendError> {
+    let path = checkpoint_path(root, stem);
+    let Some(bytes) = read_optional_bytes(&path)? else {
+        return Ok(None);
+    };
+    let checkpoint: Checkpoint = serde_json::from_slice(&bytes)
+        .map_err(|error| BackendError(format!("malformed {}: {error}", path.display())))?;
+    validate_checkpoint(checkpoint).map(Some)
+}
+
+pub fn load_blocker(root: &Path, stem: &str) -> Result<Option<Blocker>, BackendError> {
+    let path = blocker_path(root, stem);
+    let Some(bytes) = read_optional_bytes(&path)? else {
+        return Ok(None);
+    };
+    let blocker: Blocker = serde_json::from_slice(&bytes)
+        .map_err(|error| BackendError(format!("malformed {}: {error}", path.display())))?;
+    validate_blocker(blocker).map(Some)
+}
+
+pub fn load_processed_fingerprint(root: &Path, stem: &str) -> Result<Option<String>, BackendError> {
+    let path = fingerprint_path(root, stem);
+    let Some(bytes) = read_optional_bytes(&path)? else {
+        return Ok(None);
+    };
+    let text = String::from_utf8(bytes)
+        .map_err(|error| BackendError(format!("malformed {}: {error}", path.display())))?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(validate_opaque("processed fingerprint", text)?))
+}
+
+fn compact_event_id(kind: &str, iteration_id: Option<&str>, code: Option<i32>) -> String {
+    let mut input = format!("{kind}\0");
+    if let Some(iteration_id) = iteration_id {
+        input.push_str(iteration_id);
+    }
+    input.push('\0');
+    if let Some(code) = code {
+        input.push_str(&code.to_string());
+    }
+    let digest = sha256_hex(input.as_bytes());
+    format!("blk-{}", &digest[..12])
+}
+
+fn serialize_pretty(value: &impl Serialize) -> Result<Vec<u8>, BackendError> {
+    serde_json::to_vec_pretty(value)
+        .map_err(|error| BackendError(format!("cannot serialize automation state: {error}")))
+}
+
+pub fn write_checkpoint(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+    fingerprint: &str,
+    generation: Option<&str>,
+    output_revision: Option<&str>,
+) -> Result<Value, BackendError> {
+    let (manifest, stem) = crate::operator::bound_operation_manifest(explicit_root, cwd)?;
+    let checkpoint = validate_checkpoint(Checkpoint {
+        version: 1,
+        fingerprint: fingerprint.to_string(),
+        generation: generation.map(str::to_string),
+        output_revision: output_revision.map(str::to_string),
+        checkpointed_at: crate::config::unix_to_rfc3339(crate::config::now_unix()),
+    })?;
+    atomic_write(
+        &checkpoint_path(&manifest.root, &stem),
+        &serialize_pretty(&checkpoint)?,
+    )?;
+    let _ = fs::remove_file(blocker_path(&manifest.root, &stem));
+    Ok(json!({
+        "unit": stem,
+        "checkpoint": checkpoint,
+        "blocker": Value::Null,
+    }))
+}
+
+pub fn write_blocker(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+    kind: &str,
+    iteration_id: Option<&str>,
+    code: Option<i32>,
+    summary: &str,
+) -> Result<Value, BackendError> {
+    let (manifest, stem) = crate::operator::bound_operation_manifest(explicit_root, cwd)?;
+    let existing = load_blocker(&manifest.root, &stem)?;
+    let id = compact_event_id(kind, iteration_id, code);
+    if let Some(existing) = existing.as_ref() {
+        if existing.id == id {
+            return Ok(json!({
+                "unit": stem,
+                "changed": false,
+                "blocker": existing,
+            }));
+        }
+    }
+    let blocker = validate_blocker(Blocker {
+        version: 1,
+        id,
+        kind: kind.to_string(),
+        at: crate::config::unix_to_rfc3339(crate::config::now_unix()),
+        iteration_id: iteration_id.map(str::to_string),
+        code,
+        summary: summary.to_string(),
+    })?;
+    atomic_write(
+        &blocker_path(&manifest.root, &stem),
+        &serialize_pretty(&blocker)?,
+    )?;
+    Ok(json!({
+        "unit": stem,
+        "changed": true,
+        "blocker": blocker,
+    }))
+}
+
+pub fn clear_blocker(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let (manifest, stem) = crate::operator::bound_operation_manifest(explicit_root, cwd)?;
+    let path = blocker_path(&manifest.root, &stem);
+    refuse_symlink(&path)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(json!({ "unit": stem, "cleared": true })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(json!({ "unit": stem, "cleared": false }))
+        }
+        Err(error) => Err(BackendError(format!(
+            "cannot clear {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn checkpoint_json(checkpoint: Option<&Checkpoint>) -> Value {
+    match checkpoint {
+        Some(checkpoint) => json!({
+            "present": true,
+            "kind": "structured",
+            "fingerprint": checkpoint.fingerprint,
+            "generation": checkpoint.generation,
+            "output_revision": checkpoint.output_revision,
+            "checkpointed_at": checkpoint.checkpointed_at,
+        }),
+        None => json!({
+            "present": false,
+            "kind": Value::Null,
+            "fingerprint": Value::Null,
+            "generation": Value::Null,
+            "output_revision": Value::Null,
+            "checkpointed_at": Value::Null,
+        }),
+    }
+}
+
+fn blocker_json(blocker: Option<&Blocker>) -> Value {
+    match blocker {
+        Some(blocker) => json!({
+            "id": blocker.id,
+            "kind": blocker.kind,
+            "at": blocker.at,
+            "iteration_id": blocker.iteration_id,
+            "code": blocker.code,
+            "summary": blocker.summary,
+        }),
+        None => Value::Null,
+    }
+}
+
+fn processed_json(fingerprint: Option<&str>, checkpoint: Option<&Checkpoint>) -> Value {
+    json!({
+        "fingerprint": fingerprint,
+        "legacy": fingerprint.is_some() && checkpoint.is_none(),
+    })
+}
+
+fn latest_iteration_json(operator: &Value) -> Value {
+    let latest = operator
+        .get("iterations")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first());
+    match latest {
+        Some(item) => json!({
+            "id": item.get("id").cloned().unwrap_or(Value::Null),
+            "exit_code": item.get("exit_code").cloned().unwrap_or(Value::Null),
+            "reconsolidated": item.get("reconsolidated").cloned().unwrap_or(Value::Null),
+            "finished_at": item.get("finished_at").cloned().unwrap_or(Value::Null),
+        }),
+        None => Value::Null,
+    }
+}
+
+struct ChildRevisionInput<'a> {
+    unit: &'a str,
+    agent: Option<&'a str>,
+    lifecycle: &'a str,
+    running: bool,
+    active_iteration: bool,
+    processed: Option<&'a str>,
+    checkpoint: Option<&'a Checkpoint>,
+    blocker: Option<&'a Blocker>,
+}
+
+fn child_revision(input: ChildRevisionInput<'_>) -> String {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(input.unit.as_bytes());
+    buf.push(0);
+    if let Some(agent) = input.agent {
+        buf.extend_from_slice(agent.as_bytes());
+    }
+    buf.push(0);
+    buf.extend_from_slice(input.lifecycle.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(if input.running { b"1" } else { b"0" });
+    buf.push(0);
+    buf.extend_from_slice(if input.active_iteration { b"1" } else { b"0" });
+    buf.push(0);
+    if let Some(processed) = input.processed {
+        buf.extend_from_slice(processed.as_bytes());
+    }
+    buf.push(0);
+    if let Some(checkpoint) = input.checkpoint {
+        buf.extend_from_slice(checkpoint.fingerprint.as_bytes());
+        buf.push(0);
+        if let Some(generation) = &checkpoint.generation {
+            buf.extend_from_slice(generation.as_bytes());
+        }
+        buf.push(0);
+        if let Some(output_revision) = &checkpoint.output_revision {
+            buf.extend_from_slice(output_revision.as_bytes());
+        }
+    }
+    buf.push(0);
+    if let Some(blocker) = input.blocker {
+        buf.extend_from_slice(blocker.id.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(blocker.kind.as_bytes());
+    }
+    format!("sha256:{}", sha256_hex(&buf))
+}
+
 fn role_path(manifest: &ScopeManifest, agent: &str) -> Result<PathBuf, BackendError> {
     let root = manifest
         .automation_agent_root
@@ -326,6 +735,19 @@ pub fn join_operation(manifest: &ScopeManifest, stem: &str) -> (Value, Option<St
         Ok(lifecycle) => lifecycle,
         Err(error) => return (Value::Null, Some(error.0)),
     };
+    let checkpoint = match load_checkpoint(&manifest.root, stem) {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => return (Value::Null, Some(error.0)),
+    };
+    let blocker = match load_blocker(&manifest.root, stem) {
+        Ok(blocker) => blocker,
+        Err(error) => return (Value::Null, Some(error.0)),
+    };
+    let processed = match load_processed_fingerprint(&manifest.root, stem) {
+        Ok(processed) => processed,
+        Err(error) => return (Value::Null, Some(error.0)),
+    };
+    let mut warning = None;
     let Some(metadata) = metadata else {
         return (
             json!({
@@ -335,12 +757,17 @@ pub fn join_operation(manifest: &ScopeManifest, stem: &str) -> (Value, Option<St
                 "brain_paths": [],
                 "brain_revision": Value::Null,
                 "lifecycle": lifecycle_json(lifecycle.as_ref()),
+                "checkpoint": checkpoint_json(checkpoint.as_ref()),
+                "processed": processed_json(processed.as_deref(), checkpoint.as_ref()),
+                "blocker": blocker_json(blocker.as_ref()),
             }),
             None,
         );
     };
     let revision = brain_revision(manifest, stem);
-    let warning = revision.as_ref().err().map(|error| error.0.clone());
+    if let Err(error) = &revision {
+        warning = Some(error.0.clone());
+    }
     (
         json!({
             "agent": metadata.agent,
@@ -349,6 +776,9 @@ pub fn join_operation(manifest: &ScopeManifest, stem: &str) -> (Value, Option<St
             "brain_paths": metadata.brain_paths,
             "brain_revision": revision.ok(),
             "lifecycle": lifecycle_json(lifecycle.as_ref()),
+            "checkpoint": checkpoint_json(checkpoint.as_ref()),
+            "processed": processed_json(processed.as_deref(), checkpoint.as_ref()),
+            "blocker": blocker_json(blocker.as_ref()),
         }),
         warning,
     )
@@ -356,27 +786,120 @@ pub fn join_operation(manifest: &ScopeManifest, stem: &str) -> (Value, Option<St
 
 fn relation_summary(operation: &Value) -> Value {
     let operator = operation.get("operator").unwrap_or(&Value::Null);
-    let lifecycle = operation
-        .get("automation")
-        .and_then(|value| value.get("lifecycle"))
+    let automation = operation.get("automation").unwrap_or(&Value::Null);
+    let lifecycle = automation
+        .get("lifecycle")
         .and_then(|value| value.get("status"))
         .and_then(Value::as_str)
         .unwrap_or("active");
     let state = operation.get("state").and_then(Value::as_str).unwrap_or("");
     let sub = operation.get("sub").and_then(Value::as_str).unwrap_or("");
+    let running = state == "active" && sub == "running";
+    let active_iteration = operator.get("active_iteration").is_some_and(|value| {
+        !value.is_null()
+            && value
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+    });
+    let agent = automation.get("agent").and_then(Value::as_str);
+    let checkpoint = automation.get("checkpoint").cloned().unwrap_or_else(|| {
+        json!({
+            "present": false,
+            "kind": Value::Null,
+            "fingerprint": Value::Null,
+            "generation": Value::Null,
+            "output_revision": Value::Null,
+            "checkpointed_at": Value::Null,
+        })
+    });
+    let processed = automation.get("processed").cloned().unwrap_or_else(|| {
+        json!({
+            "fingerprint": Value::Null,
+            "legacy": false,
+        })
+    });
+    let blocker = automation.get("blocker").cloned().unwrap_or(Value::Null);
+    let structured = checkpoint.get("present").and_then(Value::as_bool) == Some(true)
+        && checkpoint.get("kind").and_then(Value::as_str) == Some("structured");
+    let unit = operation.get("unit").and_then(Value::as_str).unwrap_or("");
+    let processed_fingerprint = processed.get("fingerprint").and_then(Value::as_str);
+    let checkpoint_record = if structured {
+        Some(Checkpoint {
+            version: 1,
+            fingerprint: checkpoint
+                .get("fingerprint")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            generation: checkpoint
+                .get("generation")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            output_revision: checkpoint
+                .get("output_revision")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            checkpointed_at: checkpoint
+                .get("checkpointed_at")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        })
+    } else {
+        None
+    };
+    let blocker_record = blocker.as_object().map(|object| Blocker {
+        version: 1,
+        id: object
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        kind: object
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        at: object
+            .get("at")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        iteration_id: object
+            .get("iteration_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        code: object.get("code").and_then(Value::as_i64).map(|n| n as i32),
+        summary: object
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    });
     json!({
         "unit": operation.get("unit").cloned().unwrap_or(Value::Null),
         "title": operation.get("title").cloned().unwrap_or(Value::Null),
-        "agent": operation
-            .get("automation")
-            .and_then(|value| value.get("agent"))
-            .cloned()
-            .unwrap_or(Value::Null),
+        "agent": agent.map(Value::from).unwrap_or(Value::Null),
         "health": operation.get("health").cloned().unwrap_or(Value::Null),
         "lifecycle": lifecycle,
-        "running": state == "active" && sub == "running",
+        "running": running,
+        "active_iteration": active_iteration,
         "headline": operator.get("headline").cloned().unwrap_or(Value::Null),
-        "checkpoint": checkpoint_summary(operation),
+        "processed": processed,
+        "checkpoint": checkpoint,
+        "blocker": blocker,
+        "latest_iteration": latest_iteration_json(operator),
+        "child_revision": child_revision(ChildRevisionInput {
+            unit,
+            agent,
+            lifecycle,
+            running,
+            active_iteration,
+            processed: processed_fingerprint,
+            checkpoint: checkpoint_record.as_ref(),
+            blocker: blocker_record.as_ref(),
+        }),
     })
 }
 
@@ -1053,43 +1576,45 @@ pub fn resolve_request(
     Ok(record)
 }
 
-fn checkpoint_summary(operation: &Value) -> Value {
-    let operator = operation.get("operator").unwrap_or(&Value::Null);
-    let latest = operator
-        .get("iterations")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first());
-    let exit_zero = latest
-        .and_then(|item| item.get("exit_code"))
-        .and_then(Value::as_i64)
-        == Some(0);
-    let reconsolidated = latest
-        .and_then(|item| item.get("reconsolidated"))
-        .and_then(Value::as_bool)
-        == Some(true);
-    let fingerprint = operation_home_from_unit(operation)
-        .and_then(|home| fs::read_to_string(home.join("state/fingerprint")).ok())
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty());
-    json!({
-        "exit_zero": exit_zero,
-        "reconsolidated": reconsolidated,
-        "fingerprint": fingerprint,
-        "stable": exit_zero && reconsolidated && fingerprint.is_some(),
-    })
+fn structured_checkpoint(operation: &Value) -> Option<&Value> {
+    let checkpoint = operation
+        .get("automation")
+        .and_then(|value| value.get("checkpoint"))?;
+    if checkpoint.get("present").and_then(Value::as_bool) == Some(true)
+        && checkpoint.get("kind").and_then(Value::as_str) == Some("structured")
+    {
+        Some(checkpoint)
+    } else {
+        None
+    }
 }
 
-fn operation_home_from_unit(operation: &Value) -> Option<PathBuf> {
+fn current_blocker(operation: &Value) -> Option<&Value> {
+    let blocker = operation
+        .get("automation")
+        .and_then(|value| value.get("blocker"))?;
+    if blocker.is_null() {
+        None
+    } else {
+        Some(blocker)
+    }
+}
+
+fn lifecycle_status(operation: &Value) -> &str {
     operation
-        .get("operation_home")
+        .get("automation")
+        .and_then(|value| value.get("lifecycle"))
+        .and_then(|value| value.get("status"))
         .and_then(Value::as_str)
-        .map(PathBuf::from)
+        .unwrap_or("active")
 }
 
 pub fn notify_parent(
     explicit_root: Option<&str>,
     cwd: Option<&str>,
+    event: Option<&str>,
 ) -> Result<Value, BackendError> {
+    let event = NotifyEvent::parse(event)?;
     let (manifest, stem) = crate::operator::bound_operation_manifest(explicit_root, cwd)?;
     let view = crate::scope::show_manifest(&manifest)?;
     let operation = view
@@ -1106,25 +1631,46 @@ pub fn notify_parent(
         .and_then(|value| value.get("parent"))
         .and_then(Value::as_str)
         .ok_or_else(|| BackendError(format!("'{stem}' has no parent to notify")))?;
-    let checkpoint = checkpoint_summary(operation);
-    if checkpoint.get("stable").and_then(Value::as_bool) != Some(true) {
-        return Err(BackendError(format!(
-            "parent notification requires a stable successful checkpoint for '{stem}'"
-        )));
+    match event {
+        NotifyEvent::Checkpoint => {
+            if structured_checkpoint(operation).is_none() {
+                return Err(BackendError(format!(
+                    "parent notification requires a structured output checkpoint for '{stem}'"
+                )));
+            }
+        }
+        NotifyEvent::Blocked => {
+            if current_blocker(operation).is_none() {
+                return Err(BackendError(format!(
+                    "blocked parent notification requires a current blocker for '{stem}'"
+                )));
+            }
+        }
+        NotifyEvent::Completed => {
+            if lifecycle_status(operation) != "completed" {
+                return Err(BackendError(format!(
+                    "completed parent notification requires completed lifecycle for '{stem}'"
+                )));
+            }
+        }
     }
-    let timer = format!("{parent}.timer");
-    let planned = crate::write::plan(crate::write::Action::Start, &timer, None)?;
-    let token = planned
-        .get("plan_token")
-        .and_then(Value::as_str)
-        .ok_or_else(|| BackendError("parent notification plan did not return a token".into()))?;
-    let applied = crate::write::apply_with_context(token, cwd)?;
+    let service = format!("{parent}.service");
+    let changes = systemd::start_noblock(&service)?;
     Ok(json!({
         "notified": true,
+        "event": event.as_str(),
         "child": stem,
         "parent": parent,
-        "checkpoint": checkpoint,
-        "systemd": applied,
+        "unit": service,
+        "blocking": false,
+        "checkpoint": structured_checkpoint(operation).cloned().unwrap_or(Value::Null),
+        "blocker": current_blocker(operation).cloned().unwrap_or(Value::Null),
+        "systemd": {
+            "action": "start",
+            "unit": service,
+            "no_block": true,
+            "changes": changes,
+        },
     }))
 }
 
@@ -1243,8 +1789,9 @@ mod tests {
         fs::write(
             bin.join("systemctl"),
             format!(
-                "#!/bin/sh\ncase \" $* \" in\n  *\" list-unit-files \"*|*\" list-unit-files\"*) cat <<'EOF'\n{}\nEOF\n    ;;\n  *) printf '[]\\n' ;;\nesac\n",
-                serde_json::to_string(&rows).unwrap()
+                "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >>'{log}'\ncase \" $* \" in\n  *\" list-unit-files \"*|*\" list-unit-files\"*) cat <<'EOF'\n{rows}\nEOF\n    ;;\n  *' show '*) printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\n';;\n  *) : ;;\nesac\n",
+                log = root.join("systemctl.log").display(),
+                rows = serde_json::to_string(&rows).unwrap()
             ),
         )
         .unwrap();
@@ -1383,7 +1930,9 @@ mod tests {
     }
 
     fn with_path<T>(bin: &Path, run: impl FnOnce() -> T) -> T {
-        let _guard = PATH_LOCK.lock().unwrap();
+        let _guard = PATH_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = std::env::var_os("PATH");
         let mut paths = vec![bin.to_path_buf()];
         if let Some(previous) = previous.as_ref() {
@@ -1472,55 +2021,33 @@ mod tests {
     #[test]
     fn request_lifecycle_is_durable_and_compact() {
         let root = tmp_root("requests");
-        let previous_root = std::env::var_os("SYSTEMD_OPS_SCOPE_ROOT");
-        let previous_op = std::env::var_os("SYSTEMD_OPS_OPERATION");
-        std::env::set_var("SYSTEMD_OPS_SCOPE_ROOT", &root);
-        std::env::set_var("SYSTEMD_OPS_OPERATION", "managed-proof");
-        fs::create_dir_all(root.join("agents")).unwrap();
-
-        fs::create_dir_all(root.join(".systemd-ops")).unwrap();
-        fs::write(
-            root.join(".systemd-ops/scope.toml"),
-            format!(
-                "[scope]\nid = \"proof\"\nowned = [\"managed-*\"]\n[automation]\nagent_root = \"{}\"\n",
-                root.join("agents").display()
-            ),
-        )
-        .unwrap();
-
-        write_metadata(&root, "managed-proof", vec![]);
-        let created = request_capability(
-            "need capability maintainer",
-            "durable local source has no class",
-            None,
-            Some("capability-maintainer"),
-            Some(root.to_str().unwrap()),
-            Some(root.to_str().unwrap()),
-        )
-        .unwrap();
-        let id = created["id"].as_str().unwrap().to_string();
-        assert!(id.starts_with("req-"));
-        assert_eq!(id.len(), 19);
-        assert_eq!(created["status"], "open");
-        let listed =
-            list_requests(Some(root.to_str().unwrap()), Some(root.to_str().unwrap())).unwrap();
-        assert_eq!(listed["requests"][0]["id"], id);
-        let resolved = resolve_request(
-            &id,
-            "created capability-maintainer",
-            Some(root.to_str().unwrap()),
-            Some(root.to_str().unwrap()),
-        )
-        .unwrap();
-        assert_eq!(resolved["status"], "resolved");
-        match previous_root {
-            Some(value) => std::env::set_var("SYSTEMD_OPS_SCOPE_ROOT", value),
-            None => std::env::remove_var("SYSTEMD_OPS_SCOPE_ROOT"),
-        }
-        match previous_op {
-            Some(value) => std::env::set_var("SYSTEMD_OPS_OPERATION", value),
-            None => std::env::remove_var("SYSTEMD_OPS_OPERATION"),
-        }
+        with_bound_operation(&root, "managed-proof", || {
+            write_metadata(&root, "managed-proof", vec![]);
+            let created = request_capability(
+                "need capability maintainer",
+                "durable local source has no class",
+                None,
+                Some("capability-maintainer"),
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+            )
+            .unwrap();
+            let id = created["id"].as_str().unwrap().to_string();
+            assert!(id.starts_with("req-"));
+            assert_eq!(id.len(), 19);
+            assert_eq!(created["status"], "open");
+            let listed =
+                list_requests(Some(root.to_str().unwrap()), Some(root.to_str().unwrap())).unwrap();
+            assert_eq!(listed["requests"][0]["id"], id);
+            let resolved = resolve_request(
+                &id,
+                "created capability-maintainer",
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+            )
+            .unwrap();
+            assert_eq!(resolved["status"], "resolved");
+        });
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1549,13 +2076,9 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn notify_parent_requires_stable_checkpoint() {
-        let root = tmp_root("notify");
-        let previous_root = std::env::var_os("SYSTEMD_OPS_SCOPE_ROOT");
-        let previous_op = std::env::var_os("SYSTEMD_OPS_OPERATION");
-        std::env::set_var("SYSTEMD_OPS_SCOPE_ROOT", &root);
-        std::env::set_var("SYSTEMD_OPS_OPERATION", "managed-child");
+    fn bind_operation(root: &Path, stem: &str) {
+        std::env::set_var("SYSTEMD_OPS_SCOPE_ROOT", root);
+        std::env::set_var("SYSTEMD_OPS_OPERATION", stem);
         fs::create_dir_all(root.join("agents")).unwrap();
         fs::create_dir_all(root.join(".systemd-ops")).unwrap();
         fs::write(
@@ -1566,16 +2089,19 @@ mod tests {
             ),
         )
         .unwrap();
-        let error = with_user_unit_dir(&root, &["managed-child", "managed-parent"], || {
-            write_parent_fixture(&root, "managed-parent", None);
-            write_parent_fixture(&root, "managed-child", Some("managed-parent"));
-            notify_parent(Some(root.to_str().unwrap()), Some(root.to_str().unwrap())).unwrap_err()
+        crate::config::set_current(crate::config::OpsConfig {
+            manager: systemd::Manager::User,
+            write_prefix: Some("managed-*".into()),
+            plan_ttl_secs: 600,
+            state_dir: root.join("state-dir"),
         });
-        assert!(
-            error.0.contains("stable successful checkpoint") || error.0.contains("no parent"),
-            "{}",
-            error.0
-        );
+        systemd::set_write_prefix(Some("managed-*".into()));
+    }
+
+    fn restore_bindings(
+        previous_root: Option<std::ffi::OsString>,
+        previous_op: Option<std::ffi::OsString>,
+    ) {
         match previous_root {
             Some(value) => std::env::set_var("SYSTEMD_OPS_SCOPE_ROOT", value),
             None => std::env::remove_var("SYSTEMD_OPS_SCOPE_ROOT"),
@@ -1584,6 +2110,224 @@ mod tests {
             Some(value) => std::env::set_var("SYSTEMD_OPS_OPERATION", value),
             None => std::env::remove_var("SYSTEMD_OPS_OPERATION"),
         }
+        systemd::set_write_prefix(None);
+    }
+
+    fn with_bound_operation<T>(root: &Path, stem: &str, run: impl FnOnce() -> T) -> T {
+        let _guard = PATH_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_root = std::env::var_os("SYSTEMD_OPS_SCOPE_ROOT");
+        let previous_op = std::env::var_os("SYSTEMD_OPS_OPERATION");
+        bind_operation(root, stem);
+        let result = run();
+        restore_bindings(previous_root, previous_op);
+        result
+    }
+
+    #[test]
+    fn structured_checkpoint_is_atomic_and_bounded() {
+        let root = tmp_root("checkpoint");
+        with_bound_operation(&root, "managed-child", || {
+            write_parent_fixture(&root, "managed-child", None);
+            let written = write_checkpoint(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                "fp-a",
+                Some("gen-a"),
+                Some("out-a"),
+            )
+            .unwrap();
+            assert_eq!(written["checkpoint"]["generation"], "gen-a");
+            assert_eq!(written["checkpoint"]["output_revision"], "out-a");
+            let loaded = load_checkpoint(&root, "managed-child").unwrap().unwrap();
+            assert_eq!(loaded.fingerprint, "fp-a");
+            assert_eq!(loaded.generation.as_deref(), Some("gen-a"));
+            assert_eq!(loaded.output_revision.as_deref(), Some("out-a"));
+            let path = checkpoint_path(&root, "managed-child");
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_checkpoint_is_rejected() {
+        let root = tmp_root("checkpoint-malformed");
+        let path = checkpoint_path(&root, "managed-child");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"{not-json").unwrap();
+        let error = load_checkpoint(&root, "managed-child").unwrap_err();
+        assert!(error.0.contains("malformed"), "{}", error.0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_symlink_is_refused() {
+        let root = tmp_root("checkpoint-symlink");
+        with_bound_operation(&root, "managed-child", || {
+            write_parent_fixture(&root, "managed-child", None);
+            let path = checkpoint_path(&root, "managed-child");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let target = root.join("outside.json");
+            fs::write(&target, b"{}\n").unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            let error = write_checkpoint(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                "fp-a",
+                Some("gen-a"),
+                Some("out-a"),
+            )
+            .unwrap_err();
+            assert!(error.0.contains("symlink"), "{}", error.0);
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fingerprint_only_operation_is_legacy_not_structured() {
+        let root = tmp_root("legacy-fingerprint");
+        let path = fingerprint_path(&root, "managed-child");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"old-fingerprint\n").unwrap();
+        assert!(load_checkpoint(&root, "managed-child").unwrap().is_none());
+        let processed = load_processed_fingerprint(&root, "managed-child")
+            .unwrap()
+            .unwrap();
+        assert_eq!(processed, "old-fingerprint");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn blocker_write_does_not_overwrite_checkpoint() {
+        let root = tmp_root("blocker-preserves-checkpoint");
+        with_bound_operation(&root, "managed-child", || {
+            write_parent_fixture(&root, "managed-child", None);
+            write_checkpoint(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                "fp-a",
+                Some("gen-a"),
+                Some("out-a"),
+            )
+            .unwrap();
+            let before = fs::read(checkpoint_path(&root, "managed-child")).unwrap();
+            let first = write_blocker(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                "iteration-failed",
+                Some("iter-1"),
+                Some(7),
+                "model failed",
+            )
+            .unwrap();
+            assert_eq!(first["changed"], true);
+            let second = write_blocker(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                "iteration-failed",
+                Some("iter-1"),
+                Some(7),
+                "model failed again",
+            )
+            .unwrap();
+            assert_eq!(second["changed"], false);
+            let after = fs::read(checkpoint_path(&root, "managed-child")).unwrap();
+            assert_eq!(before, after);
+            write_checkpoint(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                "fp-b",
+                Some("gen-b"),
+                Some("out-b"),
+            )
+            .unwrap();
+            assert!(load_blocker(&root, "managed-child").unwrap().is_none());
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn notify_parent_requires_structured_checkpoint() {
+        let root = tmp_root("notify");
+        let error = with_user_unit_dir(&root, &["managed-child", "managed-parent"], || {
+            bind_operation(&root, "managed-child");
+            write_parent_fixture(&root, "managed-parent", None);
+            write_parent_fixture(&root, "managed-child", Some("managed-parent"));
+            notify_parent(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                None,
+            )
+            .unwrap_err()
+        });
+        assert!(
+            error.0.contains("structured output checkpoint") || error.0.contains("no parent"),
+            "{}",
+            error.0
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn notify_parent_starts_parent_service_noblock() {
+        let root = tmp_root("notify-start");
+        let notified = with_user_unit_dir(&root, &["managed-child", "managed-parent"], || {
+            bind_operation(&root, "managed-child");
+            write_parent_fixture(&root, "managed-parent", None);
+            write_parent_fixture(&root, "managed-child", Some("managed-parent"));
+            write_checkpoint(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                "fp-a",
+                Some("gen-a"),
+                Some("out-a"),
+            )
+            .unwrap();
+            notify_parent(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                Some("checkpoint"),
+            )
+            .unwrap()
+        });
+        assert_eq!(notified["unit"], "managed-parent.service");
+        assert_eq!(notified["blocking"], false);
+        let calls = fs::read_to_string(root.join("systemctl.log")).unwrap();
+        assert!(calls.contains("start --no-block"), "{calls}");
+        assert!(calls.contains("managed-parent.service"), "{calls}");
+        assert!(!calls.contains(".timer"), "{calls}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn blocked_notify_does_not_require_checkpoint() {
+        let root = tmp_root("notify-blocked");
+        let notified = with_user_unit_dir(&root, &["managed-child", "managed-parent"], || {
+            bind_operation(&root, "managed-child");
+            write_parent_fixture(&root, "managed-parent", None);
+            write_parent_fixture(&root, "managed-child", Some("managed-parent"));
+            write_blocker(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                "worktree-dirty",
+                None,
+                Some(4),
+                "dedicated worktree is dirty",
+            )
+            .unwrap();
+            notify_parent(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                Some("blocked"),
+            )
+            .unwrap()
+        });
+        assert_eq!(notified["event"], "blocked");
+        assert_eq!(notified["blocking"], false);
+        let calls = fs::read_to_string(root.join("systemctl.log")).unwrap();
+        assert!(calls.contains("start --no-block"), "{calls}");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1609,6 +2353,8 @@ mod tests {
         assert_eq!(child["lifecycle"], "completed");
         assert!(child.get("iterations").is_none());
         assert!(child.to_string().find("secret").is_none());
+        assert!(child.get("child_revision").is_some());
+        assert_eq!(child["checkpoint"]["present"], false);
     }
 
     #[test]

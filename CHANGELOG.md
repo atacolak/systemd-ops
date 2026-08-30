@@ -5,6 +5,17 @@ dates; entries describe what changed on the wire or on disk, since that
 is what a downstream package has to care about.
 
 ## unreleased (not published)
+Processed input (`state/fingerprint`) is distinct from a structured output
+checkpoint (`state/checkpoint.json`) and a current blocker (`state/blocker.json`).
+`automation checkpoint` writes the output checkpoint; `automation blocker` records
+one current failure identity; a later checkpoint clears the blocker. Relation
+summaries expose processed fingerprint, structured checkpoint, blocker, latest
+iteration outcome, and a stable child revision. `automation notify-parent`
+`--event checkpoint|blocked|completed` starts the parent service with
+`systemctl start --no-block` and does not wait for the parent oneshot to finish.
+Legacy fingerprint-only operations remain readable and are not treated as
+current-generation output.
+
 Automation metadata adds optional scope `[automation].agent_root`, canonical
 per-operation `automation.toml`, stable brain revisions, same-scope acyclic
 parent relations, bounded relation summaries, and completed lifecycle state.

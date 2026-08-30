@@ -485,6 +485,29 @@ pub fn apply_verb(
     Ok(changes)
 }
 
+/// Request a start without waiting for the unit to finish.
+///
+/// Used for parent reevaluation. A sealed plan/apply start is the wrong
+/// primitive: it waits for oneshot completion and treats an already-active
+/// parent as a stale precondition.
+pub fn start_noblock(unit: &str) -> Result<Vec<String>, BackendError> {
+    validate_unit_name(unit)?;
+    require_write_unit(unit)?;
+    ensure_unit_known(unit)?;
+    let output = systemctl()
+        .arg("start")
+        .arg("--no-block")
+        .arg("--no-ask-password")
+        .arg("--no-pager")
+        .arg("--")
+        .arg(unit)
+        .output()?;
+    let mut changes = collect_lines(&output.stdout);
+    changes.extend(collect_lines(&output.stderr));
+    changes.push(format!("requested start --no-block {unit}"));
+    Ok(changes)
+}
+
 pub(crate) fn unit_file_dir() -> PathBuf {
     match manager() {
         Manager::User => {
