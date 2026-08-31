@@ -160,4 +160,20 @@ run_wrapper "$unchanged"
 [[ ! -e $unchanged/agent-was-called ]] || fail "unchanged processed input invoked OMP"
 [[ ! -e $unchanged/.systemd-ops/operations/managed-omp-pr-9363/state/operator.json ]] || fail "unchanged processed input created an iteration"
 
+blocked_repeat=$(make_case blocked-repeat)
+write_omp "$blocked_repeat/fake-omp" '"$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "blocked unchanged" --summary '\''["still blocked"]'\'' --outcome blocked --route parent >/dev/null; echo called >>"${SYSTEMD_OPS_SCOPE_ROOT}/agent-calls"'
+run_wrapper "$blocked_repeat"
+[[ -f $blocked_repeat/agent-calls ]] || fail "blocked first pass did not invoke OMP"
+[[ $(wc -l <"$blocked_repeat/agent-calls") -eq 1 ]] || fail "blocked first pass invoked OMP more than once"
+jq -e '.outcome=="blocked"' "$blocked_repeat/.systemd-ops/operations/managed-omp-pr-9363/state/processed.json" >/dev/null \
+  || fail "blocked first pass did not process input"
+for _ in 1 2 3; do
+  run_wrapper "$blocked_repeat"
+done
+[[ $(wc -l <"$blocked_repeat/agent-calls") -eq 1 ]] || fail "unchanged blocked polls relaunched OMP"
+
+PROOF_FINGERPRINT=fp-changed run_wrapper "$blocked_repeat"
+[[ $(wc -l <"$blocked_repeat/agent-calls") -eq 2 ]] || fail "changed world did not wake OMP exactly once"
+
 echo "wrapper-contract ok"
+

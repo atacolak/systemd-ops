@@ -425,11 +425,9 @@ pub fn aggregate(
         view["critical"] = json!(critical);
         view["scope_id"] = json!(manifest.id);
         view["scope_root"] = json!(manifest.root.to_string_lossy());
-        view["operation_home"] = json!(manifest
-            .root
-            .join(".systemd-ops")
-            .join(&unit)
-            .to_string_lossy());
+        view["operation_home"] =
+            json!(crate::automation::operation_home(&manifest.root, &unit).to_string_lossy());
+
         view["automation"] = automation;
         if view.get("definition_revision").is_none() {
             view["definition_revision"] = Value::Null;
@@ -500,11 +498,9 @@ pub fn aggregate(
         view["critical"] = json!(false);
         view["scope_id"] = json!(manifest.id);
         view["scope_root"] = json!(manifest.root.to_string_lossy());
-        view["operation_home"] = json!(manifest
-            .root
-            .join(".systemd-ops")
-            .join(&unit)
-            .to_string_lossy());
+        view["operation_home"] =
+            json!(crate::automation::operation_home(&manifest.root, &unit).to_string_lossy());
+
         if view.get("definition_revision").is_none() {
             view["definition_revision"] = Value::Null;
         }

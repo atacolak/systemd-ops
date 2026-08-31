@@ -939,8 +939,6 @@ struct ChildRevisionInput<'a> {
     unit: &'a str,
     agent: Option<&'a str>,
     lifecycle: &'a str,
-    running: bool,
-    active_iteration: bool,
     processed: Option<&'a str>,
     checkpoint: Option<&'a Checkpoint>,
     blocker: Option<&'a Blocker>,
@@ -955,10 +953,6 @@ fn child_revision(input: ChildRevisionInput<'_>) -> String {
     }
     buf.push(0);
     buf.extend_from_slice(input.lifecycle.as_bytes());
-    buf.push(0);
-    buf.extend_from_slice(if input.running { b"1" } else { b"0" });
-    buf.push(0);
-    buf.extend_from_slice(if input.active_iteration { b"1" } else { b"0" });
     buf.push(0);
     if let Some(processed) = input.processed {
         buf.extend_from_slice(processed.as_bytes());
@@ -1324,12 +1318,11 @@ fn relation_summary(operation: &Value) -> Value {
             unit,
             agent,
             lifecycle,
-            running,
-            active_iteration,
             processed: processed_fingerprint,
             checkpoint: checkpoint_record.as_ref(),
             blocker: blocker_record.as_ref(),
         }),
+
     })
 }
 
@@ -1340,11 +1333,24 @@ fn active_iteration(operation: &Value) -> bool {
         .is_some_and(|value| !value.is_null())
 }
 
+fn processed_is_current_blocked(operation: &Value) -> bool {
+    let automation = operation.get("automation").unwrap_or(&Value::Null);
+    let observation_input = automation
+        .get("observation")
+        .and_then(|value| value.get("input_fingerprint"))
+        .and_then(Value::as_str);
+    let processed = automation.get("processed").unwrap_or(&Value::Null);
+    processed.get("legacy").and_then(Value::as_bool) != Some(true)
+        && processed.get("outcome").and_then(Value::as_str) == Some("blocked")
+        && observation_input.is_some()
+        && processed.get("input_fingerprint").and_then(Value::as_str) == observation_input
+}
+
 fn blocker_is_current(operation: &Value) -> bool {
     let automation = operation.get("automation").unwrap_or(&Value::Null);
     let blocker = automation.get("blocker").unwrap_or(&Value::Null);
     if blocker.is_null() {
-        return false;
+        return processed_is_current_blocked(operation);
     }
     let observation_input = automation
         .get("observation")
@@ -1454,7 +1460,7 @@ pub fn derive_semantic_states(operations: &mut [Value]) {
             "neutral"
         } else if active_iteration(operation) {
             "running"
-        } else if blocker_is_current(operation) {
+        } else if blocker_is_current(operation) || processed_is_current_blocked(operation) {
             "blocked"
         } else {
             let active_children: Vec<&str> = children
@@ -3278,5 +3284,30 @@ mod tests {
         assert_eq!(operations[0]["automation"]["semantic_state"], "stale");
         assert_eq!(operations[0]["automation"]["blocker"]["current"], false);
         assert_eq!(operations[0]["automation"]["blocker"]["id"], "blk-a");
+    }
+
+    #[test]
+    fn current_blocked_processed_is_blocked_without_blocker_file() {
+        let mut operation = semantic_operation(
+            "managed-proof",
+            None,
+            "in",
+            "gen",
+            None,
+            None,
+            None,
+            false,
+            "healthy",
+        );
+        operation["automation"]["processed"] = json!({
+            "version": 1,
+            "input_fingerprint": "in",
+            "outcome": "blocked",
+            "legacy": false
+        });
+        let mut operations = vec![operation];
+        derive_semantic_states(&mut operations);
+        assert_eq!(operations[0]["automation"]["semantic_state"], "blocked");
+        assert_eq!(operations[0]["health"], "healthy");
     }
 }

@@ -2119,8 +2119,10 @@ mod tests {
         };
         view.owned[0]["scope_id"] = serde_json::json!("personal");
         view.owned[0]["scope_root"] = serde_json::json!("/tmp/personal");
-        view.owned[0]["operation_home"] =
-            serde_json::json!("/tmp/personal/.systemd-ops/managed-personal-pr-maintainer");
+        view.owned[0]["operation_home"] = serde_json::json!(
+            "/tmp/personal/.systemd-ops/operations/managed-personal-pr-maintainer"
+        );
+
         view.owned[0]["basis_revision"] = serde_json::json!("sha256:abc");
         view
     }
