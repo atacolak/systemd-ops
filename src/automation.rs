@@ -1347,10 +1347,13 @@ fn processed_is_current_blocked(operation: &Value) -> bool {
 }
 
 fn blocker_is_current(operation: &Value) -> bool {
+    if processed_is_current_blocked(operation) {
+        return true;
+    }
     let automation = operation.get("automation").unwrap_or(&Value::Null);
     let blocker = automation.get("blocker").unwrap_or(&Value::Null);
     if blocker.is_null() {
-        return processed_is_current_blocked(operation);
+        return false;
     }
     let observation_input = automation
         .get("observation")
@@ -1358,19 +1361,7 @@ fn blocker_is_current(operation: &Value) -> bool {
         .and_then(Value::as_str);
     match blocker.get("input_fingerprint").and_then(Value::as_str) {
         Some(input) => observation_input == Some(input),
-        None => {
-            let structured_processed = automation
-                .get("processed")
-                .and_then(|value| value.get("legacy"))
-                .and_then(Value::as_bool)
-                == Some(false)
-                && automation
-                    .get("processed")
-                    .and_then(|value| value.get("input_fingerprint"))
-                    .and_then(Value::as_str)
-                    .is_some();
-            !structured_processed
-        }
+        None => true,
     }
 }
 
@@ -1460,7 +1451,7 @@ pub fn derive_semantic_states(operations: &mut [Value]) {
             "neutral"
         } else if active_iteration(operation) {
             "running"
-        } else if blocker_is_current(operation) || processed_is_current_blocked(operation) {
+        } else if blocker_is_current(operation) {
             "blocked"
         } else {
             let active_children: Vec<&str> = children
