@@ -24,6 +24,7 @@ pub struct ScopeManifest {
     pub critical: Vec<String>,
     pub watch: Vec<String>,
     pub automation_agent_root: Option<PathBuf>,
+    pub coordination_lead: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +75,7 @@ pub struct Attention {
 pub struct ScopeView {
     pub id: String,
     pub automation_agent_root: Option<PathBuf>,
+    pub coordination_lead: Option<String>,
     pub root: PathBuf,
     pub health: ScopeHealth,
     pub owned: Vec<Value>,
@@ -89,6 +91,9 @@ impl ScopeView {
             "root": self.root.to_string_lossy(),
             "automation": {
                 "agent_root": self.automation_agent_root.as_ref().map(|path| path.to_string_lossy()),
+            },
+            "coordination": {
+                "lead": self.coordination_lead,
             },
             "health": self.health.as_str(),
             "owned": self.owned,
@@ -109,6 +114,7 @@ impl ScopeView {
 struct RawFile {
     scope: Option<RawScope>,
     automation: Option<RawAutomation>,
+    coordination: Option<RawCoordination>,
     watch: Option<Vec<RawWatch>>,
 }
 
@@ -124,6 +130,12 @@ struct RawScope {
 #[serde(deny_unknown_fields)]
 struct RawAutomation {
     agent_root: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawCoordination {
+    lead: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -305,6 +317,10 @@ fn parse_manifest_named(
         }
         None => None,
     };
+    let coordination_lead = match raw.coordination.and_then(|coordination| coordination.lead) {
+        Some(value) => Some(validate_coordination_lead(&value)?),
+        None => None,
+    };
     Ok(ScopeManifest {
         id,
         root,
@@ -312,6 +328,7 @@ fn parse_manifest_named(
         critical,
         watch,
         automation_agent_root,
+        coordination_lead,
     })
 }
 
@@ -468,6 +485,7 @@ pub fn aggregate(
         }
         owned.push(view);
     }
+    crate::automation::derive_semantic_states(&mut owned);
     crate::automation::attach_relations(&mut owned);
     let mut watching = Vec::new();
     for mut view in watching_ops {
@@ -510,6 +528,7 @@ pub fn aggregate(
     ScopeView {
         id: manifest.id.clone(),
         automation_agent_root: manifest.automation_agent_root.clone(),
+        coordination_lead: manifest.coordination_lead.clone(),
         root: manifest.root.clone(),
         health,
         owned,
@@ -517,6 +536,32 @@ pub fn aggregate(
         attention,
         warnings,
     }
+}
+
+fn validate_coordination_lead(value: &str) -> Result<String, BackendError> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 {
+        return Err(BackendError(
+            "coordination.lead must be 1..128 characters".into(),
+        ));
+    }
+    if value.contains(['\n', '\r', ' ']) {
+        return Err(BackendError(
+            "coordination.lead must be a single token".into(),
+        ));
+    }
+    if !value.starts_with("hcom:") {
+        return Err(BackendError(
+            "coordination.lead must be an opaque hcom:<name> handle".into(),
+        ));
+    }
+    let name = &value[5..];
+    if name.len() != 4 || !name.bytes().all(|b| b.is_ascii_lowercase()) {
+        return Err(BackendError(
+            "coordination.lead must be hcom: plus a four-letter lowercase name".into(),
+        ));
+    }
+    Ok(value.to_string())
 }
 
 fn missing_view(stem: &str) -> Value {
@@ -770,6 +815,34 @@ operation = "managed-proxy-health"
         )
         .unwrap_err();
         assert!(err.0.contains("malformed"), "got {}", err.0);
+    }
+
+    #[test]
+    fn coordination_lead_is_optional_and_opaque() {
+        let without = parse_manifest(
+            "[scope]\nid=\"speech\"\nowned=[\"managed-speech-*\"]\n",
+            PathBuf::from("/x"),
+        )
+        .unwrap();
+        assert!(without.coordination_lead.is_none());
+        let with = parse_manifest(
+            "[scope]\nid=\"speech\"\nowned=[\"managed-speech-*\"]\n[coordination]\nlead=\"hcom:riko\"\n",
+            PathBuf::from("/x"),
+        )
+        .unwrap();
+        assert_eq!(with.coordination_lead.as_deref(), Some("hcom:riko"));
+        let err = parse_manifest(
+            "[scope]\nid=\"speech\"\nowned=[\"managed-speech-*\"]\n[coordination]\nlead=\"operator\"\n",
+            PathBuf::from("/x"),
+        )
+        .unwrap_err();
+        assert!(err.0.contains("hcom:"), "{}", err.0);
+        let err = parse_manifest(
+            "[scope]\nid=\"speech\"\nowned=[\"managed-speech-*\"]\n[coordination]\nlead=\"hcom:RIKO\"\n",
+            PathBuf::from("/x"),
+        )
+        .unwrap_err();
+        assert!(err.0.contains("four-letter"), "{}", err.0);
     }
 
     #[test]

@@ -5,24 +5,44 @@ dates; entries describe what changed on the wire or on disk, since that
 is what a downstream package has to care about.
 
 ## unreleased (not published)
-Processed input (`state/fingerprint`) is distinct from a structured output
-checkpoint (`state/checkpoint.json`) and a current blocker (`state/blocker.json`).
-`automation checkpoint` writes the output checkpoint; `automation blocker` records
-one current failure identity; a later checkpoint clears the blocker. Relation
-summaries expose processed fingerprint, structured checkpoint, blocker, latest
+Generic observation is now first-class. `[observation]` names a
+scope-relative observer. `automation observe` validates observer payload
+version 1 and writes `state/observation.json`. Effective input is the
+exact hash `sha256("world=<world>\nbrain=<brain>\n")`. `automation process`
+writes `state/processed.json` for `ready|blocked` and only then may
+remove a legacy `state/fingerprint`. New checkpoints are version 2 and
+bind `input_fingerprint`. New blockers bind that same input when known.
+Semantic state is derived, never persisted: `neutral`, `running`,
+`blocked`, `waiting`, `ready`, or `stale`. Execution health stays
+independent. Preferred operation homes are
+`.systemd-ops/operations/<stem>/`; legacy `.systemd-ops/<stem>/` remains
+readable and same-stem coexistence is an error.
+
+Reports now require `outcome=ready|blocked`. BLOCKED reports require
+`route=self|parent|lead`; READY reports refuse a route. Outcome and route
+persist on the operator surface and reconsolidate onto the finished iteration.
+Scope manifests may declare an opaque `[coordination] lead = "hcom:xxxx"`
+handle. Blockers carry the same route vocabulary; rust never shells out to
+HCOM.
+
+Processed input is distinct from a structured output checkpoint and a
+current blocker. Relation summaries expose observation, processed input,
+structured checkpoint, current blocker identity, semantic state, latest
 iteration outcome, and a stable child revision. `automation notify-parent`
 `--event checkpoint|blocked|completed` starts the parent service with
 `systemctl start --no-block` and does not wait for the parent oneshot to finish.
 Legacy fingerprint-only operations remain readable and are not treated as
 current-generation output.
 
+
 Automation metadata adds optional scope `[automation].agent_root`, canonical
 per-operation `automation.toml`, stable brain revisions, same-scope acyclic
 parent relations, bounded relation summaries, and completed lifecycle state.
 Automation author plans compose existing sealed OperationSpec author plans;
-completion preserves definitions, operation homes, histories, fingerprints,
-relations, and TUI rows while disabling future timer activation. Deterministic
+completion preserves definitions, operation homes, histories, structured
+state, relations, and TUI rows while disabling future timer activation. Deterministic
 operations remain valid without an agent or brain revision.
+
 
 The OMP adapter adds hidden explicit-only `automation_agent_author` and
 `automation_author` builder surfaces. Runtime agents remain restricted to the
@@ -34,14 +54,17 @@ Scope and operator substrate: the preferred manifest is now
 `.systemd-ops/scope.toml`; legacy `.systemd-ops.toml` remains readable,
 and same-root coexistence is an error. For scope, operator, and TUI
 commands, direct CLI `--scope-root` overrides `SYSTEMD_OPS_SCOPE_ROOT`,
-which overrides discovery from `--cwd` or the process cwd. Each operation
-home is `.systemd-ops/<stem>/`, distinct from the scope root and the unit's
-execution cwd. Operation homes hold advisory state only and do not replace
-systemd unit files or runtime truth.
+which overrides discovery from `--cwd` or the process cwd. Preferred
+operation homes are `.systemd-ops/operations/<stem>/`, distinct from the
+scope root and the unit's execution cwd. Legacy `.systemd-ops/<stem>/`
+remains readable; same-stem coexistence is an error. Operation homes hold
+advisory and structured observation state only and do not replace systemd
+unit files or runtime truth.
 
 Operator state moves to the canonical
-`.systemd-ops/<stem>/state/operator.json`. The legacy
+`.systemd-ops/operations/<stem>/state/operator.json`. The legacy
 `.systemd-ops/operator/<stem>.json` is read when canonical state is absent;
+
 the next successful write uses the canonical path and may remove legacy
 state. Canonical state wins with a warning if both exist. OperatorSurface
 v1 adds `active_iteration` and the latest 20 finished `iterations`.
@@ -51,7 +74,9 @@ Activity, iterations, and briefs remain objective-health-neutral and are
 distinct from systemd executions and checks.
 
 TUI default mode is the operator cockpit; `d` is wiring and `l` is
-diagnostics and no longer loads journald on open or selection. Cockpit
+diagnostics and no longer loads journald on open or selection. Semantic
+state is an independent axis from systemd health. Cockpit
+
 content can be scrolled without changing the selected operation. OMP
 adapter calls prefer session cwd, pass it as CLI and process cwd, and
 inherit `SYSTEMD_OPS_SCOPE_ROOT` from the parent environment.

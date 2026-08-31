@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-LIB=${WRAPPER_LIB:-/home/sf/workspace/oh-my-pi/.systemd-ops/automation-wrapper-lib}
+LIB=${WRAPPER_LIB:-/home/sf/workspace/oh-my-pi/.systemd-ops/lib/automation-wrapper}
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 command -v jq >/dev/null || fail "jq required"
@@ -15,7 +15,9 @@ source "$LIB"
 context_for() {
   local a_gen=$1 a_out=$2 b_gen=$3 b_out=$4
   local a_blocker=${5:-null}
-  jq -n --arg a_gen "$a_gen" --arg a_out "$a_out" --arg b_gen "$b_gen" --arg b_out "$b_out" --argjson a_blocker "$a_blocker" '{
+  local a_state=${6:-ready}
+  jq -n --arg a_gen "$a_gen" --arg a_out "$a_out" --arg b_gen "$b_gen" --arg b_out "$b_out" \
+    --argjson a_blocker "$a_blocker" --arg a_state "$a_state" '{
     data: {
       relations: {
         children: [
@@ -24,8 +26,9 @@ context_for() {
             lifecycle: "active",
             running: false,
             active_iteration: false,
+            semantic_state: $a_state,
             blocker: $a_blocker,
-            checkpoint: {present: true, kind: "structured", generation: $a_gen, output_revision: $a_out, fingerprint: "fp-a"},
+            checkpoint: {present: true, kind: "structured", generation: $a_gen, output_revision: $a_out, input_fingerprint: "fp-a"},
             child_revision: ("rev-a-" + $a_out)
           },
           {
@@ -33,8 +36,9 @@ context_for() {
             lifecycle: "active",
             running: false,
             active_iteration: false,
+            semantic_state: "ready",
             blocker: null,
-            checkpoint: {present: true, kind: "structured", generation: $b_gen, output_revision: $b_out, fingerprint: "fp-b"},
+            checkpoint: {present: true, kind: "structured", generation: $b_gen, output_revision: $b_out, input_fingerprint: "fp-b"},
             child_revision: ("rev-b-" + $b_out)
           }
         ]
@@ -53,7 +57,7 @@ children_ready_for_generation "$ctx" generation-B || fail "matching generations 
 ctx=$(context_for generation-B out-a2 generation-B out-b)
 children_ready_for_generation "$ctx" generation-B || fail "review-only sibling change was not ready"
 
-ctx=$(context_for generation-B out-a generation-B out-b '{"id":"blk-1","kind":"iteration-failed"}')
+ctx=$(context_for generation-B out-a generation-B out-b '{"id":"blk-1","kind":"iteration-failed","current":true}' blocked)
 children_ready_for_generation "$ctx" generation-B && fail "blocked child was treated ready"
 children_have_blocker "$ctx" || fail "blocked child was not detected"
 
@@ -70,16 +74,18 @@ completed=$(jq -n '{
           lifecycle: "completed",
           running: false,
           active_iteration: false,
+          semantic_state: "ready",
           blocker: null,
-          checkpoint: {present: true, kind: "structured", generation: "generation-A", output_revision: "old", fingerprint: "fp-old"}
+          checkpoint: {present: true, kind: "structured", generation: "generation-A", output_revision: "old", input_fingerprint: "fp-old"}
         },
         {
           unit: "managed-omp-pr-live",
           lifecycle: "active",
           running: false,
           active_iteration: false,
+          semantic_state: "ready",
           blocker: null,
-          checkpoint: {present: true, kind: "structured", generation: "generation-B", output_revision: "live", fingerprint: "fp-live"}
+          checkpoint: {present: true, kind: "structured", generation: "generation-B", output_revision: "live", input_fingerprint: "fp-live"}
         }
       ]
     }

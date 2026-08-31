@@ -1,6 +1,7 @@
 //! Project-local advisory operator commentary.
 //!
-//! Stored under `<scope-root>/.systemd-ops/<stem>/state/operator.json`.
+//! Stored under `<scope-root>/.systemd-ops/operations/<stem>/state/operator.json`.
+
 //! The former `.systemd-ops/operator/<stem>.json` location is read-only
 //! compatibility and is migrated after the next successful write.
 //! Soft state never feeds objective operation or scope health.
@@ -69,7 +70,7 @@ pub struct ActiveIteration {
     pub reported_at: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OperatorIteration {
     pub id: String,
     pub started_at: String,
@@ -78,9 +79,10 @@ pub struct OperatorIteration {
     pub reconsolidated: bool,
     pub headline: Option<String>,
     pub summary: Option<String>,
+    pub outcome: Option<String>,
+    pub route: Option<String>,
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OperatorSurface {
     pub version: u32,
     pub about: Option<String>,
@@ -88,6 +90,8 @@ pub struct OperatorSurface {
     pub body: Option<String>,
     pub updated_at: Option<String>,
     pub basis_revision: Option<String>,
+    pub outcome: Option<String>,
+    pub route: Option<String>,
     pub activity: Vec<OperatorActivity>,
     pub active_iteration: Option<ActiveIteration>,
     pub iterations: Vec<OperatorIteration>,
@@ -102,6 +106,8 @@ impl OperatorSurface {
             "body": self.body,
             "updated_at": self.updated_at,
             "basis_revision": self.basis_revision,
+            "outcome": self.outcome,
+            "route": self.route,
             "activity": self.activity.iter().map(|a| json!({
                 "at": a.at,
                 "text": a.text,
@@ -120,6 +126,8 @@ impl OperatorSurface {
                 "reconsolidated": iteration.reconsolidated,
                 "headline": iteration.headline,
                 "summary": iteration.summary,
+                "outcome": iteration.outcome,
+                "route": iteration.route,
             })).collect::<Vec<_>>(),
         })
     }
@@ -148,7 +156,7 @@ pub fn derive_state(load: &OperatorLoad, definition_revision: Option<&str>) -> O
 }
 
 pub fn operator_dir(root: &Path, stem: &str) -> PathBuf {
-    root.join(DIR_NAME).join(stem).join("state")
+    crate::automation::operation_home(root, stem).join("state")
 }
 
 pub fn operator_path(root: &Path, stem: &str) -> PathBuf {
@@ -185,8 +193,9 @@ pub fn require_owned(manifest: &ScopeManifest, stem: &str) -> Result<(), Backend
     }
 }
 
-fn selected_path(root: &Path, stem: &str) -> (PathBuf, Option<String>) {
-    let canonical = operator_path(root, stem);
+fn selected_path(root: &Path, stem: &str) -> Result<(PathBuf, Option<String>), BackendError> {
+    let operation = crate::automation::operation_home_checked(root, stem)?;
+    let canonical = operation.join("state/operator.json");
     let legacy = legacy_operator_path(root, stem);
     if canonical.exists() {
         let warning = legacy.exists().then(|| {
@@ -196,14 +205,17 @@ fn selected_path(root: &Path, stem: &str) -> (PathBuf, Option<String>) {
                 legacy.display()
             )
         });
-        (canonical, warning)
+        Ok((canonical, warning))
     } else {
-        (legacy, None)
+        Ok((legacy, None))
     }
 }
 
 pub fn load_with_warning(root: &Path, stem: &str) -> (OperatorLoad, Option<String>) {
-    let (path, warning) = selected_path(root, stem);
+    let (path, warning) = match selected_path(root, stem) {
+        Ok(selected) => selected,
+        Err(error) => return (OperatorLoad::Error(error.0), None),
+    };
     if !path.exists() {
         return (OperatorLoad::Missing, warning);
     }
@@ -223,19 +235,10 @@ pub fn load(root: &Path, stem: &str) -> OperatorLoad {
 
 pub fn parse_surface(bytes: &[u8]) -> Result<OperatorSurface, BackendError> {
     let value: Value = serde_json::from_slice(bytes)
-        .map_err(|e| BackendError(format!("operator state is not valid JSON: {e}")))?;
+        .map_err(|error| BackendError(format!("malformed operator state: {error}")))?;
     let obj = value
         .as_object()
-        .ok_or_else(|| BackendError("operator state must be a JSON object".into()))?;
-    let version = obj
-        .get("version")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| BackendError("operator state missing version".into()))?;
-    if version != u64::from(VERSION) {
-        return Err(BackendError(format!(
-            "unsupported operator state version {version}"
-        )));
-    }
+        .ok_or_else(|| BackendError("operator state must be an object".into()))?;
     let activity = parse_activity(obj)?;
     let active_iteration = match obj.get("active_iteration") {
         None | Some(Value::Null) => None,
@@ -267,6 +270,8 @@ pub fn parse_surface(bytes: &[u8]) -> Result<OperatorSurface, BackendError> {
         body: opt_string(obj, "body"),
         updated_at: opt_string(obj, "updated_at"),
         basis_revision: opt_string(obj, "basis_revision"),
+        outcome: opt_string(obj, "outcome"),
+        route: opt_string(obj, "route"),
         activity,
         active_iteration,
         iterations,
@@ -334,6 +339,8 @@ fn parse_iteration(value: &Value) -> Result<OperatorIteration, BackendError> {
             .ok_or_else(|| BackendError("iteration missing reconsolidated".into()))?,
         headline: opt_string(obj, "headline"),
         summary: opt_string(obj, "summary"),
+        outcome: opt_string(obj, "outcome"),
+        route: opt_string(obj, "route"),
     })
 }
 
@@ -378,7 +385,14 @@ fn ensure_dirs(root: &Path, stem: &str) -> Result<PathBuf, BackendError> {
             .map_err(|e| BackendError(format!("mkdir {}: {e}", base.display())))?;
         let _ = fs::set_permissions(&base, fs::Permissions::from_mode(0o700));
     }
-    let operation = base.join(stem);
+    let operations = base.join("operations");
+    refuse_symlink(&operations)?;
+    if !operations.exists() {
+        fs::create_dir(&operations)
+            .map_err(|e| BackendError(format!("mkdir {}: {e}", operations.display())))?;
+        let _ = fs::set_permissions(&operations, fs::Permissions::from_mode(0o700));
+    }
+    let operation = crate::automation::operation_home_checked(root, stem)?;
     refuse_symlink(&operation)?;
     if !operation.exists() {
         fs::create_dir(&operation)
@@ -475,6 +489,8 @@ fn empty_surface() -> OperatorSurface {
         body: None,
         updated_at: None,
         basis_revision: None,
+        outcome: None,
+        route: None,
         activity: Vec::new(),
         active_iteration: None,
         iterations: Vec::new(),
@@ -607,7 +623,13 @@ pub fn automation_context(
             "brain_revision": automation.get("brain_revision").cloned().unwrap_or(Value::Null),
             "lifecycle": automation.get("lifecycle").cloned().unwrap_or(Value::Null),
             "parent": automation.get("parent").cloned().unwrap_or(Value::Null),
+            "observation": automation.get("observation").cloned().unwrap_or(Value::Null),
+            "processed": automation.get("processed").cloned().unwrap_or(Value::Null),
+            "checkpoint": automation.get("checkpoint").cloned().unwrap_or(Value::Null),
+            "blocker": automation.get("blocker").cloned().unwrap_or(Value::Null),
+            "semantic_state": automation.get("semantic_state").cloned().unwrap_or(Value::Null),
         },
+
         "relations": relations,
         "runtime": {
             "state": operation.get("state").cloned().unwrap_or(Value::Null),
@@ -623,6 +645,8 @@ pub fn automation_context(
             "summary": operator.get("body").cloned().unwrap_or(Value::Null),
             "updated_at": operator.get("updated_at").cloned().unwrap_or(Value::Null),
             "basis_revision": operator.get("basis_revision").cloned().unwrap_or(Value::Null),
+            "outcome": operator.get("outcome").cloned().unwrap_or(Value::Null),
+            "route": operator.get("route").cloned().unwrap_or(Value::Null),
         },
         "active_iteration": operator.get("active_iteration").cloned().unwrap_or(Value::Null),
         "iterations": operator.get("iterations").cloned().unwrap_or_else(|| json!([])),
@@ -635,10 +659,13 @@ pub fn automation_report(
     cwd: Option<&str>,
     headline: &str,
     summary: &[String],
+    outcome: Option<&str>,
+    route: Option<&str>,
 ) -> Result<Value, BackendError> {
     let headline = strict_single_line("headline", headline, MAX_AUTOMATION_HEADLINE)?;
     let summary = strict_summary(summary)?;
     let body = summary.join("\n\n");
+    let (outcome, route) = validate_report_outcome(outcome, route)?;
     let (manifest, stem) = bound_operation_manifest(explicit_root, cwd)?;
 
     let (load, warning) = load_with_warning(&manifest.root, &stem);
@@ -657,6 +684,8 @@ pub fn automation_report(
     })?;
     surface.headline = Some(headline);
     surface.body = Some(body);
+    surface.outcome = outcome.clone();
+    surface.route = route.clone();
     surface.updated_at = Some(now.clone());
     surface.basis_revision = current_definition_revision(&manifest, &stem);
     active.reported_at = Some(now);
@@ -668,6 +697,45 @@ pub fn automation_report(
         "warning": warning,
         "reported": true,
     }))
+}
+
+fn validate_report_outcome(
+    outcome: Option<&str>,
+    route: Option<&str>,
+) -> Result<(Option<String>, Option<String>), BackendError> {
+    let outcome = outcome
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| BackendError("report requires outcome=ready|blocked".into()))?;
+    let outcome = strict_single_line("outcome", outcome, 16)?;
+    match outcome.as_str() {
+        "ready" => {
+            if route.is_some() {
+                return Err(BackendError(
+                    "READY reports must not include a route".into(),
+                ));
+            }
+            Ok((Some(outcome), None))
+        }
+        "blocked" => {
+            let route = route.ok_or_else(|| {
+                BackendError("BLOCKED reports require route=self|parent|lead".into())
+            })?;
+            let route = strict_single_line("route", route, 16)?;
+            if !matches!(route.as_str(), "self" | "parent" | "lead") {
+                return Err(BackendError(
+                    "unknown blocker route (known: self, parent, lead)".into(),
+                ));
+            }
+            Ok((Some(outcome), Some(route)))
+        }
+        "failed" => Err(BackendError(
+            "FAILED is a wrapper outcome, not an automation_report outcome".into(),
+        )),
+        other => Err(BackendError(format!(
+            "unknown report outcome '{other}' (known: ready, blocked)"
+        ))),
+    }
 }
 
 pub fn automation_activity(
@@ -741,6 +809,7 @@ fn start_iteration(surface: &mut OperatorSurface, id: String, started_at: String
                 reconsolidated: false,
                 headline: None,
                 summary: None,
+                ..Default::default()
             },
         );
     }
@@ -772,6 +841,8 @@ fn finish_iteration(
     let reconsolidated = exit_code == 0 && active.reported_at.is_some();
     let headline = reconsolidated.then(|| surface.headline.clone()).flatten();
     let summary = reconsolidated.then(|| surface.body.clone()).flatten();
+    let outcome = reconsolidated.then(|| surface.outcome.clone()).flatten();
+    let route = reconsolidated.then(|| surface.route.clone()).flatten();
     push_iteration(
         surface,
         OperatorIteration {
@@ -782,6 +853,8 @@ fn finish_iteration(
             reconsolidated,
             headline,
             summary,
+            outcome,
+            route,
         },
     );
     Ok(reconsolidated)
@@ -1072,6 +1145,7 @@ mod tests {
             critical: Vec::new(),
             watch: vec!["managed-proxy-health".into()],
             automation_agent_root: None,
+            coordination_lead: None,
         }
     }
 
@@ -1109,6 +1183,7 @@ mod tests {
             }],
             active_iteration: None,
             iterations: Vec::new(),
+            ..Default::default()
         };
         atomic_write(&operator_path(&m.root, stem), &surface).unwrap();
         surface.headline = Some("now".into());
@@ -1161,6 +1236,7 @@ mod tests {
             activity: Vec::new(),
             active_iteration: None,
             iterations: Vec::new(),
+            ..Default::default()
         };
         for i in 0..(MAX_ACTIVITY + 5) {
             surface.activity.push(OperatorActivity {
@@ -1202,6 +1278,7 @@ mod tests {
             activity: Vec::new(),
             active_iteration: None,
             iterations: Vec::new(),
+            ..Default::default()
         };
         atomic_write(&operator_path(&m.root, "managed-personal-a"), &a).unwrap();
         atomic_write(&operator_path(&m.root, "managed-personal-b"), &a).unwrap();
@@ -1252,6 +1329,7 @@ mod tests {
                 activity: Vec::new(),
                 active_iteration: None,
                 iterations: Vec::new(),
+                ..Default::default()
             })
         };
         assert_eq!(
@@ -1377,6 +1455,28 @@ mod tests {
     }
 
     #[test]
+    fn report_outcome_requires_ready_or_blocked() {
+        assert!(validate_report_outcome(None, None).is_err());
+        assert!(validate_report_outcome(Some(""), None).is_err());
+        assert!(validate_report_outcome(Some("ready"), Some("self")).is_err());
+        assert!(validate_report_outcome(Some("blocked"), None).is_err());
+        assert!(validate_report_outcome(Some("blocked"), Some("operator")).is_err());
+        assert!(validate_report_outcome(Some("failed"), None).is_err());
+        assert_eq!(
+            validate_report_outcome(Some("ready"), None).unwrap(),
+            (Some("ready".into()), None)
+        );
+        assert_eq!(
+            validate_report_outcome(Some("blocked"), Some("parent")).unwrap(),
+            (Some("blocked".into()), Some("parent".into()))
+        );
+        assert_eq!(
+            validate_report_outcome(Some("blocked"), Some("lead")).unwrap(),
+            (Some("blocked".into()), Some("lead".into()))
+        );
+    }
+
+    #[test]
     fn iteration_abandonment_and_trim_newest_first() {
         let mut surface = empty_surface();
         start_iteration(&mut surface, "abandoned".into(), "start".into());
@@ -1397,6 +1497,7 @@ mod tests {
                     reconsolidated: false,
                     headline: None,
                     summary: None,
+                    ..Default::default()
                 },
             );
         }
@@ -1427,6 +1528,7 @@ mod tests {
             activity: Vec::new(),
             active_iteration: None,
             iterations: Vec::new(),
+            ..Default::default()
         };
         assert!(atomic_write(&link, &surface).is_err());
         let _ = fs::remove_dir_all(&root);

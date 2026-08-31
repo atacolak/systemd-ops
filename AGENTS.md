@@ -21,7 +21,10 @@ survives review.
 | `src/mcp.rs`            | protocol, tool registry, MCP scope gating                |
 | `src/operations.rs`     | OperationSpec, OperationView, authoring plans            |
 | `src/scope.rs`          | scope resolution, `.systemd-ops/scope.toml`, ScopeView, health |
+| `src/automation.rs`     | observation, processed input, checkpoint v2, derived semantic state |
 | `src/tui.rs`            | read-only ratatui cockpit over ScopeView                |
+| `src/operator.rs`       | advisory operator.json and bound automation commands     |
+
 | `src/sha256.rs`         | spec/file digest and HMAC-SHA256                         |
 | `src/token.rs`          | sealed plan tokens                                       |
 | `src/config.rs`         | local config, write-prefix, HMAC key                     |
@@ -34,19 +37,24 @@ survives review.
 
 Scope paths have three distinct roles. The scope root contains the
 preferred `.systemd-ops/scope.toml` manifest; `.systemd-ops.toml` is
-legacy compatibility and same-root coexistence is an error. An operation
-home is `<scope-root>/.systemd-ops/<stem>/`. Execution cwd belongs to the
-systemd operation and is independent. Operation homes hold advisory state;
-unit files and systemd runtime remain operational truth.
+legacy compatibility and same-root coexistence is an error. The preferred
+operation home is `<scope-root>/.systemd-ops/operations/<stem>/`; legacy
+`<scope-root>/.systemd-ops/<stem>/` remains readable and same-stem
+coexistence is an error. Execution cwd belongs to the systemd operation
+and is independent. Operation homes hold advisory and structured
+observation state; unit files and systemd runtime remain operational
+truth. Semantic state is derived on ScopeView construction and is never
+persisted as a file.
 
 For direct CLI scope, operator, and TUI resolution, explicit
 `--scope-root` beats `SYSTEMD_OPS_SCOPE_ROOT`, which beats upward discovery
 from `--cwd` or the process cwd. Author and control provenance continue to
 use `--cwd`. Operator state is canonical at
-`.systemd-ops/<stem>/state/operator.json`. The legacy
+`.systemd-ops/operations/<stem>/state/operator.json`. The legacy
 `.systemd-ops/operator/<stem>.json` is read only when canonical state is
 absent and migrates on the next successful write, which may remove it. If
 both exist, canonical wins with a warning and contents are not merged.
+
 
 The OMP adapter prefers session `ctx.cwd` over factory cwd, passes the
 resolved directory as both `systemd-ops --cwd` and child process cwd, and

@@ -17,7 +17,8 @@ async runtime.
    with a sealed `plan_token`. Apply is refused if the token is stale,
    expired, tampered, the wrong class (control vs author), or bound to
    the other manager. Operator commentary and iteration history under
-   `.systemd-ops/<stem>/state/operator.json` are advisory soft state:
+   `.systemd-ops/operations/<stem>/state/operator.json` are advisory soft state:
+
    they are written directly by `systemd-ops operator ...` and never
    touch unit files or affect objective health.
 3. **The MCP frontend grants nothing by default.** `systemd-ops-mcp`
@@ -127,22 +128,29 @@ For scope, operator, and TUI commands, scope resolution uses
 `--scope-root` first, then `SYSTEMD_OPS_SCOPE_ROOT`, then upward discovery
 from `--cwd` or the process working directory. Author and control
 provenance continue to use `--cwd`. The scope root identifies the
-responsibility scope. Each owned operation has an operation home at
-`.systemd-ops/<stem>/` under that root. The execution cwd is the directory
-recorded in and used by the systemd unit. These are separate concepts.
-Operation homes hold advisory project state; they do not replace the
-`.service` and `.timer` files or systemd's runtime state as operational
-truth.
+responsibility scope. Each owned operation has a preferred operation home at
+`.systemd-ops/operations/<stem>/` under that root. Legacy
+`.systemd-ops/<stem>/` remains readable; same-stem coexistence is an error.
+The execution cwd is the directory recorded in and used by the systemd unit.
+These are separate concepts. Operation homes hold advisory project state and
+structured observation; they do not replace the `.service` and `.timer`
+files or systemd's runtime state as operational truth.
 
-Agent-backed operations may add `.systemd-ops/<stem>/automation.toml` with
-`version`, `agent`, optional same-scope `parent`, and explicit `brain_paths`.
-The brain revision hashes canonical metadata, the exact resolved agent file,
-and only those listed paths. Systemd remains canonical for execution, cwd,
-schedule, restart, and enablement. `automation plan-create`, `plan-update`,
-`plan-retire`, and `plan-complete` compose the existing sealed author path;
-`automation complete` is the trusted immediate completion seam. Completed
-operations keep their definition, operation home, history, fingerprint, TUI
-row, and relations while future timer activation is stopped and disabled.
+Agent-backed operations may add
+`.systemd-ops/operations/<stem>/automation.toml` with `version`, `agent`,
+optional same-scope `parent`, explicit `brain_paths`, optional
+`[observation]`, and `output_revision_required`. The brain revision hashes
+canonical metadata, the exact resolved agent file, and only those listed
+paths. `automation observe` writes `state/observation.json`;
+`automation process` writes `state/processed.json`; new checkpoints are
+version 2 and bind that input. Semantic state is derived, never persisted.
+Systemd remains canonical for execution, cwd, schedule, restart, and
+enablement. `automation plan-create`, `plan-update`, `plan-retire`, and
+`plan-complete` compose the existing sealed author path; `automation complete`
+is the trusted immediate completion seam. Completed operations keep their
+definition, operation home, history, structured state, TUI row, and
+relations while future timer activation is stopped and disabled.
+
 
 The OMP adapter exposes `automation_agent_author` and `automation_author` as
 hidden explicit-only builder tools. Ordinary runtime agents should receive only
@@ -152,8 +160,9 @@ hidden explicit-only builder tools. Ordinary runtime agents should receive only
 ScopeView. Agents are the first-class author/control/operator interface;
 the TUI is a read-only operator cockpit. The AUTOMATIONS panel omits a
 redundant OWNED heading for owned-only scopes and shows relationship headings
-when watching entries exist. Cockpit detail renders the description, NOW,
+when watching entries exist. Cockpit detail renders the description,
 AGENT BRIEF, RECENT ITERATIONS, NOTABLE ACTIVITY, then objective RUNTIME. `d`
+
 toggles wiring detail. `l` independently attaches a lazy raw-journal drawer
 below the selected detail. Opening the TUI or moving selection while that drawer
 is closed does not fetch journald. `j`/`k` or the arrow keys select an
@@ -183,10 +192,11 @@ systemd-ops --json --scope-root ~/worlds/personal operator iteration-finish \
 
 Only stems matching the resolved scope's `owned` globs may be written.
 The canonical state file is
-`.systemd-ops/<stem>/state/operator.json`. Existing
+`.systemd-ops/operations/<stem>/state/operator.json`. Existing
 `.systemd-ops/operator/<stem>.json` files remain readable when canonical
 state is absent. The next successful operator write uses the canonical
 path and may remove the legacy file. If both files exist, the canonical
+
 file wins with a warning and their contents are not merged. Deleting
 operator state has no effect on systemd operations.
 

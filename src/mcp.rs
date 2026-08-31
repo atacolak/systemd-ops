@@ -113,6 +113,7 @@ fn spec_schema() -> Value {
                     "type": { "type": "string", "enum": ["interval", "calendar"] },
                     "on_boot_sec": { "type": "string" },
                     "on_unit_active_sec": { "type": "string" },
+                    "on_unit_inactive_sec": { "type": "string" },
                     "on_calendar": { "type": "string" },
                     "persistent": { "type": "boolean" },
                     "accuracy_sec": { "type": "string" }

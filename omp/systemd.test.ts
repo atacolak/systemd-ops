@@ -214,11 +214,30 @@ test("bound automation argv never accepts a unit", () => {
 		"automation",
 		"context",
 	]);
+	expect(automationArgv("observe", { unit: "managed-other" })).toEqual([
+		"automation",
+		"observe",
+	]);
+	expect(
+		automationArgv("process", {
+			unit: "managed-other",
+			input_fingerprint: "abc",
+			outcome: "ready",
+		}),
+	).toEqual([
+		"automation",
+		"process",
+		"--input-fingerprint",
+		"abc",
+		"--outcome",
+		"ready",
+	]);
 	expect(
 		automationArgv("report", {
 			unit: "managed-other",
 			headline: "waiting for review",
 			summary: ["all actionable feedback is addressed"],
+			outcome: "ready",
 		}),
 	).toEqual([
 		"automation",
@@ -227,6 +246,8 @@ test("bound automation argv never accepts a unit", () => {
 		"waiting for review",
 		"--summary",
 		'["all actionable feedback is addressed"]',
+		"--outcome",
+		"ready",
 	]);
 	expect(automationArgv("activity", { unit: "managed-other", text: "requested review" })).toEqual([
 		"automation",
@@ -235,6 +256,7 @@ test("bound automation argv never accepts a unit", () => {
 		"requested review",
 	]);
 });
+
 
 test("autonomous tools are strict bound surfaces", () => {
 	const tools = systemdTools({ cwd: "/worktrees/pr-123" });

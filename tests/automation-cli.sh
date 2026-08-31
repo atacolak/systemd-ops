@@ -35,6 +35,8 @@ cat >"$unit_dir/$STEM.service" <<'EOF'
 [Service]
 ExecStart=/bin/true
 EOF
+
+
 export XDG_CONFIG_HOME=$xdg
 missing=$(env -u SYSTEMD_OPS_OPERATION "$BIN" --json --manager user --scope-root "$SCOPE" automation context || true)
 rejected "$missing"
@@ -44,7 +46,7 @@ outside=$(SYSTEMD_OPS_OPERATION=managed-external-watch json automation context |
 rejected "$outside"
 jq -e '.error.message | contains("restricted to owned stems")' <<<"$outside" >/dev/null || fail "watched binding error: $outside"
 
-cross=$(json automation report --unit managed-proof-other --headline nope --summary '["nope"]' || true)
+cross=$(json automation report --unit managed-proof-other --headline nope --summary '["nope"]' --outcome ready || true)
 rejected "$cross"
 jq -e '.error.message | contains("unknown argument")' <<<"$cross" >/dev/null || fail "cross-operation argument accepted: $cross"
 
@@ -52,35 +54,43 @@ start=$(json operator iteration-start --unit "$STEM")
 ok "$start"
 iteration=$(jq -er '.data.iteration_id' <<<"$start")
 
-out=$(json automation report --headline '' --summary '["one"]' || true)
+out=$(json automation report --headline '' --summary '["one"]' --outcome ready || true)
 rejected "$out"
-out=$(json automation report --headline $'one\nline' --summary '["one"]' || true)
+out=$(json automation report --headline $'one\nline' --summary '["one"]' --outcome ready || true)
 rejected "$out"
 
 long_headline=$(printf 'x%.0s' {1..81})
-out=$(json automation report --headline "$long_headline" --summary '["one"]' || true)
+out=$(json automation report --headline "$long_headline" --summary '["one"]' --outcome ready || true)
 rejected "$out"
-out=$(json automation report --headline valid --summary '[]' || true)
+out=$(json automation report --headline valid --summary '[]' --outcome ready || true)
 rejected "$out"
-out=$(json automation report --headline valid --summary '[" "]' || true)
+out=$(json automation report --headline valid --summary '[" "]' --outcome ready || true)
 rejected "$out"
-out=$(json automation report --headline valid --summary $'["one\ntwo"]' || true)
+out=$(json automation report --headline valid --summary $'["one\ntwo"]' --outcome ready || true)
 rejected "$out"
-out=$(json automation report --headline valid --summary '["1","2","3","4","5","6"]' || true)
+out=$(json automation report --headline valid --summary '["1","2","3","4","5","6"]' --outcome ready || true)
 rejected "$out"
 long_summary=$(printf 'x%.0s' {1..281})
-out=$(json automation report --headline valid --summary "[\"$long_summary\"]" || true)
+out=$(json automation report --headline valid --summary "[\"$long_summary\"]" --outcome ready || true)
+rejected "$out"
+out=$(json automation report --headline valid --summary '["one"]' || true)
+rejected "$out"
+out=$(json automation report --headline valid --summary '["one"]' --outcome ready --route self || true)
+rejected "$out"
+out=$(json automation report --headline valid --summary '["one"]' --outcome blocked || true)
 rejected "$out"
 long_activity=$(printf 'x%.0s' {1..201})
 out=$(json automation activity --text "$long_activity" || true)
 rejected "$out"
 
-report=$(json automation report --headline "proof is current" --summary '["first paragraph","second paragraph"]')
+report=$(json automation report --headline "proof is current" --summary '["first paragraph","second paragraph"]' --outcome ready)
 ok "$report"
 jq -e '
   .data.reported == true and
   .data.operator.headline == "proof is current" and
   .data.operator.body == "first paragraph\n\nsecond paragraph" and
+  .data.operator.outcome == "ready" and
+  .data.operator.route == null and
   (.data.operator.updated_at | type == "string") and
   (.data.operator.active_iteration.reported_at | type == "string") and
   (.data.operator.basis_revision | startswith("sha256:")) and
@@ -96,7 +106,9 @@ ok "$finish"
 jq -e '
   .data.reconsolidated == true and
   .data.operator.iterations[0].headline == "proof is current" and
-  .data.operator.iterations[0].summary == "first paragraph\n\nsecond paragraph"
+  .data.operator.iterations[0].summary == "first paragraph\n\nsecond paragraph" and
+  .data.operator.iterations[0].outcome == "ready" and
+  .data.operator.iterations[0].route == null
 ' <<<"$finish" >/dev/null || fail "report did not reconsolidate: $finish"
 
 start=$(json operator iteration-start --unit "$STEM")
@@ -109,4 +121,16 @@ finish=$(json operator iteration-finish --unit "$STEM" --iteration "$iteration" 
 ok "$finish"
 jq -e '.data.reconsolidated == false' <<<"$finish" >/dev/null || fail "activity alone reconsolidated: $finish"
 
+mkdir -p "$SCOPE/.systemd-ops/operations/$STEM/state"
+input=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+process=$(json automation process --input-fingerprint "$input" --outcome ready)
+ok "$process"
+jq -e --arg input "$input" '.data.processed.input_fingerprint==$input and .data.processed.outcome=="ready"' \
+  <<<"$process" >/dev/null || fail "process state mismatch: $process"
+jq -e --arg input "$input" '.input_fingerprint==$input and .outcome=="ready" and .version==1' \
+  "$SCOPE/.systemd-ops/operations/$STEM/state/processed.json" >/dev/null \
+  || fail "process did not write preferred processed.json"
+
 echo "automation-cli ok"
+
+

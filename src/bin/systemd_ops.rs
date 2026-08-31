@@ -60,7 +60,9 @@ Commands:
   operator iteration-finish --unit STEM --iteration ID --exit-code N
 
   automation context
-  automation report --headline TEXT --summary JSON_ARRAY
+  automation observe
+  automation process --input-fingerprint HASH --outcome ready|blocked
+  automation report --headline TEXT --summary JSON_ARRAY [--outcome ready|blocked] [--route self|parent|lead]
   automation activity --text TEXT
   automation revision --unit STEM
   automation inspect-plan --plan-token TOKEN
@@ -68,9 +70,10 @@ Commands:
   automation list-requests
   automation inspect-request --id ID
   automation resolve-request --id ID --resolution TEXT
-  automation checkpoint --fingerprint HASH [--generation VALUE] [--output-revision VALUE]
-  automation blocker --kind KIND --summary TEXT [--iteration ID] [--code N]
+  automation checkpoint --input-fingerprint HASH [--generation VALUE] [--output-revision VALUE]
+  automation blocker --kind KIND --summary TEXT [--route self|parent|lead] [--input-fingerprint HASH] [--iteration ID] [--code N]
   automation clear-blocker
+
   automation notify-parent [--event checkpoint|blocked|completed]
 
   automation inspect --unit STEM
@@ -629,6 +632,18 @@ fn run_automation(
             remaining_flags(args).map_err(BackendError)?;
             operator::automation_context(scope_root, cwd)
         }
+        "observe" => {
+            remaining_flags(args).map_err(BackendError)?;
+            automation::run_observer(scope_root, cwd)
+        }
+        "process" => {
+            let input_fingerprint =
+                require_opt(args, "--input-fingerprint").map_err(BackendError)?;
+            let outcome = require_opt(args, "--outcome").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            automation::write_processed(scope_root, cwd, &input_fingerprint, &outcome)
+        }
+
         "report" => {
             let headline = require_opt(args, "--headline").map_err(BackendError)?;
             let summary = json_arg(args, "--summary")
@@ -644,8 +659,17 @@ fn run_automation(
                         .ok_or_else(|| BackendError("--summary items must be strings".into()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let outcome = take_opt(args, "--outcome").map_err(BackendError)?;
+            let route = take_opt(args, "--route").map_err(BackendError)?;
             remaining_flags(args).map_err(BackendError)?;
-            operator::automation_report(scope_root, cwd, &headline, &summary)
+            operator::automation_report(
+                scope_root,
+                cwd,
+                &headline,
+                &summary,
+                outcome.as_deref(),
+                route.as_deref(),
+            )
         }
         "activity" => {
             let text = require_opt(args, "--text").map_err(BackendError)?;
@@ -743,21 +767,26 @@ fn run_automation(
             automation::resolve_request(&id, &resolution, scope_root, cwd)
         }
         "checkpoint" => {
-            let fingerprint = require_opt(args, "--fingerprint").map_err(BackendError)?;
+            let input_fingerprint = require_opt(args, "--input-fingerprint")
+                .or_else(|_| require_opt(args, "--fingerprint"))
+                .map_err(BackendError)?;
             let generation = take_opt(args, "--generation").map_err(BackendError)?;
             let output_revision = take_opt(args, "--output-revision").map_err(BackendError)?;
             remaining_flags(args).map_err(BackendError)?;
             automation::write_checkpoint(
                 scope_root,
                 cwd,
-                &fingerprint,
+                &input_fingerprint,
                 generation.as_deref(),
                 output_revision.as_deref(),
             )
         }
+
         "blocker" => {
             let kind = require_opt(args, "--kind").map_err(BackendError)?;
             let summary = require_opt(args, "--summary").map_err(BackendError)?;
+            let route = take_opt(args, "--route").map_err(BackendError)?;
+            let input_fingerprint = take_opt(args, "--input-fingerprint").map_err(BackendError)?;
             let iteration = take_opt(args, "--iteration").map_err(BackendError)?;
             let code = take_opt(args, "--code").map_err(BackendError)?;
             remaining_flags(args).map_err(BackendError)?;
@@ -767,7 +796,16 @@ fn run_automation(
                 })?),
                 None => None,
             };
-            automation::write_blocker(scope_root, cwd, &kind, iteration.as_deref(), code, &summary)
+            automation::write_blocker(
+                scope_root,
+                cwd,
+                &kind,
+                route.as_deref(),
+                input_fingerprint.as_deref(),
+                iteration.as_deref(),
+                code,
+                &summary,
+            )
         }
         "clear-blocker" => {
             remaining_flags(args).map_err(BackendError)?;

@@ -128,8 +128,10 @@ Each term names a different directory:
 | Term | Meaning |
 |---|---|
 | scope root | project directory that contains the responsibility manifest |
-| operation home | `<scope-root>/.systemd-ops/<operation-stem>/`, for advisory state associated with one owned operation |
+| operation home | preferred `<scope-root>/.systemd-ops/operations/<operation-stem>/`; legacy `<scope-root>/.systemd-ops/<stem>/` remains readable |
 | execution cwd | directory configured in the operation's systemd definition and used when its command runs |
+
+Preferred and legacy homes must not both exist for the same stem. New operator and structured state writes use the preferred home. Duplicate homes fail clearly.
 
 An operation home is project-local storage, not an OperationSpec database.
 It does not replace the unit files, systemd enablement, or runtime state.
@@ -144,7 +146,12 @@ operation home:
 version = 1
 agent = "pr-maintainer"
 parent = "managed-omp-capability"
-brain_paths = [".systemd-ops/pr-driver"]
+brain_paths = [".systemd-ops/drivers/pr-observe", ".systemd-ops/drivers/pr-run"]
+output_revision_required = true
+
+[observation]
+exec = "drivers/pr-observe"
+args = ["9363"]
 ```
 
 `parent` is a producer-consumer relation, not ownership transfer, readiness,
@@ -157,11 +164,25 @@ definition bytes, and only the listed `brain_paths`. It does not hash directory
 listings. Deterministic operations have no automation metadata or brain
 revision.
 
+Observation is generic. `[observation].exec` is relative to
+`<scope-root>/.systemd-ops/` and must be a regular non-symlink file.
+`automation observe` runs that executable, validates observer payload
+version 1, and writes `state/observation.json` with the exact effective
+input `sha256("world=<world>\nbrain=<brain>\n")`. Semantic state is derived
+on ScopeView construction and is never persisted as a file:
+`neutral | running | blocked | waiting | ready | stale`. Execution health
+remains independent. READY requires a current structured checkpoint matching
+the current observation, including generation when present and output
+revision when `output_revision_required` is true. WAITING is derived from any
+active declared child that is not semantically READY. Zero children are
+vacuously satisfied.
+
 Completed lifecycle state is stored at
 `<operation-home>/state/lifecycle.json`. Completion preserves the definition,
-operation home, operator history, fingerprint, relations, and TUI row, but
+operation home, operator history, structured state, relations, and TUI row, but
 stops and disables future timer activation. Retirement removes the managed
 definition. These are deliberately different operations.
+
 
 For systemd-ops-managed operations, OperationView includes
 `editable_spec`: a reconstruction of every durable supported authoring
@@ -210,6 +231,7 @@ ScopeView
 
 ```
   definition_revision   sha256 over ordered definition fragment files, or null
+  semantic_state        derived ready|stale|waiting|blocked|running|neutral
   operator              advisory OperatorSurface v1, or null
     version, about, headline, body, updated_at, basis_revision
     activity[{at,text}]
@@ -220,6 +242,10 @@ ScopeView
   operator_state        missing|unbased|current|outdated|error
                         (null on watching entries)
 ```
+
+Semantic state is derived on ScopeView construction and is never persisted.
+It is independent of systemd health. Deterministic units stay `neutral`.
+
 
 Activity, active and finished iterations, and operator brief fields are
 advisory. They never affect operation or scope health. Runtime is
@@ -253,7 +279,8 @@ Modes and drawers:
 
 | key | surface | content |
 |---|---|---|
-| (default) | COCKPIT | description, NOW, AGENT BRIEF, RECENT ITERATIONS, NOTABLE ACTIVITY, objective RUNTIME |
+| (default) | COCKPIT | description, AGENT BRIEF, RECENT ITERATIONS, NOTABLE ACTIVITY, objective RUNTIME |
+
 | `d` | WIRING detail | identity, responsibility, execution, activation |
 | `l` | DIAGNOSTICS drawer | raw journal for the selected service, loaded lazily below the current detail |
 
@@ -274,15 +301,22 @@ exit code. A finished session without reconsolidated brief state says
 `exited before reconsolidating a brief`; an interrupted one says
 `interrupted before producing a final brief`.
 
+The automations list sorts by hierarchy, not health. Semantic marks are
+`●` ready, `▶` running, `⏳` waiting, `◌` stale, `■` blocked, `○` neutral.
+A failed systemd health is an independent red `✖` beside the semantic mark.
+Wiring detail exposes `semantic` as its own field.
+
 Header: `SCOPE_ID   HEALTH` then `N owned · M watching · K attention`.
+
 
 ## Operator soft state
 
 The canonical file for each owned stem is:
 
 ```
-<scope-root>/.systemd-ops/<stem>/state/operator.json
+<scope-root>/.systemd-ops/operations/<stem>/state/operator.json
 ```
+
 
 The legacy `<scope-root>/.systemd-ops/operator/<stem>.json` path is read
 only when the canonical file is absent. The next successful operator write

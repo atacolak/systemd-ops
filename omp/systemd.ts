@@ -476,8 +476,21 @@ export function automationArgv(action: string, args: Json): string[] {
 	switch (action) {
 		case "context":
 			return ["automation", "context"];
-		case "report":
-			return [
+		case "observe":
+			return ["automation", "observe"];
+		case "process": {
+			const argv = [
+				"automation",
+				"process",
+				"--input-fingerprint",
+				String(args.input_fingerprint ?? args.fingerprint ?? ""),
+				"--outcome",
+				String(args.outcome ?? ""),
+			];
+			return argv;
+		}
+		case "report": {
+			const argv = [
 				"automation",
 				"report",
 				"--headline",
@@ -485,12 +498,22 @@ export function automationArgv(action: string, args: Json): string[] {
 				"--summary",
 				JSON.stringify(args.summary ?? []),
 			];
+			if (typeof args.outcome === "string" && args.outcome.length > 0) {
+				argv.push("--outcome", args.outcome);
+			}
+			if (typeof args.route === "string" && args.route.length > 0) {
+				argv.push("--route", args.route);
+			}
+
+			return argv;
+		}
 		case "activity":
 			return ["automation", "activity", "--text", String(args.text ?? "")];
 		default:
 			throw new Error(`unknown automation action '${action}'`);
 	}
 }
+
 
 export function opsCliArgv(argv: string[], cwd?: string): string[] {
 	return ["--json", "--manager", "user", ...(cwd ? ["--cwd", cwd] : []), ...argv];
@@ -984,7 +1007,9 @@ export default function systemdTools(pi: { cwd?: string }) {
 			description:
 				"Responsible autonomous-operation read surface. Return focused context for the operation bound by " +
 				"SYSTEMD_OPS_SCOPE_ROOT and SYSTEMD_OPS_OPERATION: canonical identity, objective runtime, current " +
-				"human report, active iteration, latest 20 iterations, and notable activity. No parameters. No raw journal.",
+				"human report, observation, processed input, structured checkpoint, derived semantic state, " +
+				"active iteration, latest 20 iterations, and notable activity. No parameters. No raw journal.",
+
 			parameters: { type: "object", additionalProperties: false, properties: {} },
 			async execute(_id: string, _params: Json, _onUpdate?: unknown, ctx?: SessionLike) {
 				try {
@@ -1009,7 +1034,7 @@ export default function systemdTools(pi: { cwd?: string }) {
 			parameters: {
 				type: "object",
 				additionalProperties: false,
-				required: ["headline", "summary"],
+				required: ["headline", "summary", "outcome"],
 				properties: {
 					headline: { type: "string", minLength: 1, maxLength: 80, pattern: "^[^\\r\\n]+$" },
 					summary: {
@@ -1018,6 +1043,8 @@ export default function systemdTools(pi: { cwd?: string }) {
 						maxItems: 5,
 						items: { type: "string", minLength: 1, maxLength: 280, pattern: "^[^\\r\\n]+$" },
 					},
+					outcome: { type: "string", enum: ["ready", "blocked"] },
+					route: { type: "string", enum: ["self", "parent", "lead"] },
 				},
 			},
 			async execute(_id: string, params: Json, _onUpdate?: unknown, ctx?: SessionLike) {

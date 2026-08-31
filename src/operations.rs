@@ -75,7 +75,8 @@ impl Kind {
 pub enum Schedule {
     Interval {
         on_boot_sec: String,
-        on_unit_active_sec: String,
+        on_unit_active_sec: Option<String>,
+        on_unit_inactive_sec: Option<String>,
         persistent: bool,
         accuracy_sec: Option<String>,
     },
@@ -196,6 +197,7 @@ struct FileMeta {
     on_calendar: Option<String>,
     on_boot_sec: Option<String>,
     on_unit_active_sec: Option<String>,
+    on_unit_inactive_sec: Option<String>,
     persistent: Option<bool>,
     accuracy_sec: Option<String>,
     env: BTreeMap<String, String>,
@@ -516,15 +518,24 @@ fn parse_schedule(v: Option<&Value>, kind: Kind) -> Result<Option<Schedule>, Bac
                 .get("on_boot_sec")
                 .and_then(Value::as_str)
                 .ok_or_else(|| BackendError("schedule.on_boot_sec is required".into()))?;
-            let on_unit_active_sec = obj
-                .get("on_unit_active_sec")
-                .and_then(Value::as_str)
-                .ok_or_else(|| BackendError("schedule.on_unit_active_sec is required".into()))?;
+            let on_unit_active_sec = obj.get("on_unit_active_sec").and_then(Value::as_str);
+            let on_unit_inactive_sec = obj.get("on_unit_inactive_sec").and_then(Value::as_str);
+            if on_unit_active_sec.is_none() && on_unit_inactive_sec.is_none() {
+                return Err(BackendError(
+                    "schedule interval requires on_unit_active_sec or on_unit_inactive_sec".into(),
+                ));
+            }
             validate_time_word("schedule.on_boot_sec", on_boot_sec)?;
-            validate_time_word("schedule.on_unit_active_sec", on_unit_active_sec)?;
+            if let Some(value) = on_unit_active_sec {
+                validate_time_word("schedule.on_unit_active_sec", value)?;
+            }
+            if let Some(value) = on_unit_inactive_sec {
+                validate_time_word("schedule.on_unit_inactive_sec", value)?;
+            }
             Ok(Some(Schedule::Interval {
                 on_boot_sec: on_boot_sec.to_string(),
-                on_unit_active_sec: on_unit_active_sec.to_string(),
+                on_unit_active_sec: on_unit_active_sec.map(str::to_string),
+                on_unit_inactive_sec: on_unit_inactive_sec.map(str::to_string),
                 persistent,
                 accuracy_sec,
             }))
@@ -748,12 +759,14 @@ fn canonical_spec_json(spec: &NormalizedSpec) -> Value {
         Some(Schedule::Interval {
             on_boot_sec,
             on_unit_active_sec,
+            on_unit_inactive_sec,
             persistent,
             accuracy_sec,
         }) => json!({
             "type": "interval",
             "on_boot_sec": on_boot_sec,
             "on_unit_active_sec": on_unit_active_sec,
+            "on_unit_inactive_sec": on_unit_inactive_sec,
             "persistent": persistent,
             "accuracy_sec": accuracy_sec,
         }),
@@ -883,11 +896,17 @@ fn render_timer(spec: &NormalizedSpec) -> Option<String> {
         Schedule::Interval {
             on_boot_sec,
             on_unit_active_sec,
+            on_unit_inactive_sec,
             persistent,
             accuracy_sec,
         } => {
             body.push_str(&format!("OnBootSec={on_boot_sec}\n"));
-            body.push_str(&format!("OnUnitActiveSec={on_unit_active_sec}\n"));
+            if let Some(active) = on_unit_active_sec {
+                body.push_str(&format!("OnUnitActiveSec={active}\n"));
+            }
+            if let Some(inactive) = on_unit_inactive_sec {
+                body.push_str(&format!("OnUnitInactiveSec={inactive}\n"));
+            }
             body.push_str(&format!("Persistent={}\n", bool_word(*persistent)));
             if let Some(a) = accuracy_sec {
                 body.push_str(&format!("AccuracySec={a}\n"));
@@ -977,6 +996,8 @@ fn parse_meta(text: &str) -> FileMeta {
             meta.on_boot_sec = Some(rest.trim().to_string());
         } else if let Some(rest) = t.strip_prefix("OnUnitActiveSec=") {
             meta.on_unit_active_sec = Some(rest.trim().to_string());
+        } else if let Some(rest) = t.strip_prefix("OnUnitInactiveSec=") {
+            meta.on_unit_inactive_sec = Some(rest.trim().to_string());
         } else if let Some(rest) = t.strip_prefix("AccuracySec=") {
             meta.accuracy_sec = Some(rest.trim().to_string());
         } else if t.eq_ignore_ascii_case("Persistent=true")
@@ -1383,11 +1404,13 @@ fn schedule_view(timer_meta: Option<&FileMeta>) -> Value {
             "accuracy_sec": m.accuracy_sec,
         });
     }
-    if m.on_boot_sec.is_some() || m.on_unit_active_sec.is_some() {
+    if m.on_boot_sec.is_some() || m.on_unit_active_sec.is_some() || m.on_unit_inactive_sec.is_some()
+    {
         return json!({
             "type": "interval",
             "on_boot_sec": m.on_boot_sec,
             "on_unit_active_sec": m.on_unit_active_sec,
+            "on_unit_inactive_sec": m.on_unit_inactive_sec,
             "persistent": m.persistent,
             "accuracy_sec": m.accuracy_sec,
         });
@@ -2291,6 +2314,7 @@ mod tests {
             Some(Schedule::Interval {
                 on_boot_sec,
                 on_unit_active_sec,
+                on_unit_inactive_sec,
                 ..
             }) => {
                 assert_eq!(got["schedule"]["type"], json!("interval"));
@@ -2298,6 +2322,10 @@ mod tests {
                 assert_eq!(
                     got["schedule"]["on_unit_active_sec"],
                     json!(on_unit_active_sec)
+                );
+                assert_eq!(
+                    got["schedule"]["on_unit_inactive_sec"],
+                    json!(on_unit_inactive_sec)
                 );
             }
             None => assert!(got["schedule"].is_null()),

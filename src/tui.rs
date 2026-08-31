@@ -108,7 +108,9 @@ struct Row {
     unit: String,
     title: String,
     health: String,
+    semantic_state: String,
     relationship: &'static str,
+
     critical: bool,
     next: String,
     kind: String,
@@ -151,6 +153,7 @@ struct Row {
     blocker: String,
     depth: usize,
     last_child: bool,
+    tree_prefix: String,
 }
 
 pub(crate) fn logs_unit(stem: &str) -> String {
@@ -197,10 +200,7 @@ fn hierarchy_rows(rows: Vec<Row>) -> Vec<Row> {
     let order = |left: &String, right: &String, values: &BTreeMap<String, Row>| {
         let a = values.get(left).expect("hierarchy unit");
         let b = values.get(right).expect("hierarchy unit");
-        health_rank(&a.health)
-            .cmp(&health_rank(&b.health))
-            .then_with(|| a.title.cmp(&b.title))
-            .then_with(|| a.unit.cmp(&b.unit))
+        a.title.cmp(&b.title).then_with(|| a.unit.cmp(&b.unit))
     };
     roots.sort_by(|a, b| order(a, b, &by_unit));
     for siblings in children.values_mut() {
@@ -210,6 +210,7 @@ fn hierarchy_rows(rows: Vec<Row>) -> Vec<Row> {
     fn visit(
         unit: &str,
         depth: usize,
+        prefix: String,
         last_child: bool,
         by_unit: &mut BTreeMap<String, Row>,
         children: &BTreeMap<String, Vec<String>>,
@@ -220,11 +221,27 @@ fn hierarchy_rows(rows: Vec<Row>) -> Vec<Row> {
         };
         row.depth = depth;
         row.last_child = last_child;
+        row.tree_prefix = prefix.clone();
         output.push(row);
         if let Some(siblings) = children.get(unit) {
             let last = siblings.len().saturating_sub(1);
             for (index, child) in siblings.iter().enumerate() {
-                visit(child, depth + 1, index == last, by_unit, children, output);
+                let child_last = index == last;
+                let child_prefix = if depth == 0 {
+                    String::new()
+                } else {
+                    format!("{}{}", prefix, if last_child { "  " } else { "│ " })
+                };
+
+                visit(
+                    child,
+                    depth + 1,
+                    child_prefix,
+                    child_last,
+                    by_unit,
+                    children,
+                    output,
+                );
             }
         }
     }
@@ -235,6 +252,7 @@ fn hierarchy_rows(rows: Vec<Row>) -> Vec<Row> {
         visit(
             root,
             0,
+            String::new(),
             index == last_root,
             &mut by_unit,
             &children,
@@ -244,16 +262,10 @@ fn hierarchy_rows(rows: Vec<Row>) -> Vec<Row> {
     for (_, mut row) in by_unit {
         row.depth = 0;
         row.last_child = true;
+        row.tree_prefix = String::new();
         output.push(row);
     }
     output
-}
-fn health_rank(health: &str) -> u8 {
-    match health {
-        "failed" => 0,
-        "unknown" => 1,
-        _ => 2,
-    }
 }
 
 impl App {
@@ -308,7 +320,8 @@ impl App {
                 }
             }
         }
-        watching.sort_by_key(|r| health_rank(&r.health));
+        watching.sort_by(|a, b| a.title.cmp(&b.title).then_with(|| a.unit.cmp(&b.unit)));
+
         self.rows = sectioned_rows(owned, watching);
         if let Some(unit) = keep {
             if let Some(i) = self.rows.iter().position(|r| match r {
@@ -679,10 +692,20 @@ fn row_from_view(v: &Value, relationship: &'static str) -> Option<Row> {
         .to_string();
     let processed = automation
         .and_then(|value| value.get("processed"))
-        .and_then(|value| value.get("fingerprint"))
+        .and_then(|value| {
+            value
+                .get("input_fingerprint")
+                .or_else(|| value.get("fingerprint"))
+        })
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let semantic_state = automation
+        .and_then(|value| value.get("semantic_state"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
     let checkpoint = automation.and_then(|value| value.get("checkpoint"));
     let checkpoint_generation = checkpoint
         .and_then(|value| value.get("generation"))
@@ -714,7 +737,9 @@ fn row_from_view(v: &Value, relationship: &'static str) -> Option<Row> {
         unit,
         title,
         health: json_str(v, "health"),
+        semantic_state,
         relationship,
+
         critical: v.get("critical").and_then(Value::as_bool).unwrap_or(false),
         next,
         kind: json_str(v, "kind"),
@@ -757,6 +782,7 @@ fn row_from_view(v: &Value, relationship: &'static str) -> Option<Row> {
         blocker,
         depth: 0,
         last_child: false,
+        tree_prefix: String::new(),
     })
 }
 
@@ -785,11 +811,25 @@ fn schedule_text(value: &Value) -> Option<String> {
                 .get("on_unit_active_sec")
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty());
-            match (boot, active) {
-                (Some(boot), Some(active)) => Some(format!("boot {boot} · every {active}")),
-                (Some(boot), None) => Some(format!("boot {boot}")),
-                (None, Some(active)) => Some(format!("every {active}")),
-                (None, None) => None,
+            let inactive = obj
+                .get("on_unit_inactive_sec")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            match (boot, active, inactive) {
+                (Some(boot), Some(active), Some(inactive)) => {
+                    Some(format!("boot {boot} · every {active} · idle {inactive}"))
+                }
+                (Some(boot), Some(active), None) => Some(format!("boot {boot} · every {active}")),
+                (Some(boot), None, Some(inactive)) => {
+                    Some(format!("boot {boot} · idle {inactive}"))
+                }
+                (None, Some(active), Some(inactive)) => {
+                    Some(format!("every {active} · idle {inactive}"))
+                }
+                (Some(boot), None, None) => Some(format!("boot {boot}")),
+                (None, Some(active), None) => Some(format!("every {active}")),
+                (None, None, Some(inactive)) => Some(format!("idle {inactive}")),
+                (None, None, None) => None,
             }
         }
         _ => None,
@@ -872,17 +912,39 @@ fn health_style(health: &str) -> Style {
     }
 }
 
-fn mark(health: &str, lifecycle: &str) -> &'static str {
+fn semantic_style(semantic: &str, health: &str) -> Style {
+    match semantic {
+        "ready" => Style::default().fg(GREEN),
+        "blocked" => Style::default().fg(RED),
+        "running" | "waiting" | "stale" => Style::default().fg(YELLOW),
+        "neutral" => Style::default().fg(MUTED),
+        _ => health_style(health),
+    }
+}
+
+fn mark(semantic: &str, health: &str, lifecycle: &str) -> &'static str {
     if lifecycle == "completed" {
         return "✓";
     }
-    match health {
-        "healthy" => "●",
-        "failed" => "✖",
-        "unknown" => "?",
-        _ => "○",
+    if semantic.is_empty() {
+        return match health {
+            "healthy" => "●",
+            "failed" => "✖",
+            "unknown" => "?",
+            _ => "○",
+        };
+    }
+    match semantic {
+        "ready" => "●",
+        "running" => "▶",
+        "waiting" => "⏳",
+        "stale" => "◌",
+        "blocked" => "■",
+        "neutral" => "○",
+        _ => "?",
     }
 }
+
 fn panel(title: impl Into<String>) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
@@ -1108,7 +1170,8 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
             ListRow::Op(r) => {
                 let when = when_label(r, now);
                 let title = tree_title(r);
-                let line = op_line(&title, &r.health, &r.lifecycle, &when, inner);
+                let line = op_line(r, &title, &when, inner);
+
                 ListItem::new(line)
             }
         })
@@ -1133,35 +1196,32 @@ fn tree_title(row: &Row) -> String {
         return row.title.clone();
     }
     let connector = if row.last_child { "└─" } else { "├─" };
-    format!(
-        "{}{} {}",
-        "  ".repeat(row.depth.saturating_sub(1)),
-        connector,
-        row.title
-    )
+    format!("{}{} {}", row.tree_prefix, connector, row.title)
 }
 
-fn op_line(title: &str, health: &str, lifecycle: &str, when: &str, inner: u16) -> Line<'static> {
-    let mark = mark(health, lifecycle);
-    let mark_w = 2usize;
+fn op_line(row: &Row, title: &str, when: &str, inner: u16) -> Line<'static> {
+    let mark = mark(&row.semantic_state, &row.health, &row.lifecycle);
+    let failed = row.health == "failed";
+    let mark_w = if failed { 4usize } else { 2usize };
     let when_w = when.chars().count();
     let budget = inner.saturating_sub(mark_w as u16 + 1) as usize;
     let title_budget = budget.saturating_sub(when_w);
     let title = truncate(title, title_budget);
     let used = mark_w + title.chars().count() + when_w;
     let pad = (inner as usize).saturating_sub(used);
-    let state_style = if lifecycle == "completed" {
+    let state_style = if row.lifecycle == "completed" {
         Style::default().fg(ACCENT)
     } else {
-        health_style(health)
+        semantic_style(&row.semantic_state, &row.health)
     };
-    let mut spans = vec![
-        Span::styled(format!("{mark} "), state_style),
-        Span::styled(title, Style::default().fg(TEXT)),
-        Span::raw(" ".repeat(pad)),
-    ];
+    let mut spans = vec![Span::styled(format!("{mark} "), state_style)];
+    if failed {
+        spans.push(Span::styled("✖ ", Style::default().fg(RED)));
+    }
+    spans.push(Span::styled(title, Style::default().fg(TEXT)));
+    spans.push(Span::raw(" ".repeat(pad)));
     if !when.is_empty() {
-        let when_style = if health == "failed" {
+        let when_style = if failed {
             Style::default().fg(RED)
         } else {
             Style::default().fg(MUTED)
@@ -1304,15 +1364,6 @@ fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
 #[cfg(test)]
 fn cockpit_plain(r: &Row, now: SystemTime) -> String {
     let mut out = vec![description_for(r).to_string()];
-    if !r.headline.is_empty() || !r.body.is_empty() {
-        out.push("NOW".into());
-        if !r.headline.is_empty() {
-            out.push(r.headline.clone());
-        }
-        if !r.body.is_empty() {
-            out.extend(r.body.split('\n').map(str::to_string));
-        }
-    }
     if r.relationship == "owned" {
         let mut brief = String::from("AGENT BRIEF");
         if !r.updated_at.is_empty() {
@@ -1322,6 +1373,13 @@ fn cockpit_plain(r: &Row, now: SystemTime) -> String {
             brief.push_str(&format!("  [{cue}]"));
         }
         out.push(brief);
+        if !r.headline.is_empty() {
+            out.push(r.headline.clone());
+        }
+        if !r.body.is_empty() {
+            out.extend(r.body.split('\n').map(str::to_string));
+        }
+
         if r.active_iteration.is_some() || !r.iterations.is_empty() {
             out.push("RECENT ITERATIONS".into());
             if let Some(active) = &r.active_iteration {
@@ -1404,28 +1462,6 @@ fn cockpit_detail_lines(r: &Row, now: SystemTime) -> Vec<Line<'static>> {
         description_for(r).to_string(),
         Style::default().fg(MUTED),
     ))];
-    if !r.headline.is_empty() || !r.body.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(section_heading("NOW"));
-        lines.push(Line::from(""));
-        if !r.headline.is_empty() {
-            lines.push(Line::from(Span::styled(
-                r.headline.clone(),
-                Style::default()
-                    .fg(Color::Rgb(250, 248, 240))
-                    .add_modifier(Modifier::BOLD),
-            )));
-        }
-        if !r.body.is_empty() {
-            lines.push(Line::from(""));
-            lines.extend(
-                r.body.split('\n').map(|line| {
-                    Line::from(Span::styled(line.to_string(), Style::default().fg(TEXT)))
-                }),
-            );
-        }
-    }
-
     if r.relationship == "owned" {
         lines.push(Line::from(""));
         let mut brief = vec![Span::styled(
@@ -1447,6 +1483,23 @@ fn cockpit_detail_lines(r: &Row, now: SystemTime) -> Vec<Line<'static>> {
             brief.push(Span::styled("  current", Style::default().fg(MUTED)));
         }
         lines.push(Line::from(brief));
+        if !r.headline.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                r.headline.clone(),
+                Style::default()
+                    .fg(Color::Rgb(250, 248, 240))
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+        if !r.body.is_empty() {
+            lines.push(Line::from(""));
+            lines.extend(
+                r.body.split('\n').map(|line| {
+                    Line::from(Span::styled(line.to_string(), Style::default().fg(TEXT)))
+                }),
+            );
+        }
 
         if r.active_iteration.is_some() || !r.iterations.is_empty() {
             lines.push(Line::from(""));
@@ -1535,7 +1588,10 @@ fn wiring_detail_lines(r: &Row, _now: SystemTime) -> Vec<Line<'static>> {
     push_detail(&mut lines, "agent", r.agent.clone(), TEXT);
     push_detail(&mut lines, "agent root", short_path(&r.agent_root), MUTED);
     push_detail(&mut lines, "parent", r.parent.clone(), TEXT);
+
     push_detail(&mut lines, "lifecycle", r.lifecycle.clone(), TEXT);
+    push_detail(&mut lines, "semantic", r.semantic_state.clone(), TEXT);
+
     push_detail(&mut lines, "brain", r.brain_revision.clone(), MUTED);
     push_detail(&mut lines, "processed", r.processed.clone(), MUTED);
     push_detail(
@@ -1930,7 +1986,9 @@ mod tests {
             unit: unit.into(),
             title: unit.into(),
             health: "unknown".into(),
+            semantic_state: String::new(),
             relationship,
+
             critical: false,
             next: String::new(),
             kind: "oneshot".into(),
@@ -1973,6 +2031,7 @@ mod tests {
             blocker: String::new(),
             depth: 0,
             last_child: false,
+            tree_prefix: String::new(),
         }
     }
 
@@ -1980,6 +2039,7 @@ mod tests {
         let mut view = ScopeView {
             id: "personal".into(),
             automation_agent_root: None,
+            coordination_lead: None,
             root: PathBuf::from("/tmp/personal"),
             health: ScopeHealth::Healthy,
             owned: vec![serde_json::json!({
@@ -2259,7 +2319,8 @@ mod tests {
         row.lifecycle = "completed".into();
         row.state = "inactive".into();
         row.sub = "dead".into();
-        assert_eq!(mark(&row.health, &row.lifecycle), "✓");
+        assert_eq!(mark(&row.semantic_state, &row.health, &row.lifecycle), "✓");
+
         assert_eq!(when_label(&row, SystemTime::now()), "completed");
     }
 
@@ -2482,6 +2543,15 @@ mod tests {
             Some("boot 2min · every 15min".into())
         );
         assert_eq!(
+            schedule_text(&serde_json::json!({
+                "type": "interval",
+                "on_boot_sec": "5min",
+                "on_unit_inactive_sec": "3min",
+                "persistent": false
+            })),
+            Some("boot 5min · idle 3min".into())
+        );
+        assert_eq!(
             schedule_text(&serde_json::json!({"type": "calendar"})),
             None
         );
@@ -2599,7 +2669,6 @@ mod tests {
         let text = cockpit_plain(row, now);
         let headings = [
             "fallback purpose",
-            "NOW",
             "AGENT BRIEF",
             "RECENT ITERATIONS",
             "NOTABLE ACTIVITY",
