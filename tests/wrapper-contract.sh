@@ -19,7 +19,8 @@ make_case() {
   local name=$1
   local scope=$TMP/$name
   local home=$scope/.systemd-ops/operations/managed-omp-pr-9363
-  mkdir -p "$home/state" "$scope/worktree" "$scope/.systemd-ops/drivers" "$scope/.systemd-ops/lib"
+  mkdir -p "$home/state" "$scope/worktree" "$scope/fork.git" "$scope/.systemd-ops/drivers" "$scope/.systemd-ops/lib"
+  git -C "$scope/fork.git" init -q --bare
   git -C "$scope/worktree" init -q
   git -C "$scope/worktree" config user.email proof@example.invalid
   git -C "$scope/worktree" config user.name proof
@@ -27,7 +28,9 @@ make_case() {
   touch "$scope/worktree/.proof"
   git -C "$scope/worktree" add .proof
   git -C "$scope/worktree" commit -qm proof
-  git -C "$scope/worktree" remote add fork "$scope/worktree"
+  git -C "$scope/worktree" remote add fork "$scope/fork.git"
+  git -C "$scope/worktree" push -q fork fix/settings-project-scope
+  git -C "$scope/worktree" fetch -q fork
   cat >"$home/run" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -69,7 +72,11 @@ EOF
   cat >"$scope/.systemd-ops/drivers/pr-observe" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-jq -cn --arg world "${PROOF_FINGERPRINT:-fp-proof}" --arg generation "${UPSTREAM_GENERATION:-deadbeef}" \
+world=${PROOF_FINGERPRINT:-fp-proof}
+if [[ -n "${SYSTEMD_OPS_SCOPE_ROOT:-}" && -f "${SYSTEMD_OPS_SCOPE_ROOT}/world" ]]; then
+  world=$(cat "${SYSTEMD_OPS_SCOPE_ROOT}/world")
+fi
+jq -cn --arg world "$world" --arg generation "${UPSTREAM_GENERATION:-deadbeef}" \
   '{version:1,world_fingerprint:$world,generation:$generation}'
 EOF
   chmod +x "$scope/.systemd-ops/drivers/pr-observe"
@@ -175,5 +182,22 @@ done
 PROOF_FINGERPRINT=fp-changed run_wrapper "$blocked_repeat"
 [[ $(wc -l <"$blocked_repeat/agent-calls") -eq 2 ]] || fail "changed world did not wake OMP exactly once"
 
+mut=$(make_case self-mutation)
+pre=$(SYSTEMD_OPS_SCOPE_ROOT="$mut" SYSTEMD_OPS_OPERATION=managed-omp-pr-9363 "$BIN" --json --manager user --cwd "$mut/worktree" automation observe)
+pre_fp=$(jq -er '.data.observation.input_fingerprint' <<<"$pre")
+write_omp "$mut/fake-omp" 'printf fp-after >"${SYSTEMD_OPS_SCOPE_ROOT}/world"
+"$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "mutated" --summary '\''["self mutation"]'\'' --outcome ready >/dev/null'
+run_wrapper "$mut"
+post=$(SYSTEMD_OPS_SCOPE_ROOT="$mut" SYSTEMD_OPS_OPERATION=managed-omp-pr-9363 "$BIN" --json --manager user --cwd "$mut/worktree" automation observe)
+post_fp=$(jq -er '.data.observation.input_fingerprint' <<<"$post")
+[[ $pre_fp != "$post_fp" ]] || fail "self-mutation did not change observation"
+[[ $(processed_fp "$mut") == "$post_fp" ]] || fail "processed certified pre-pass input $pre_fp instead of $post_fp"
+jq -e --arg fp "$post_fp" '.input_fingerprint==$fp' "$mut/.systemd-ops/operations/managed-omp-pr-9363/state/checkpoint.json" >/dev/null \
+  || fail "checkpoint certified pre-pass input"
+write_omp "$mut/fake-omp" 'touch "${SYSTEMD_OPS_SCOPE_ROOT}/agent-was-called"'
+run_wrapper "$mut"
+[[ ! -e $mut/agent-was-called ]] || fail "post-pass processed input invoked OMP again"
+
 echo "wrapper-contract ok"
+
 
