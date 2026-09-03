@@ -40,6 +40,7 @@ EOF
   cp "$SOURCE_DRIVER" "$scope/.systemd-ops/drivers/pr-run"
   chmod +x "$scope/.systemd-ops/drivers/pr-run"
   cp "$SOURCE_LIB" "$scope/.systemd-ops/lib/automation-wrapper"
+  cp /home/sf/workspace/oh-my-pi/.systemd-ops/lib/pr-attempt "$scope/.systemd-ops/lib/pr-attempt"
   chmod +x "$scope/.systemd-ops/lib/automation-wrapper"
   cat >"$scope/.systemd-ops/scope.toml" <<EOF
 [scope]
@@ -103,6 +104,8 @@ run_wrapper() {
   OMP_BIN="$scope/fake-omp" \
   AGENT_CWD="$scope/agents" \
   UPSTREAM_GENERATION="${UPSTREAM_GENERATION:-deadbeef}" \
+  PR_ATTEMPT_ROOT="$scope/attempts" \
+  GIT_BASE="$scope/worktree" \
   PROOF_SKIP_GH=1 \
   "$scope/.systemd-ops/operations/managed-omp-pr-9363/run"
 }

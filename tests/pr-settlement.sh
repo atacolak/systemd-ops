@@ -96,4 +96,21 @@ pr_quiet_elapsed "$state" "$G2" "$rev2" 1800 || fail "reset quiet not elapsed at
 same=$(capability_release_gate "$not_ready" "$G2" "$G2" 1000 "$tmp/quiet-same.json") || true
 [[ $same == launch ]] || fail "same-generation unprocessed children blocked launch: $same"
 
+# 60m grace: unsettled children become eligible at +3600, not before.
+grace_file=$tmp/grace.json
+g0=$(capability_release_gate "$not_ready" "$G2" "$G1" 1000 "$tmp/quiet-grace.json" "$grace_file") || true
+[[ $g0 == wait-unsettled ]] || fail "t+0 unsettled was $g0"
+g3599=$(capability_release_gate "$not_ready" "$G2" "$G1" 4599 "$tmp/quiet-grace.json" "$grace_file") || true
+[[ $g3599 == wait-unsettled ]] || fail "t+3599 unsettled was $g3599"
+g3600=$(capability_release_gate "$not_ready" "$G2" "$G1" 4600 "$tmp/quiet-grace.json" "$grace_file") || true
+[[ $g3600 == launch-grace ]] || fail "t+3600 unsettled was $g3600, want launch-grace"
+units=$(pr_unsettled_units "$not_ready" "$G2")
+printf '%s\n' "$units" | grep -q pr-a || fail "unsettled units missing pr-a: $units"
+
+# settled path still wins before grace: quiet 300 after settle, no 3600 wait
+pref=$(capability_release_gate "$settled" "$G2" "$G1" 1000 "$tmp/quiet-pref.json" "$tmp/grace-pref.json") || true
+[[ $pref == wait-quiet ]] || fail "settled t+0 was $pref, want wait-quiet"
+pref2=$(capability_release_gate "$settled" "$G2" "$G1" 1300 "$tmp/quiet-pref.json" "$tmp/grace-pref.json") || true
+[[ $pref2 == launch ]] || fail "settled t+300 was $pref2, want launch not grace"
+
 echo "pr-settlement ok"
