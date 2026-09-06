@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+if [[ $# -ne 4 ]]; then
+  echo "usage: pr-maintainer-run PR_NUMBER HEAD_BRANCH OPERATION_STEM WORKTREE" >&2
+  exit 2
+fi
+
+PR_NUMBER=$1
+HEAD_BRANCH=$2
+OPERATION_STEM=$3
+BOUND_WORKTREE=${WORKTREE:-$4}
+WORKTREE=${BOUND_WORKTREE}
+PR_URL=https://github.com/can1357/oh-my-pi/pull/$PR_NUMBER
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+SCOPE_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+OPERATION_HOME="$SCOPE_ROOT/.systemd-ops/operations/$OPERATION_STEM"
+STATE_DIR="$OPERATION_HOME/state"
+
+SYSTEMD_OPS_BIN=${SYSTEMD_OPS_BIN:-/home/sf/.local/bin/systemd-ops}
+OMP_BIN=${OMP_BIN:-/home/sf/.bun/bin/omp}
+AGENT_CWD=${AGENT_CWD:-/home/sf/worlds/automation-agents}
+
+export SYSTEMD_OPS_SCOPE_ROOT="$SCOPE_ROOT"
+export SYSTEMD_OPS_OPERATION="$OPERATION_STEM"
+export PATH="/home/sf/.bun/bin:/home/sf/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+# shellcheck source=../lib/automation-wrapper
+source "$SCOPE_ROOT/.systemd-ops/lib/automation-wrapper"
+# shellcheck source=../lib/pr-attempt
+source "$SCOPE_ROOT/.systemd-ops/lib/pr-attempt"
+
+current_input=$(observe_input) || exit $?
+if input_is_processed "$current_input"; then
+  exit 0
+fi
+wake_input=$current_input
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+exec 9>"$STATE_DIR/.wake.lock"
+
+if ! flock -n 9; then
+  exit 0
+fi
+current_input=$(observe_input) || exit $?
+if input_is_processed "$current_input"; then
+  exit 0
+fi
+wake_input=$current_input
+
+upstream_generation=$(resolve_target_generation) || exit $?
+start_json=$(ops_bound operator iteration-start --unit "$OPERATION_STEM") || exit $?
+iteration_id=$(jq -er '.data.iteration_id' <<<"$start_json") || exit $?
+
+if ! create_pr_attempt "$HEAD_BRANCH" "$iteration_id"; then
+  echo "cannot create disposable PR attempt worktree" >&2
+  record_blocker iteration-failed 4 "cannot create disposable PR attempt worktree" "$iteration_id" parent "$wake_input" || true
+  finish_iteration 4 >/dev/null 2>&1 || true
+  exit 4
+fi
+WORKTREE=$ATTEMPT_WORKTREE
+export WORKTREE
+
+cleanup_attempt() {
+  dispose_pr_attempt
+}
+trap cleanup_attempt EXIT
+
+"$OMP_BIN" -p --agent pr-maintainer --agent-cwd "$AGENT_CWD" \
+  --cwd "$ATTEMPT_WORKTREE" --approval-mode yolo --max-time 45m \
+  "Repository: can1357/oh-my-pi
+PR: $PR_URL
+PR number: $PR_NUMBER
+Head branch: $HEAD_BRANCH
+Operation stem: $OPERATION_STEM
+Required target generation: $upstream_generation
+Durable publication branch: fork/$HEAD_BRANCH
+This cwd is a disposable attempt snapshot of fork/$HEAD_BRANCH at $ATTEMPT_START_HEAD. Push verified commits to fork/$HEAD_BRANCH. Do not expect this worktree to survive the pass.
+
+Call automation_report with outcome=ready or outcome=blocked before exit.
+BLOCKED reports require route=self|parent. READY means the PR is locally safe to keep as a publication stream, not that upstream accepted it. READY requires the intended repair committed and pushed to fork/$HEAD_BRANCH with a clean attempt worktree. BLOCKED must leave the attempt clean without speculative uncommitted edits. Perform exactly one maintenance pass, then exit."
+
+omp_code=$?
+
+finish_json=$(finish_iteration "$omp_code")
+finish_code=$?
+
+dirty=$(attempt_dirty_files "$ATTEMPT_WORKTREE" || true)
+dirty_n=$(printf '%s' "$dirty" | grep -c . || true)
+
+handle_hard_failure() {
+  local kind=$1
+  local code=$2
+  log_pr_attempt_aftermath "$kind" "$code" >&2
+  n=$(record_attempt_failure "$wake_input" "$kind")
+  record_blocker iteration-failed "$code" "PR attempt $kind with exit $code" "$iteration_id" parent "$wake_input" || true
+  if [[ "$n" -ge "${PR_FAILURE_BUDGET}" ]]; then
+    park_pr_input "$wake_input" "$kind"
+    echo "PR parked after $n identical $kind failures on unchanged input" >&2
+    exit 0
+  fi
+  exit "$code"
+}
+
+if [[ $omp_code -ne 0 ]]; then
+  kind=crash
+  if [[ $omp_code -eq 124 ]]; then
+    kind=timeout
+  fi
+  handle_hard_failure "$kind" "$omp_code"
+fi
+if [[ $finish_code -ne 0 ]]; then
+  handle_hard_failure crash "$finish_code"
+fi
+reconsolidated=$(jq -r '.data.reconsolidated // false' <<<"$finish_json") || exit $?
+if [[ "$reconsolidated" != true ]]; then
+  echo "automation_report is required before a successful maintainer exit" >&2
+  handle_hard_failure contract-failure 3
+fi
+
+outcome=$(report_outcome_from_finish "$finish_json")
+route=$(report_route_from_finish "$finish_json")
+post_input=$(observe_input) || exit $?
+
+if [[ "$dirty_n" -gt 0 ]]; then
+  echo "PR attempt left uncommitted files; rejecting $outcome" >&2
+  printf '%s\n' "$dirty" | sed 's/^/  /' >&2
+  log_pr_attempt_aftermath dirty-at-exit 3 >&2
+  record_blocker contract-failure 3 "dirty attempt at $outcome exit" "$iteration_id" parent "$wake_input" || true
+  n=$(record_attempt_failure "$wake_input" dirty-at-exit)
+  if [[ "$n" -ge "${PR_FAILURE_BUDGET}" ]]; then
+    park_pr_input "$wake_input" dirty-at-exit
+    exit 0
+  fi
+  exit 3
+fi
+
+if [[ "$outcome" == blocked ]]; then
+  summary=$(jq -r '.data.operator.headline // .data.operator.body // "blocked"' <<<"$finish_json")
+  mark_processed "$post_input" blocked || exit $?
+  record_blocker semantic-blocked 0 "$summary" "$iteration_id" "${route:-self}" "$post_input" || true
+  clear_failure_budget
+  exit 0
+fi
+
+if [[ "$outcome" != ready ]]; then
+  echo "automation_report outcome must be ready or blocked" >&2
+  record_blocker contract-failure 3 "automation_report outcome must be ready or blocked" "$iteration_id" parent "$post_input" || true
+  exit 3
+fi
+
+post_upstream_generation=$(resolve_target_generation) || exit $?
+if [[ "$post_upstream_generation" != "$upstream_generation" ]]; then
+  echo "target generation advanced during maintenance; refusing a stale checkpoint" >&2
+  record_blocker stale-generation 4 "target generation advanced during maintenance; refusing a stale checkpoint" "$iteration_id" parent "$post_input" || true
+  exit 4
+fi
+output_revision=$(git -C "$ATTEMPT_WORKTREE" rev-parse HEAD) || exit $?
+mark_processed "$post_input" ready || exit $?
+write_output_checkpoint "$post_input" "$upstream_generation" "$output_revision" || {
+  echo "structured checkpoint write failed" >&2
+  record_blocker postcondition-failed 4 "structured checkpoint write failed" "$iteration_id" parent "$post_input" || true
+  exit 4
+}
+clear_failure_budget
+
+notify_parent checkpoint
+
+if command -v /home/sf/.local/bin/gh >/dev/null && [[ -z "${PROOF_SKIP_GH:-}" ]]; then
+  pr_state=$(/home/sf/.local/bin/gh pr view "$PR_NUMBER" --repo can1357/oh-my-pi --json state --jq '.state') || exit $?
+  if [[ "$pr_state" == MERGED ]]; then
+    ops automation complete --unit "$OPERATION_STEM" --reason "merged upstream" || exit $?
+    notify_parent completed
+  fi
+fi
+exit 0

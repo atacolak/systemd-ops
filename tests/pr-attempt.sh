@@ -4,8 +4,9 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${SYSTEMD_OPS_BIN:-$ROOT/target/debug/systemd-ops}
-SOURCE_DRIVER=${SOURCE_DRIVER:-/home/sf/workspace/oh-my-pi/.systemd-ops/drivers/pr-run}
-SOURCE_LIB=${SOURCE_LIB:-/home/sf/workspace/oh-my-pi/.systemd-ops/lib/automation-wrapper}
+DOGFOOD_ROOT=${DOGFOOD_ROOT:-$ROOT/dogfood}
+SOURCE_DRIVER=${SOURCE_DRIVER:-$DOGFOOD_ROOT/drivers/pr-run}
+SOURCE_LIB=${SOURCE_LIB:-$DOGFOOD_ROOT/lib/automation-wrapper}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -75,7 +76,7 @@ EOF
   cp "$SOURCE_DRIVER" "$scope/.systemd-ops/drivers/pr-run"
   chmod +x "$scope/.systemd-ops/drivers/pr-run"
   cp "$SOURCE_LIB" "$scope/.systemd-ops/lib/automation-wrapper"
-  cp /home/sf/workspace/oh-my-pi/.systemd-ops/lib/pr-attempt "$scope/.systemd-ops/lib/pr-attempt"
+  cp "$DOGFOOD_ROOT/lib/pr-attempt" "$scope/.systemd-ops/lib/pr-attempt"
   cat >"$scope/.systemd-ops/operations/$STEM/run" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail

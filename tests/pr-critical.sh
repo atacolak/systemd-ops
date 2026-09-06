@@ -3,8 +3,8 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-LIB=${REVIEW_LIB:-/home/sf/workspace/oh-my-pi/.systemd-ops/lib/pr-review-state}
-SETTLE=${SETTLE_LIB:-/home/sf/workspace/oh-my-pi/.systemd-ops/lib/pr-settlement}
+LIB=${REVIEW_LIB:-${DOGFOOD_ROOT:-$ROOT/dogfood}/lib/pr-review-state}
+SETTLE=${SETTLE_LIB:-${DOGFOOD_ROOT:-$ROOT/dogfood}/lib/pr-settlement}
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 command -v jq >/dev/null || fail "jq required"

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: pr-observe PR_NUMBER" >&2
+  exit 2
+fi
+
+repo=can1357/oh-my-pi
+number=$1
+SCOPE_ROOT=${SYSTEMD_OPS_SCOPE_ROOT:-/home/sf/workspace/oh-my-pi}
+GEN_FILE="$SCOPE_ROOT/.systemd-ops/operations/managed-omp-release-watch/state/generation.json"
+[[ -r "$GEN_FILE" ]] || { echo "missing $GEN_FILE" >&2; exit 4; }
+target_generation=$(jq -er '.target_commit' "$GEN_FILE")
+pr_file=$(mktemp)
+threads_file=$(mktemp)
+trap 'rm -f "$pr_file" "$threads_file"' EXIT
+/home/sf/.local/bin/gh pr view "$number" --repo "$repo" \
+  --json number,state,headRefName,headRefOid,reviewDecision,mergeable,statusCheckRollup,reviews,comments \
+  --jq '{
+    number,
+    state,
+    headRefName,
+    headRefOid,
+    reviewDecision,
+    mergeable,
+    checks: ([.statusCheckRollup[]? | {
+      name,
+      context,
+      conclusion
+    }] | sort_by([.name, .context, .conclusion])),
+    reviews: ([.reviews[] | {
+      id,
+      author: .author.login,
+      state,
+      commit: .commit.oid
+    }] | sort_by([.id, .state, .commit])),
+    comments: ([.comments[] | {
+      id,
+      author: .author.login
+    }] | sort_by([.id, .author]))
+  }' >"$pr_file"
+/home/sf/.local/bin/gh api graphql \
+  -f query='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{id isResolved isOutdated comments(last:1){nodes{id author{login} body commit{oid}}}}}}}}' \
+  -F owner=can1357 \
+  -F repo=oh-my-pi \
+  -F number="$number" \
+  --jq '.data.repository.pullRequest.reviewThreads.nodes' >"$threads_file"
+
+# shellcheck source=../lib/pr-review-state
+source "$SCOPE_ROOT/.systemd-ops/lib/pr-review-state"
+head=$(jq -r '.headRefOid // empty' "$pr_file")
+if [[ -n "$head" ]]; then
+  threads_json=$(jq -c '.' "$threads_file")
+  severity=$(extract_codex_severity "$threads_json" "$head")
+  op_home=${SYSTEMD_OPS_OPERATION_HOME:-$SCOPE_ROOT/.systemd-ops/operations/${SYSTEMD_OPS_OPERATION:-}}
+  record_codex_critical_state "$op_home/state" "$severity"
+fi
+
+# Hash without comment bodies so fetching bodies for severity cannot wake PRs.
+world=$(jq -n -cS \
+  --arg target "$target_generation" \
+  --slurpfile pr "$pr_file" \
+  --slurpfile threads "$threads_file" \
+  '{
+    target: $target,
+    pr: $pr[0],
+    reviewThreads: (($threads[0] // []) | map(.comments.nodes[]? |= del(.body)) | sort_by(.id))
+  }' | sha256sum | cut -d' ' -f1)
+jq -n -c --arg world "$world" --arg generation "$target_generation" \
+  '{version:1,world_fingerprint:$world,generation:$generation}'

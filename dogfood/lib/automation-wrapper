@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+# Shared trusted-wrapper helpers. Sourced, never executed.
+
+ops() {
+  "$SYSTEMD_OPS_BIN" --json --manager user --scope-root "$SCOPE_ROOT" --cwd "$WORKTREE" "$@"
+}
+
+ops_bound() {
+  "$SYSTEMD_OPS_BIN" --json --manager user --cwd "$WORKTREE" "$@"
+}
+
+notify_parent() {
+  local event=${1:-checkpoint}
+  local out
+  if [[ -n "${PROOF_SKIP_GH:-}" ]]; then
+    return 0
+  fi
+  if ! out=$(ops automation notify-parent --event "$event" 2>&1); then
+    echo "parent notification failed: $out" >&2
+    return 0
+  fi
+}
+
+
+observe_input() {
+  ops automation observe | jq -er '.data.observation.input_fingerprint'
+}
+
+processed_input() {
+  automation_context_json | jq -r '.data.automation.processed.input_fingerprint // empty'
+}
+
+input_is_processed() {
+  local input=$1
+  [[ $(processed_input) == "$input" ]]
+}
+
+mark_processed() {
+  local input=$1
+  local outcome=$2
+  ops automation process --input-fingerprint "$input" --outcome "$outcome" >/dev/null
+}
+
+write_output_checkpoint() {
+  local input_fingerprint=$1
+  local generation=$2
+  local output_revision=$3
+  local args=(automation checkpoint --input-fingerprint "$input_fingerprint")
+  [[ -n "$generation" ]] && args+=(--generation "$generation")
+  [[ -n "$output_revision" ]] && args+=(--output-revision "$output_revision")
+  ops "${args[@]}" >/dev/null
+}
+
+
+record_blocker() {
+  local kind=$1
+  local code=$2
+  local summary=$3
+  local iteration=${4:-}
+  local route=${5:-parent}
+  local input=${6:-}
+  summary=$(printf '%s' "$summary" | tr '\n\r' '  ' | sed 's/[[:space:]]\{1,\}/ /g; s/^ //; s/ $//')
+  if [[ ${#summary} -gt 200 ]]; then
+    summary=${summary:0:200}
+  fi
+  if [[ -z "$input" ]]; then
+    input=$(automation_context_json | jq -r '.data.automation.observation.input_fingerprint // empty')
+  fi
+  local args=(automation blocker --kind "$kind" --summary "$summary" --route "$route")
+  [[ -n "$code" ]] && args+=(--code "$code")
+  [[ -n "$iteration" ]] && args+=(--iteration "$iteration")
+  [[ -n "$input" ]] && args+=(--input-fingerprint "$input")
+  local out
+  if ! out=$(ops "${args[@]}" 2>&1); then
+    echo "blocker write failed: $out" >&2
+    return 1
+  fi
+  if jq -e '.ok == true and .data.changed == true' <<<"$out" >/dev/null 2>&1; then
+    case "$route" in
+      parent) notify_parent blocked ;;
+      self|lead) ;;
+      *) echo "unknown blocker route '$route'" >&2 ;;
+    esac
+  fi
+}
+
+
+
+finish_iteration() {
+  local code=$1
+  ops_bound operator iteration-finish --unit "$OPERATION_STEM" \
+    --iteration "$iteration_id" --exit-code "$code"
+}
+
+report_outcome_from_finish() {
+  local finish_json=$1
+  jq -r '.data.operator.outcome // empty' <<<"$finish_json"
+}
+
+report_route_from_finish() {
+  local finish_json=$1
+  jq -r '.data.operator.route // empty' <<<"$finish_json"
+}
+
+automation_context_json() {
+  ops automation context
+}
+
+child_revision_digest() {
+  local context=${1:-}
+  if [[ -z "$context" ]]; then
+    context=$(automation_context_json) || return $?
+  fi
+  jq -er '[.data.relations.children // [] | sort_by(.unit)[] | .child_revision // ""] | join("\n")' <<<"$context" \
+    | sha256sum | cut -d' ' -f1
+}
+
+capability_child_revision_digest() {
+  local context=${1:-}
+  if [[ -z "$context" ]]; then
+    context=$(automation_context_json) || return $?
+  fi
+  jq -er '[.data.relations.children // []
+    | map(select((.agent // "") != "pr-maintainer"))
+    | sort_by(.unit)[]
+    | .child_revision // ""] | join("\n")' <<<"$context" \
+    | sha256sum | cut -d' ' -f1
+}
+
+
+children_ready_for_generation() {
+  local context=$1
+  local required_generation=$2
+  jq -e --arg gen "$required_generation" '
+    (.data.relations.children // [])
+    | map(select((.lifecycle // "active") != "completed"))
+    | map(select((.agent // "") == "capability-maintainer" or (.agent // "") == ""))
+    | all(
+        (.semantic_state == "ready")
+        and (.active_iteration != true)
+        and (.running != true)
+        and ((.blocker.current // false) != true)
+        and (.checkpoint.present == true)
+        and (.checkpoint.kind == "structured")
+        and ((.checkpoint.generation // "") == $gen)
+        and ((.checkpoint.output_revision // "") != "")
+      )
+  ' <<<"$context" >/dev/null
+}
+
+capability_sources_ready_for_generation() {
+  local context=$1
+  local required_generation=$2
+  local tmp
+  tmp=$(mktemp)
+  printf '%s\n' "$context" >"$tmp"
+  jq -e --arg gen "$required_generation" '
+    [.data.relations.children[]?
+      | select((.lifecycle // "active") != "completed")
+      | select((.agent // "") == "capability-maintainer")]
+    | (length > 0)
+      and all(
+        ((.blocker.current // false) != true)
+        and ((.running // false) != true)
+        and ((.active_iteration // false) != true)
+        and (.checkpoint.present == true)
+        and (.checkpoint.kind == "structured")
+        and ((.checkpoint.generation // "") == $gen)
+        and ((.checkpoint.output_revision // "") != "")
+      )
+  ' "$tmp" >/dev/null
+  local rc=$?
+  rm -f "$tmp"
+  return "$rc"
+}
+
+
+
+
+capability_sources_have_blocker() {
+  local context=$1
+  jq -e '
+    (.data.relations.children // [])
+    | map(select((.lifecycle // "active") != "completed"))
+    | map(select((.agent // "") == "capability-maintainer"))
+    | any(
+        ((.blocker.current // false) == true)
+        or (.semantic_state == "blocked")
+      )
+  ' <<<"$context" >/dev/null
+}
+
+children_have_blocker() {
+  local context=$1
+  jq -e '
+    (.data.relations.children // [])
+    | map(select((.lifecycle // "active") != "completed"))
+    | any(
+        ((.blocker.current // false) == true)
+        or (.semantic_state == "blocked")
+      )
+  ' <<<"$context" >/dev/null
+}
+
+
+resolve_target_generation() {
+  if [[ -n "${UPSTREAM_GENERATION:-}" ]]; then
+    printf '%s\n' "$UPSTREAM_GENERATION"
+    return 0
+  fi
+  local gen_file="${SCOPE_ROOT}/.systemd-ops/operations/managed-omp-release-watch/state/generation.json"
+  if [[ -r "$gen_file" ]]; then
+    jq -er '.target_commit' "$gen_file"
+    return $?
+  fi
+  echo "missing release-watch generation.json at $gen_file" >&2
+  return 4
+}
+
+
+
+resolve_upstream_generation() {
+  if [[ -n "${UPSTREAM_GENERATION:-}" ]]; then
+    printf '%s\n' "$UPSTREAM_GENERATION"
+    return 0
+  fi
+  git -C "$WORKTREE" fetch --quiet origin main 2>/dev/null || true
+  git -C "$WORKTREE" fetch --quiet fork main 2>/dev/null || true
+  git -C "$WORKTREE" rev-parse --verify -q origin/main \
+    || git -C "$WORKTREE" rev-parse --verify -q fork/main \
+    || git -C "$WORKTREE" rev-parse --verify -q main
+}
+
+worktree_invariant_kind() {
+  local expected_branch=${1:-}
+  if [[ ! -d "$WORKTREE/.git" && ! -f "$WORKTREE/.git" ]]; then
+    echo worktree-missing
+    echo "dedicated worktree is missing: $WORKTREE"
+    return 0
+  fi
+  if [[ -n $(git -C "$WORKTREE" status --porcelain=v1 --untracked-files=normal) ]]; then
+    echo worktree-dirty
+    echo "dedicated worktree is dirty: $WORKTREE"
+    return 0
+  fi
+  if ! git -C "$WORKTREE" symbolic-ref --quiet --short HEAD >/dev/null; then
+    echo worktree-detached
+    echo "dedicated worktree is detached: $WORKTREE"
+    return 0
+  fi
+  if [[ -n "$expected_branch" ]]; then
+    local current_branch
+    current_branch=$(git -C "$WORKTREE" symbolic-ref --quiet --short HEAD) || {
+      echo worktree-detached
+      echo "dedicated worktree is detached: $WORKTREE"
+      return 0
+    }
+    if [[ "$current_branch" != "$expected_branch" ]]; then
+      echo worktree-diverged
+      echo "dedicated worktree branch '$current_branch' does not match '$expected_branch'"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+git_base_repo() {
+  if [[ -n "${GIT_BASE:-}" ]]; then
+    printf '%s\n' "$GIT_BASE"
+    return 0
+  fi
+  if [[ -d "$WORKTREE/.git" || -f "$WORKTREE/.git" ]]; then
+    git -C "$WORKTREE" rev-parse --path-format=absolute --git-common-dir 2>/dev/null \
+      | sed 's|/\.git$||'
+    return 0
+  fi
+  printf '%s\n' "$SCOPE_ROOT"
+}
+
+replacement_worktree_path() {
+  local old=$1
+  local parent stem stamp
+  parent=$(dirname -- "$old")
+  stem=$(basename -- "$old")
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  printf '%s/%s-recovered-%s\n' "$parent" "$stem" "$stamp"
+}
+
+rebind_worktree() {
+  local new=$1
+  local old=$WORKTREE
+  local view spec token apply
+  view=$(ops inspect get-operation --unit "$OPERATION_STEM") || return $?
+  spec=$(jq -c '.data.editable_spec // .editable_spec' <<<"$view") || return $?
+  if [[ "$spec" == "null" || -z "$spec" ]]; then
+    echo "no editable_spec to rebind $OPERATION_STEM" >&2
+    return 1
+  fi
+  spec=$(jq -c --arg old "$old" --arg new "$new" '
+    .cwd = $new
+    | if (.exec.argv | type) == "array" then
+        .exec.argv |= map(if . == $old then $new else . end)
+      else .
+      end
+  ' <<<"$spec") || return $?
+  local plan
+  plan=$(ops author plan-update --spec "$spec") || return $?
+  token=$(jq -er '.data.plan_token // .plan_token' <<<"$plan") || return $?
+  apply=$(ops author apply --plan-token "$token") || return $?
+  jq -e '.ok == true' <<<"$apply" >/dev/null \
+    || { echo "worktree rebind apply failed: $apply" >&2; return 1; }
+  WORKTREE=$new
+  export WORKTREE
+}
+
+recover_worktree() {
+  local expected_branch=$1
+  local kind=$2
+  local summary=$3
+  local base new
+  echo "$summary; recovering a clean replacement without resetting $WORKTREE" >&2
+  base=$(git_base_repo) || return 1
+  new=$(replacement_worktree_path "$WORKTREE")
+  if [[ -e "$new" ]]; then
+    echo "replacement worktree already exists: $new" >&2
+    return 1
+  fi
+  git -C "$base" fetch --quiet fork "$expected_branch" 2>/dev/null || true
+  if ! git -C "$base" worktree add --detach "$new" "fork/$expected_branch" 2>/dev/null; then
+    if ! git -C "$base" worktree add --detach "$new" "$expected_branch" 2>/dev/null; then
+      echo "cannot create replacement worktree at $new" >&2
+      record_blocker "$kind" 4 "$summary" "" parent || true
+      return 1
+    fi
+  fi
+  git -C "$new" checkout -B "$expected_branch" || {
+    echo "cannot check out $expected_branch in $new" >&2
+    record_blocker "$kind" 4 "$summary" "" parent || true
+    return 1
+  }
+  if ! rebind_worktree "$new"; then
+    echo "created $new but failed to rebind $OPERATION_STEM; leaving dirty $WORKTREE untouched" >&2
+    record_blocker "$kind" 4 "$summary" "" parent || true
+    return 1
+  fi
+  ops automation clear-blocker >/dev/null 2>&1 || true
+  echo "rebound $OPERATION_STEM to clean worktree $new" >&2
+
+}
+
+ensure_clean_worktree() {
+  local expected_branch=$1
+  local kind summary
+  if kind_summary=$(worktree_invariant_kind "$expected_branch"); then
+    kind=$(printf '%s\n' "$kind_summary" | sed -n '1p')
+    summary=$(printf '%s\n' "$kind_summary" | sed -n '2p')
+    recover_worktree "$expected_branch" "$kind" "$summary" || return 4
+  fi
+  git -C "$WORKTREE" fetch --quiet fork "$expected_branch" || return $?
+  local local_head remote_head
+  local_head=$(git -C "$WORKTREE" rev-parse HEAD) || return $?
+  remote_head=$(git -C "$WORKTREE" rev-parse "fork/$expected_branch") || return $?
+  if [[ "$local_head" != "$remote_head" ]]; then
+    if git -C "$WORKTREE" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      git -C "$WORKTREE" merge --ff-only "fork/$expected_branch" || return $?
+    else
+      recover_worktree "$expected_branch" worktree-diverged \
+        "dedicated worktree diverged from fork/$expected_branch" || return 4
+    fi
+  fi
+}

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCOPE_ROOT=${SYSTEMD_OPS_SCOPE_ROOT:-/home/sf/workspace/oh-my-pi}
+STATE_DIR=${STATE_DIR:-$SCOPE_ROOT/.systemd-ops/operations/managed-omp-project-lead-watch/state}
+
+export SYSTEMD_OPS_SCOPE_ROOT="$SCOPE_ROOT"
+export STATE_DIR
+export MERGED_VERIFY_BIN="${MERGED_VERIFY_BIN:-$SCOPE_ROOT/.systemd-ops/lib/verify-merged-pr}"
+export MERGED_VERIFY_REPO="${MERGED_VERIFY_REPO:-can1357/oh-my-pi}"
+export MERGED_VERIFY_GIT_DIR="${MERGED_VERIFY_GIT_DIR:-$SCOPE_ROOT}"
+exec /home/sf/worlds/base/tools/systemd-ops-hcom

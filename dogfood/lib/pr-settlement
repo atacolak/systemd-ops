@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# OMP-domain PR settlement for a target generation, plus 5-minute quiet debounce.
+# Sourced, never executed. Not a generic systemd-ops child-readiness primitive.
+
+PR_SETTLE_QUIET_SECONDS=${PR_SETTLE_QUIET_SECONDS:-300}
+PR_RELEASE_GRACE_SECONDS=${PR_RELEASE_GRACE_SECONDS:-3600}
+
+pr_active_children_json() {
+  local context=$1
+  jq -c '
+    [.data.relations.children[]?
+      | select((.lifecycle // "active") != "completed")
+      | select((.agent // "") == "pr-maintainer")]
+  ' <<<"$context"
+}
+
+# A PR is SETTLED for generation G when it is idle and its CURRENT observation
+# has been processed at G. READY and BLOCKED both count. Checkpoint generation
+# is irrelevant: a BLOCKED PR may keep an older checkpoint.
+pr_child_is_settled_for_generation() {
+  local child=$1
+  local required_generation=$2
+  jq -e --arg gen "$required_generation" '
+    ((.running // false) != true)
+    and ((.active_iteration // false) != true)
+    and ((.observation.generation // "") == $gen)
+    and ((.processed.input_fingerprint // "") != "")
+    and ((.processed.input_fingerprint // "") == (.observation.input_fingerprint // ""))
+  ' <<<"$child" >/dev/null
+}
+
+pr_children_settled_for_generation() {
+  local context=$1
+  local required_generation=$2
+  local children child
+  children=$(pr_active_children_json "$context") || return 1
+  if [[ $(jq 'length' <<<"$children") -eq 0 ]]; then
+    return 0
+  fi
+  while IFS= read -r child; do
+    [[ -n "$child" ]] || continue
+    pr_child_is_settled_for_generation "$child" "$required_generation" || return 1
+  done < <(jq -c '.[]' <<<"$children")
+  return 0
+}
+
+pr_children_running() {
+  local context=$1
+  jq -e '
+    [.data.relations.children[]?
+      | select((.lifecycle // "active") != "completed")
+      | select((.agent // "") == "pr-maintainer")
+      | select((.running == true) or (.active_iteration == true))]
+    | length > 0
+  ' <<<"$context" >/dev/null
+}
+
+# Digest of the settled PR-child snapshot. Any meaningful child change
+# (new observation, new processed outcome, new iteration, running bit)
+# must change this so the quiet window resets.
+pr_children_settled_revision() {
+  local context=$1
+  jq -er '
+    [.data.relations.children[]?
+      | select((.lifecycle // "active") != "completed")
+      | select((.agent // "") == "pr-maintainer")
+      | [
+          .unit,
+          (.observation.generation // ""),
+          (.observation.input_fingerprint // ""),
+          (.processed.input_fingerprint // ""),
+          (.processed.outcome // ""),
+          (.latest_iteration.id // ""),
+          (.latest_iteration.finished_at // ""),
+          (if .running == true then "running" else "idle" end),
+          (if .active_iteration == true then "active" else "idle" end)
+        ] | join("\t")]
+    | sort
+    | join("\n")
+  ' <<<"$context" | sha256sum | cut -d' ' -f1
+}
+
+# Persist only the quiet boundary. Do not feed this into world_fingerprint.
+# Fourth argument is unix epoch so tests stay deterministic.
+# Zero PR children: vacuously quiet (immediate).
+pr_quiet_elapsed() {
+  local state_file=$1
+  local generation=$2
+  local settled_revision=$3
+  local now=${4:-}
+  if [[ -z "$now" ]]; then
+    now=$(date +%s)
+  fi
+  local required=${PR_SETTLE_QUIET_SECONDS:-300}
+  mkdir -p "$(dirname -- "$state_file")"
+  if [[ ! -s "$state_file" ]] || ! jq -e --arg gen "$generation" --arg rev "$settled_revision" '
+      .generation==$gen and .settled_revision==$rev and (.since|type=="number")
+    ' "$state_file" >/dev/null 2>&1; then
+    jq -nc --arg gen "$generation" --arg rev "$settled_revision" --argjson since "$now" \
+      '{generation:$gen,settled_revision:$rev,since:$since}' >"$state_file"
+    return 1
+  fi
+  local since
+  since=$(jq -er '.since' "$state_file")
+  (( now - since >= required ))
+}
+
+# Prints launch | wait-unsettled | wait-quiet | launch-grace.
+# Return 0 only for launch / launch-grace. Same-generation is not a release upgrade.
+# sixth arg is optional grace sidecar path; when omitted, wait forever for settlement.
+capability_release_gate() {
+  local context=$1
+  local target_generation=$2
+  local checkpoint_generation=$3
+  local now=$4
+  local state_file=$5
+  local grace_file=${6:-}
+  if [[ -z "$target_generation" ]]; then
+    echo wait-unsettled
+    return 1
+  fi
+  if [[ "$target_generation" == "$checkpoint_generation" ]]; then
+    echo launch
+    return 0
+  fi
+  if pr_children_settled_for_generation "$context" "$target_generation"; then
+    local n_pr
+    n_pr=$(pr_active_children_json "$context" | jq 'length')
+    if [[ "$n_pr" -eq 0 ]]; then
+      echo launch
+      return 0
+    fi
+    local rev
+    rev=$(pr_children_settled_revision "$context")
+    if ! pr_quiet_elapsed "$state_file" "$target_generation" "$rev" "$now"; then
+      echo wait-quiet
+      return 1
+    fi
+    echo launch
+    return 0
+  fi
+  if [[ -n "$grace_file" ]] && pr_release_grace_elapsed "$grace_file" "$target_generation" "$now"; then
+    echo launch-grace
+    return 0
+  fi
+  echo wait-unsettled
+  return 1
+}
+
+pr_release_grace_elapsed() {
+  local state_file=$1
+  local generation=$2
+  local now=${3:-}
+  if [[ -z "$now" ]]; then
+    now=$(date +%s)
+  fi
+  local required=${PR_RELEASE_GRACE_SECONDS:-3600}
+  mkdir -p "$(dirname -- "$state_file")"
+  if [[ ! -s "$state_file" ]] || ! jq -e --arg gen "$generation" '
+      .generation==$gen and (.since|type=="number")
+    ' "$state_file" >/dev/null 2>&1; then
+    jq -nc --arg gen "$generation" --argjson since "$now" \
+      '{generation:$gen,since:$since}' >"$state_file"
+    return 1
+  fi
+  local since
+  since=$(jq -er '.since' "$state_file")
+  (( now - since >= required ))
+}
+
+pr_unsettled_units() {
+  local context=$1
+  local required_generation=$2
+  jq -r --arg gen "$required_generation" '
+    .data.relations.children[]?
+      | select((.lifecycle // "active") != "completed")
+      | select((.agent // "") == "pr-maintainer")
+      | select(
+          (.running == true)
+          or (.active_iteration == true)
+          or ((.observation.generation // "") != $gen)
+          or ((.processed.input_fingerprint // "") == "")
+          or ((.processed.input_fingerprint // "") != (.observation.input_fingerprint // ""))
+        )
+      | .unit
+  ' <<<"$context"
+}
+
+# Sorted critical-cleared revisions of direct PR children. Used by
+# capability-observe so a verified P0/P1 clear wakes only the parent cap.
+capability_critical_digest() {
+  local context=$1
+  local scope_root=$2
+  local unit rev path
+  local lines=""
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    path="$scope_root/.systemd-ops/operations/$unit/state/critical-cleared.json"
+    rev=""
+    if [[ -r "$path" ]]; then
+      rev=$(jq -r '.revision // empty' "$path" 2>/dev/null || true)
+    fi
+    lines+="$unit	$rev"$'\n'
+  done < <(jq -r '
+    .data.relations.children[]?
+      | select((.lifecycle // "active") != "completed")
+      | select((.agent // "") == "pr-maintainer")
+      | .unit
+  ' <<<"$context")
+  printf '%s' "$lines" | sha256sum | cut -d' ' -f1
+}

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCOPE_ROOT=${SCOPE_ROOT:-/home/sf/workspace/oh-my-pi}
+SYSTEMD_OPS_BIN=${SYSTEMD_OPS_BIN:-/home/sf/.local/bin/systemd-ops}
+RUNTIME_STEM=${RUNTIME_STEM:-managed-omp-runtime-integrator}
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+"$SYSTEMD_OPS_BIN" --json --manager user --scope-root "$SCOPE_ROOT" scope show >"$tmp"
+
+errors=()
+
+while IFS= read -r unit; do
+  [[ -n "$unit" ]] || continue
+  agent=$(jq -r --arg unit "$unit" '.data.owned[] | select(.unit==$unit) | .automation.agent // empty' "$tmp")
+  [[ "$agent" == capability-maintainer ]] || errors+=("$unit is a direct Runtime child but agent is '$agent'")
+done < <(jq -r --arg rt "$RUNTIME_STEM" '.data.owned[] | select((.automation.parent // null)==$rt) | select((.automation.lifecycle.status // "active") != "completed") | .unit' "$tmp")
+
+while IFS= read -r unit; do
+  [[ -n "$unit" ]] || continue
+  tag_count=$(jq -r --arg unit "$unit" '.data.owned[] | select(.unit==$unit) | [.tags[]? | select(startswith("capability:"))] | length' "$tmp")
+  branch_count=$(jq -r --arg unit "$unit" '.data.owned[] | select(.unit==$unit) | [.tags[]? | select(startswith("branch:"))] | length' "$tmp")
+  [[ "$tag_count" == 1 ]] || errors+=("$unit requires exactly one capability tag")
+  [[ "$branch_count" == 1 ]] || errors+=("$unit requires exactly one branch tag")
+done < <(jq -r --arg rt "$RUNTIME_STEM" '.data.owned[] | select((.automation.parent // null)==$rt) | select(.automation.agent=="capability-maintainer") | .unit' "$tmp")
+
+duplicate_caps=$(jq -r --arg rt "$RUNTIME_STEM" '[.data.owned[] | select((.automation.parent // null)==$rt) | (.tags // [])[]? | select(startswith("capability:"))] | group_by(.)[] | select(length > 1) | .[0]' "$tmp")
+while IFS= read -r tag; do
+  [[ -n "$tag" ]] && errors+=("capability $tag has more than one Runtime owner")
+done <<<"$duplicate_caps"
+
+duplicate_branches=$(jq -r --arg rt "$RUNTIME_STEM" '[.data.owned[] | select((.automation.parent // null)==$rt) | (.tags // [])[]? | select(startswith("branch:"))] | group_by(.)[] | select(length > 1) | .[0]' "$tmp")
+while IFS= read -r tag; do
+  [[ -n "$tag" ]] && errors+=("branch $tag has more than one Runtime owner")
+done <<<"$duplicate_branches"
+
+if ((${#errors[@]})); then
+  printf '%s\n' "${errors[@]}" >&2
+  exit 4
+fi
+
+jq -c --arg rt "$RUNTIME_STEM" '{
+  reconciled:true,
+  direct_capabilities:([.data.owned[]
+    | select((.automation.parent // null)==$rt)
+    | select((.automation.lifecycle.status // "active") != "completed")] | length),
+  owned:(.data.owned|length)
+}' "$tmp"

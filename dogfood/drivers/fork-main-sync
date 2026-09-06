@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo=can1357/oh-my-pi
+fork=atacolak/oh-my-pi
+upstream_sha=$(/home/sf/.local/bin/gh api "repos/$repo/git/ref/heads/main" --jq '.object.sha')
+fork_sha=$(/home/sf/.local/bin/gh api "repos/$fork/git/ref/heads/main" --jq '.object.sha')
+
+if [[ "$fork_sha" == "$upstream_sha" ]]; then
+  exit 0
+fi
+
+comparison=$(/home/sf/.local/bin/gh api "repos/$repo/compare/$fork_sha...$upstream_sha" --jq '.status')
+if [[ "$comparison" != ahead && "$comparison" != identical ]]; then
+  echo "fork/main diverged from upstream/main: $comparison" >&2
+  exit 3
+fi
+
+/home/sf/.local/bin/gh api --method PATCH "repos/$fork/git/refs/heads/main" \
+  -f sha="$upstream_sha" -F force=false >/dev/null
+printf 'advanced fork/main %s -> %s\n' "$fork_sha" "$upstream_sha"

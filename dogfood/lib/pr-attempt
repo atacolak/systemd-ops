@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# OMP-domain PR transactional attempts. Sourced, never executed.
+# Durable progress is fork/$HEAD_BRANCH. Scratch worktrees are disposable.
+
+PR_ATTEMPT_ROOT=${PR_ATTEMPT_ROOT:-/home/sf/workspace/worktrees/omp-automation}
+PR_FAILURE_BUDGET=${PR_FAILURE_BUDGET:-2}
+
+pr_attempt_path() {
+  local iteration=${1:?}
+  printf '%s/%s/%s\n' "$PR_ATTEMPT_ROOT" "$OPERATION_STEM" "$iteration"
+}
+
+pr_attempt_base_repo() {
+  if [[ -n "${GIT_BASE:-}" ]]; then
+    printf '%s\n' "$GIT_BASE"
+    return 0
+  fi
+  local bound=${BOUND_WORKTREE:-${WORKTREE:-}}
+  if [[ -n "$bound" && ( -d "$bound/.git" || -f "$bound/.git" ) ]]; then
+    git -C "$bound" rev-parse --path-format=absolute --git-common-dir 2>/dev/null \
+      | sed 's|/\.git$||'
+    return 0
+  fi
+  printf '%s\n' "$SCOPE_ROOT"
+}
+
+create_pr_attempt() {
+  local branch=$1
+  local iteration=$2
+  local base path start
+  base=$(pr_attempt_base_repo) || return 1
+  git -C "$base" fetch --quiet fork "$branch" || return 1
+  start=$(git -C "$base" rev-parse "fork/$branch") || return 1
+  ATTEMPT_START_HEAD=$start
+  path=$(pr_attempt_path "$iteration")
+  mkdir -p "$(dirname -- "$path")"
+  if [[ -e "$path" ]]; then
+    echo "attempt path already exists: $path" >&2
+    return 1
+  fi
+  git -C "$base" worktree add --detach "$path" "$start" >/dev/null || return 1
+  ATTEMPT_WORKTREE=$path
+  export ATTEMPT_WORKTREE ATTEMPT_START_HEAD
+  printf '%s\n' "$path"
+}
+
+attempt_dirty_files() {
+  local tree=${1:-$ATTEMPT_WORKTREE}
+  git -C "$tree" status --porcelain=v1 --untracked-files=normal
+}
+
+log_pr_attempt_aftermath() {
+  local kind=$1
+  local code=$2
+  local tree=${ATTEMPT_WORKTREE:-}
+  local start=${ATTEMPT_START_HEAD:-unknown}
+  local final=missing
+  local dirty="" n=0
+  if [[ -n "$tree" && ( -d "$tree/.git" || -f "$tree/.git" ) ]]; then
+    final=$(git -C "$tree" rev-parse HEAD 2>/dev/null || echo missing)
+    dirty=$(attempt_dirty_files "$tree" || true)
+    n=$(printf '%s' "$dirty" | grep -c . || true)
+  fi
+  echo "PR #${PR_NUMBER:-?} attempt ${iteration_id:-unknown}"
+  echo "result: $kind (exit $code)"
+  echo "starting fork head: $start"
+  echo "final attempt HEAD: $final"
+  if [[ "$final" != "$start" && "$final" != missing ]]; then
+    echo "attempt HEAD changed; unpushed SHA $final not resumed"
+  fi
+  echo "dirty files: $n"
+  if [[ -n "$dirty" ]]; then
+    printf '%s\n' "$dirty" | sed 's/^/  /'
+  fi
+  echo "uncommitted attempt discarded"
+}
+
+dispose_pr_attempt() {
+  local tree=${ATTEMPT_WORKTREE:-}
+  [[ -n "$tree" ]] || return 0
+  local base
+  base=$(pr_attempt_base_repo) || true
+  rm -rf "$tree"
+  if [[ -n "$base" && ( -d "$base/.git" || -f "$base/.git" ) ]]; then
+    git -C "$base" worktree prune >/dev/null 2>&1 || true
+  fi
+  ATTEMPT_WORKTREE=""
+}
+
+failure_budget_file() {
+  printf '%s\n' "$STATE_DIR/failure-budget.json"
+}
+
+failure_budget_count() {
+  local input=$1
+  local f
+  f=$(failure_budget_file)
+  if [[ ! -r "$f" ]]; then
+    echo 0
+    return 0
+  fi
+  jq -er --arg fp "$input" 'if .input_fingerprint==$fp then (.failures // 0) else 0 end' "$f"
+}
+
+record_attempt_failure() {
+  local input=$1
+  local kind=$2
+  local f n
+  f=$(failure_budget_file)
+  mkdir -p "$STATE_DIR"
+  n=$(failure_budget_count "$input")
+  n=$((n + 1))
+  jq -nc --arg fp "$input" --argjson n "$n" --arg kind "$kind" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{version:1,input_fingerprint:$fp,failures:$n,last_kind:$kind,last_at:$at}' >"$f"
+  printf '%s\n' "$n"
+}
+
+clear_failure_budget() {
+  rm -f "$(failure_budget_file)"
+}
+
+park_pr_input() {
+  local input=$1
+  local kind=$2
+  local summary="PR parked after ${PR_FAILURE_BUDGET} identical $kind failures"
+  mark_processed "$input" blocked || true
+  record_blocker semantic-blocked 0 "$summary" "${iteration_id:-}" parent "$input" || true
+}

@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "os::linux-apis"]
 authors = ["systemd-ops contributors"]
 # The published crate is the buildable source and its documentation.
 # Live suites, GitHub workflows, and the OMP adapter live in git.
-exclude = ["/tests", "/.github", "/omp"]
+exclude = ["/tests", "/.github", "/omp", "/dogfood"]
 
 [lib]
 name = "systemd_ops"

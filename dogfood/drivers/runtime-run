@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+OPERATION_STEM=managed-omp-runtime-integrator
+WORKTREE=${WORKTREE:-/home/sf/worktrees/omp/runtime}
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+SCOPE_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+STATE_DIR="$SCOPE_ROOT/.systemd-ops/operations/$OPERATION_STEM/state"
+
+RECONCILE_TOOL=${RECONCILE_TOOL:-$SCOPE_ROOT/.systemd-ops/drivers/runtime-reconcile}
+
+
+SYSTEMD_OPS_BIN=${SYSTEMD_OPS_BIN:-/home/sf/.local/bin/systemd-ops}
+OMP_BIN=${OMP_BIN:-/home/sf/.local/bin/omp-policy}
+AGENT_CWD=${AGENT_CWD:-/home/sf/worlds/automation-agents}
+MAX_INTELLIGENT_PASSES=${MAX_INTELLIGENT_PASSES:-3}
+
+export SYSTEMD_OPS_SCOPE_ROOT="$SCOPE_ROOT"
+export SYSTEMD_OPS_OPERATION="$OPERATION_STEM"
+export PATH="/home/sf/.bun/bin:/home/sf/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+# shellcheck source=../../lib/automation-wrapper
+source "$SCOPE_ROOT/.systemd-ops/lib/automation-wrapper"
+
+ensure_clean_worktree runtime || exit $?
+
+$RECONCILE_TOOL >/dev/null || exit $?
+upstream_generation=$(resolve_target_generation) || exit $?
+
+
+current_input=$(observe_input) || exit $?
+if input_is_processed "$current_input"; then
+  exit 0
+fi
+wake_input=$current_input
+
+
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+exec 9>"$STATE_DIR/.wake.lock"
+
+if ! flock -n 9; then
+  exit 0
+fi
+
+passes=0
+while (( passes < MAX_INTELLIGENT_PASSES )); do
+  $RECONCILE_TOOL >/dev/null || exit $?
+  upstream_generation=$(resolve_target_generation) || exit $?
+
+  context=$(automation_context_json) || exit $?
+  current_input=$(observe_input) || exit $?
+  if input_is_processed "$current_input"; then
+    exit 0
+  fi
+  wake_input=$current_input
+
+
+
+  child_revision_before=$(child_revision_digest "$context") || exit $?
+  ready=0
+  blocked=0
+  capability_sources_ready_for_generation "$context" "$upstream_generation" && ready=1
+  capability_sources_have_blocker "$context" && blocked=1
+  if [[ $ready -ne 1 && $blocked -ne 1 ]]; then
+    echo "direct capabilities are not all READY for $upstream_generation; leaving runtime stale" >&2
+    exit 0
+  fi
+
+  start_json=$(ops_bound operator iteration-start --unit "$OPERATION_STEM") || exit $?
+  iteration_id=$(jq -er '.data.iteration_id' <<<"$start_json") || exit $?
+  passes=$((passes + 1))
+
+  if [[ $ready -eq 1 ]]; then
+    prompt_mode="Every active direct capability is semantically READY for this generation. Compose a truthful runtime only from those consumable capability outputs. PRs are not Runtime sources."
+  else
+    prompt_mode="A direct capability is semantically BLOCKED. Attempt allowed machine-level recovery. If the local capability problem remains, report outcome=blocked with route=lead. Do not compose or mutate fork/runtime."
+  fi
+
+
+
+
+  "$OMP_BIN" -p --agent runtime-maintainer --agent-cwd "$AGENT_CWD" \
+    --cwd "$WORKTREE" --approval-mode yolo --max-time 30m \
+    "Repository: atacolak/oh-my-pi
+Runtime branch: runtime
+Runtime worktree: $WORKTREE
+Operation stem: $OPERATION_STEM
+Canonical integration metadata: $WORKTREE/README.md
+Required target generation: $upstream_generation
+Direct sources are capability-maintainer children only.
+
+Call automation_report with outcome=ready or outcome=blocked before exit.
+BLOCKED reports require route=self|parent|lead. If a direct capability is semantically BLOCKED and this is a machine-level composition stop, use route=lead.
+Reconcile the integration graph first. $prompt_mode Perform exactly one runtime maintenance pass, then exit."
+
+
+  omp_code=$?
+
+  finish_json=$(finish_iteration "$omp_code")
+  finish_code=$?
+  if [[ $omp_code -ne 0 ]]; then
+    record_blocker iteration-failed "$omp_code" "intelligent iteration failed with exit $omp_code" "$iteration_id" parent || true
+    exit "$omp_code"
+  fi
+  if [[ $finish_code -ne 0 ]]; then
+    record_blocker iteration-failed "$finish_code" "iteration-finish failed with exit $finish_code" "$iteration_id" parent || true
+    exit "$finish_code"
+  fi
+  reconsolidated=$(jq -r '.data.reconsolidated // false' <<<"$finish_json") || exit $?
+  if [[ "$reconsolidated" != true ]]; then
+    echo "automation_report is required before a successful integrator exit" >&2
+    record_blocker contract-failure 3 "automation_report is required before a successful integrator exit" "$iteration_id" parent || true
+    exit 3
+  fi
+
+  outcome=$(report_outcome_from_finish "$finish_json")
+  route=$(report_route_from_finish "$finish_json")
+  post_context=$(automation_context_json) || exit $?
+  child_revision_after=$(child_revision_digest "$post_context") || exit $?
+  post_input=$(observe_input) || exit $?
+  if [[ "$child_revision_after" != "$child_revision_before" ]]; then
+    echo "child input changed during runtime pass; reevaluating" >&2
+    continue
+  fi
+
+  if [[ "$outcome" == blocked ]]; then
+    summary=$(jq -r '.data.operator.headline // .data.operator.body // "blocked"' <<<"$finish_json")
+    if [[ $ready -ne 1 ]]; then
+      route=lead
+    fi
+    mark_processed "$post_input" blocked || exit $?
+    record_blocker semantic-blocked 0 "$summary" "$iteration_id" "${route:-lead}" "$post_input" || true
+    exit 0
+  fi
+
+  if [[ "$outcome" != ready ]]; then
+    echo "automation_report outcome must be ready or blocked" >&2
+    record_blocker contract-failure 3 "automation_report outcome must be ready or blocked" "$iteration_id" lead "$post_input" || true
+    exit 3
+  fi
+  if ! capability_sources_ready_for_generation "$post_context" "$upstream_generation"; then
+    echo "an active capability is not READY; refusing composition checkpoint" >&2
+    record_blocker postcondition-failed 4 "an active capability is not READY; refusing composition checkpoint" "$iteration_id" lead "$post_input" || true
+    exit 4
+  fi
+  post_head=$(git -C "$WORKTREE" rev-parse HEAD) || exit $?
+  post_upstream=$(resolve_target_generation) || exit $?
+  if [[ "$post_upstream" != "$upstream_generation" ]]; then
+    echo "target generation advanced during runtime maintenance; refusing a stale checkpoint" >&2
+    record_blocker stale-generation 4 "target generation advanced during runtime maintenance; refusing a stale checkpoint" "$iteration_id" lead "$post_input" || true
+    exit 4
+  fi
+
+  mark_processed "$post_input" ready || exit $?
+  write_output_checkpoint "$post_input" "$upstream_generation" "$post_head" || {
+    echo "structured checkpoint write failed" >&2
+    record_blocker postcondition-failed 4 "structured checkpoint write failed" "$iteration_id" lead "$post_input" || true
+    exit 4
+  }
+
+  exit 0
+
+done
+
+echo "child input kept changing; leaving processed fingerprint stale" >&2
+exit 0

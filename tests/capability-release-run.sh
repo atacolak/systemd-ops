@@ -4,10 +4,11 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${SYSTEMD_OPS_BIN:-$ROOT/target/debug/systemd-ops}
-SOURCE_DRIVER=${SOURCE_DRIVER:-/home/sf/workspace/oh-my-pi/.systemd-ops/drivers/capability-run}
-SOURCE_LIB=${SOURCE_LIB:-/home/sf/workspace/oh-my-pi/.systemd-ops/lib/automation-wrapper}
-SETTLE_LIB=${SETTLE_LIB:-/home/sf/workspace/oh-my-pi/.systemd-ops/lib/pr-settlement}
-REVIEW_LIB=${REVIEW_LIB:-/home/sf/workspace/oh-my-pi/.systemd-ops/lib/pr-review-state}
+DOGFOOD_ROOT=${DOGFOOD_ROOT:-$ROOT/dogfood}
+SOURCE_DRIVER=${SOURCE_DRIVER:-$DOGFOOD_ROOT/drivers/capability-run}
+SOURCE_LIB=${SOURCE_LIB:-$DOGFOOD_ROOT/lib/automation-wrapper}
+SETTLE_LIB=${SETTLE_LIB:-$DOGFOOD_ROOT/lib/pr-settlement}
+REVIEW_LIB=${REVIEW_LIB:-$DOGFOOD_ROOT/lib/pr-review-state}
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 command -v jq >/dev/null || fail "jq required"

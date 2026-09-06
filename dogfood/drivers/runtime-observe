@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUNTIME_WORKTREE=${SYSTEMD_OPS_CWD:?SYSTEMD_OPS_CWD is required}
+SCOPE_ROOT=${SYSTEMD_OPS_SCOPE_ROOT:?SYSTEMD_OPS_SCOPE_ROOT is required}
+SYSTEMD_OPS_BIN=${SYSTEMD_OPS_BIN:-/home/sf/.local/bin/systemd-ops}
+README_FILE="$RUNTIME_WORKTREE/README.md"
+GEN_FILE="$SCOPE_ROOT/.systemd-ops/operations/managed-omp-release-watch/state/generation.json"
+
+[[ -r "$README_FILE" ]] || { echo "missing runtime metadata: $README_FILE" >&2; exit 2; }
+[[ -r "$GEN_FILE" ]] || { echo "missing $GEN_FILE" >&2; exit 4; }
+target_generation=$(jq -er '.target_commit' "$GEN_FILE")
+
+runtime_head=$(git -C "$RUNTIME_WORKTREE" rev-parse HEAD)
+runtime_remote=$(git -C "$RUNTIME_WORKTREE" ls-remote --exit-code fork refs/heads/runtime | cut -f1)
+scope_json=$("$SYSTEMD_OPS_BIN" --json --manager user --scope-root "$SCOPE_ROOT" --cwd "$RUNTIME_WORKTREE" scope show)
+
+world=$(jq -cS \
+  --arg target "$target_generation" \
+  --arg runtime_head "$runtime_head" \
+  --arg runtime_remote "$runtime_remote" \
+  '{
+    target:$target,
+    runtime:{local:$runtime_head,remote:$runtime_remote},
+    capabilities:[.data.owned[]
+      | select((.automation.parent // null)=="managed-omp-runtime-integrator")
+      | select((.automation.agent // "")=="capability-maintainer")
+      | select((.automation.lifecycle.status // "active") != "completed")
+      | {
+          unit,
+          lifecycle:(.automation.lifecycle.status // "active"),
+          generation:(.automation.checkpoint.generation // null),
+          output_revision:(.automation.checkpoint.output_revision // null)
+        }] | sort_by(.unit)
+  }' <<<"$scope_json" | sha256sum | cut -d' ' -f1)
+
+jq -cn --arg world "$world" --arg generation "$target_generation" \
+  '{version:1,world_fingerprint:$world,generation:$generation}'

@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# OMP PR-domain Codex severity helpers. Sourced, never executed.
+# Live Codex findings are review-thread comments from chatgpt-codex-connector
+# whose first line contains: ![PN Badge](https://img.shields.io/badge/PN-...)
+
+codex_badge_severity() {
+  local body=$1
+  if [[ $body =~ badge/P([0-3])- ]]; then
+    printf 'P%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+# extract_codex_severity THREADS_JSON HEAD_OID
+# THREADS_JSON is a JSON array of GraphQL reviewThreads.nodes.
+extract_codex_severity() {
+  local threads_json=$1
+  local head=$2
+  jq -nc --argjson threads "$threads_json" --arg head "$head" '
+    def comments:
+      if (.comments.nodes | type) == "array" then .comments.nodes
+      elif (.comments | type) == "array" then .comments
+      else []
+      end;
+    def finding_id:
+      .id // empty;
+    def comment_commit:
+      (.commit.oid // .commit // "") | tostring;
+    def badge:
+      (.body // "") | capture("badge/P(?<sev>[0-3])-")? | .sev;
+    ($threads // [])
+    | map(select((.isResolved // false) != true))
+    | map(select((.isOutdated // false) != true))
+    | map(
+        . as $thread
+        | (comments
+           | map(select((.author.login // .author // "") == "chatgpt-codex-connector"))
+           | map(select(comment_commit == $head or comment_commit == ($head[0:12])))
+           | map(badge)
+           | map(select(. != null))
+           | .[0]
+          ) as $sev
+        | select($sev != null)
+        | {id: ($thread | finding_id), sev: ("P" + $sev)}
+      )
+    | {
+        head: $head,
+        p0: [ .[] | select(.sev=="P0") | .id ] | unique | sort,
+        p1: [ .[] | select(.sev=="P1") | .id ] | unique | sort,
+        p2: [ .[] | select(.sev=="P2") | .id ] | unique | sort,
+        p3: [ .[] | select(.sev=="P3") | .id ] | unique | sort
+      }
+    | .review_revision = (
+        [.head, (.p0 | join(",")), (.p1 | join(",")), (.p2 | join(",")), (.p3 | join(","))]
+        | join("|")
+      )
+  '
+}
+
+codex_repair_policy() {
+  local state=$1
+  jq -er '
+    if (.p0 | length) > 0 then "repair-p0"
+    elif (.p1 | length) > 0 then "repair-p1"
+    elif (.p2 | length) > 0 then "repair-p2"
+    elif (.p3 | length) > 0 then "ignore-p3"
+    else "none"
+    end
+  ' <<<"$state"
+}
+
+# Record / clear OMP-domain critical sidecars. Not systemd-ops core state.
+# pending: current-head has P0/P1. cleared: previous pending existed, current
+# head Codex review has zero P0/P1. revision changes once per episode.
+record_codex_critical_state() {
+  local state_dir=$1
+  local severity_json=$2
+  local pending="$state_dir/critical-pending.json"
+  local cleared="$state_dir/critical-cleared.json"
+  mkdir -p "$state_dir"
+  local head p0n p1n review_revision
+  head=$(jq -er '.head' <<<"$severity_json")
+  p0n=$(jq -er '.p0 | length' <<<"$severity_json")
+  p1n=$(jq -er '.p1 | length' <<<"$severity_json")
+  review_revision=$(jq -er '.review_revision' <<<"$severity_json")
+  if (( p0n + p1n > 0 )); then
+    jq -nc --argjson sev "$severity_json" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+      {
+        version: 1,
+        head: $sev.head,
+        review_revision: $sev.review_revision,
+        p0: $sev.p0,
+        p1: $sev.p1,
+        recorded_at: $at
+      }
+    ' >"$pending"
+    return 0
+  fi
+  if [[ ! -r "$pending" ]]; then
+    return 0
+  fi
+  local pending_head pending_rev
+  pending_head=$(jq -r '.head // empty' "$pending")
+  pending_rev=$(jq -r '.review_revision // empty' "$pending")
+  if [[ "$pending_head" == "$head" && "$pending_rev" == "$review_revision" ]]; then
+    return 0
+  fi
+  local last_rev=""
+  if [[ -r "$cleared" ]]; then
+    last_rev=$(jq -r '.revision // empty' "$cleared")
+  fi
+  local new_rev
+  new_rev=$(printf '%s\n' "$pending_head" "$head" "$review_revision" "$last_rev" | sha256sum | cut -d' ' -f1)
+  if [[ "$new_rev" == "$last_rev" ]]; then
+    rm -f "$pending"
+    return 0
+  fi
+  jq -nc --argjson sev "$severity_json" --arg pending_head "$pending_head" --arg rev "$new_rev" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    {
+      version: 1,
+      revision: $rev,
+      from_head: $pending_head,
+      head: $sev.head,
+      review_revision: $sev.review_revision,
+      p2: $sev.p2,
+      p3: $sev.p3,
+      cleared_at: $at
+    }
+  ' >"$cleared"
+  rm -f "$pending"
+}
+
+capability_has_fresh_critical_clear() {
+  local context=$1
+  local scope_root=$2
+  local checkpoint_generation=$3
+  local target_generation=$4
+  [[ "$checkpoint_generation" == "$target_generation" ]] || return 1
+  local unit path last consumed
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    path="$scope_root/.systemd-ops/operations/$unit/state/critical-cleared.json"
+    [[ -r "$path" ]] || continue
+    last=$(jq -r '.revision // empty' "$path")
+    [[ -n "$last" ]] || continue
+    consumed="$scope_root/.systemd-ops/operations/${SYSTEMD_OPS_OPERATION:-}/state/critical-consumed.json"
+    if [[ -r "$consumed" ]] && jq -e --arg unit "$unit" --arg rev "$last" '
+        (.consumed[$unit] // "") == $rev
+      ' "$consumed" >/dev/null 2>&1; then
+      continue
+    fi
+    return 0
+  done < <(jq -r '
+    .data.relations.children[]?
+      | select((.lifecycle // "active") != "completed")
+      | select((.agent // "") == "pr-maintainer")
+      | .unit
+  ' <<<"$context")
+  return 1
+}
+
+mark_critical_consumed() {
+  local context=$1
+  local scope_root=$2
+  local operation=${SYSTEMD_OPS_OPERATION:?}
+  local dest="$scope_root/.systemd-ops/operations/$operation/state/critical-consumed.json"
+  mkdir -p "$(dirname -- "$dest")"
+  local tmp unit path rev
+  tmp=$(mktemp)
+  jq -n '{consumed:{}}' >"$tmp"
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    path="$scope_root/.systemd-ops/operations/$unit/state/critical-cleared.json"
+    [[ -r "$path" ]] || continue
+    rev=$(jq -r '.revision // empty' "$path")
+    [[ -n "$rev" ]] || continue
+    jq --arg unit "$unit" --arg rev "$rev" '.consumed[$unit]=$rev' "$tmp" >"$tmp.next"
+    mv "$tmp.next" "$tmp"
+  done < <(jq -r '
+    .data.relations.children[]?
+      | select((.lifecycle // "active") != "completed")
+      | select((.agent // "") == "pr-maintainer")
+      | .unit
+  ' <<<"$context")
+  mv "$tmp" "$dest"
+}

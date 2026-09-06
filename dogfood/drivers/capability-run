@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+if [[ $# -ne 3 ]]; then
+  echo "usage: capability-maintainer-run BRANCH OPERATION_STEM WORKTREE" >&2
+  exit 2
+fi
+
+BRANCH=$1
+OPERATION_STEM=$2
+WORKTREE=$3
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+SCOPE_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+OPERATION_HOME="$SCOPE_ROOT/.systemd-ops/operations/$OPERATION_STEM"
+STATE_DIR="$OPERATION_HOME/state"
+
+
+SYSTEMD_OPS_BIN=${SYSTEMD_OPS_BIN:-/home/sf/.local/bin/systemd-ops}
+OMP_BIN=${OMP_BIN:-/home/sf/.local/bin/omp-policy}
+AGENT_CWD=${AGENT_CWD:-/home/sf/worlds/automation-agents}
+MAX_INTELLIGENT_PASSES=${MAX_INTELLIGENT_PASSES:-3}
+
+export SYSTEMD_OPS_SCOPE_ROOT="$SCOPE_ROOT"
+export SYSTEMD_OPS_OPERATION="$OPERATION_STEM"
+export PATH="/home/sf/.bun/bin:/home/sf/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+# shellcheck source=../lib/automation-wrapper
+source "$SCOPE_ROOT/.systemd-ops/lib/automation-wrapper"
+# shellcheck source=../lib/pr-settlement
+source "$SCOPE_ROOT/.systemd-ops/lib/pr-settlement"
+# shellcheck source=../lib/pr-review-state
+source "$SCOPE_ROOT/.systemd-ops/lib/pr-review-state"
+
+ensure_clean_worktree "$BRANCH" || exit $?
+git -C "$WORKTREE" fetch --quiet fork main || true
+upstream_generation=$(resolve_target_generation) || exit $?
+
+
+current_input=$(observe_input) || exit $?
+if input_is_processed "$current_input"; then
+  exit 0
+fi
+wake_input=$current_input
+
+
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+exec 9>"$STATE_DIR/.wake.lock"
+
+if ! flock -n 9; then
+  exit 0
+fi
+
+passes=0
+while (( passes < MAX_INTELLIGENT_PASSES )); do
+  upstream_generation=$(resolve_target_generation) || exit $?
+
+  context=$(automation_context_json) || exit $?
+  current_input=$(observe_input) || exit $?
+  if input_is_processed "$current_input"; then
+    exit 0
+  fi
+  wake_input=$current_input
+
+
+
+  child_revision_before=$(capability_child_revision_digest "$context") || exit $?
+  pr_child_revision_before=$(pr_children_settled_revision "$context") || exit $?
+
+  checkpoint_generation=""
+  if [[ -r "$STATE_DIR/checkpoint.json" ]]; then
+    checkpoint_generation=$(jq -r '.generation // empty' "$STATE_DIR/checkpoint.json")
+  fi
+  now=${PR_SETTLE_NOW:-$(date +%s)}
+  critical_fast=0
+  gate=""
+  if capability_has_fresh_critical_clear "$context" "$SCOPE_ROOT" "$checkpoint_generation" "$upstream_generation"; then
+    if pr_children_running "$context"; then
+      echo "critical repair is pending but a child PR is still mutating; leaving capability stale" >&2
+      exit 0
+    fi
+    critical_fast=1
+  else
+    gate=$(capability_release_gate "$context" "$upstream_generation" "$checkpoint_generation" "$now" "$STATE_DIR/pr-quiet.json" "$STATE_DIR/pr-release-grace.json") || true
+    case "$gate" in
+      launch|launch-grace) ;;
+      wait-unsettled)
+        echo "PR children are not settled for $upstream_generation; leaving capability stale" >&2
+        exit 0
+        ;;
+      wait-quiet)
+        echo "PR children settled for $upstream_generation but quiet window is open; leaving capability stale" >&2
+        exit 0
+        ;;
+      *)
+        echo "PR children are not settled for $upstream_generation; leaving capability stale" >&2
+        exit 0
+        ;;
+    esac
+  fi
+
+  start_json=$(ops_bound operator iteration-start --unit "$OPERATION_STEM") || exit $?
+  iteration_id=$(jq -er '.data.iteration_id' <<<"$start_json") || exit $?
+  passes=$((passes + 1))
+
+  extra_prompt=""
+  if [[ $critical_fast -eq 1 ]]; then
+    extra_prompt="A verified P0/P1 repair was confirmed by current-head Codex rereview (critical-cleared). Inspect that PR change, integrate only the needed local correctness repair, verify, and checkpoint. Do not blindly merge. Other capabilities must not rerun."
+  elif [[ "$gate" == launch-grace ]]; then
+    unsettled=$(pr_unsettled_units "$context" "$upstream_generation" | tr '\n' ' ')
+    extra_prompt="Release settlement grace expired. These publication streams did not settle: ${unsettled}. Preserve local capability continuity. Use the existing known-good Capability plus target release. Only incorporate stable committed PR-branch changes you can independently verify. Do not read or consume an automation attempt worktree. Do not wait for publication automation merely because it is operationally stuck."
+  elif [[ -n "$checkpoint_generation" && "$checkpoint_generation" != "$upstream_generation" ]]; then
+    extra_prompt="This is a release-generation pass. Consume the target generation, the known-good local capability, and accumulated useful PR-child improvements. Do not require every PR READY. Do not blindly merge every PR head."
+  fi
+
+  "$OMP_BIN" -p --agent capability-maintainer --agent-cwd "$AGENT_CWD" \
+    --cwd "$WORKTREE" --approval-mode yolo --max-time 20m \
+    "Repository: atacolak/oh-my-pi
+Capability branch: $BRANCH
+Operation stem: $OPERATION_STEM
+Worktree: $WORKTREE
+Required target generation: $upstream_generation
+
+Call automation_report with outcome=ready or outcome=blocked before exit.
+BLOCKED reports require route=self|parent.
+PR children are publication/review streams, not semaphores. Maintain the local capability against the target generation even if a child PR is BLOCKED. Only BLOCKED if the LOCAL capability cannot be made correct. $extra_prompt Perform exactly one capability maintenance pass, then exit."
+
+  omp_code=$?
+
+  finish_json=$(finish_iteration "$omp_code")
+  finish_code=$?
+  if [[ $omp_code -ne 0 ]]; then
+    record_blocker iteration-failed "$omp_code" "intelligent iteration failed with exit $omp_code" "$iteration_id" parent || true
+    exit "$omp_code"
+  fi
+  if [[ $finish_code -ne 0 ]]; then
+    record_blocker iteration-failed "$finish_code" "iteration-finish failed with exit $finish_code" "$iteration_id" parent || true
+    exit "$finish_code"
+  fi
+  reconsolidated=$(jq -r '.data.reconsolidated // false' <<<"$finish_json") || exit $?
+  if [[ "$reconsolidated" != true ]]; then
+    echo "automation_report is required before a successful maintainer exit" >&2
+    record_blocker contract-failure 3 "automation_report is required before a successful maintainer exit" "$iteration_id" parent || true
+    exit 3
+  fi
+
+  outcome=$(report_outcome_from_finish "$finish_json")
+  route=$(report_route_from_finish "$finish_json")
+  post_context=$(automation_context_json) || exit $?
+  child_revision_after=$(capability_child_revision_digest "$post_context") || exit $?
+  pr_child_revision_after=$(pr_children_settled_revision "$post_context") || exit $?
+
+  post_upstream_generation=$(resolve_target_generation) || exit $?
+
+  post_input=$(observe_input) || exit $?
+
+  if [[ "$child_revision_after" != "$child_revision_before" || "$pr_child_revision_after" != "$pr_child_revision_before" ]]; then
+    echo "child input changed during capability pass; reevaluating" >&2
+    continue
+  fi
+
+  if [[ "$outcome" == blocked ]]; then
+    summary=$(jq -r '.data.operator.headline // .data.operator.body // "blocked"' <<<"$finish_json")
+    mark_processed "$post_input" blocked || exit $?
+    record_blocker semantic-blocked 0 "$summary" "$iteration_id" "${route:-self}" "$post_input" || true
+    exit 0
+  fi
+
+  if [[ "$outcome" != ready ]]; then
+    echo "automation_report outcome must be ready or blocked" >&2
+    record_blocker contract-failure 3 "automation_report outcome must be ready or blocked" "$iteration_id" parent "$post_input" || true
+    exit 3
+  fi
+
+  if [[ "$post_upstream_generation" != "$upstream_generation" ]]; then
+    echo "target generation advanced during maintenance; refusing a stale checkpoint" >&2
+    record_blocker stale-generation 4 "target generation advanced during maintenance; refusing a stale checkpoint" "$iteration_id" parent "$post_input" || true
+    exit 4
+  fi
+
+  post_head=$(git -C "$WORKTREE" rev-parse HEAD) || exit $?
+  if ! git -C "$WORKTREE" merge-base --is-ancestor "$upstream_generation" "$post_head"; then
+    echo "capability branch did not process required target generation $upstream_generation" >&2
+    record_blocker postcondition-failed 4 "capability branch did not process required target generation $upstream_generation" "$iteration_id" parent "$post_input" || true
+    exit 4
+  fi
+  mark_processed "$post_input" ready || exit $?
+  write_output_checkpoint "$post_input" "$upstream_generation" "$post_head" || {
+    echo "structured checkpoint write failed" >&2
+    record_blocker postcondition-failed 4 "structured checkpoint write failed" "$iteration_id" parent "$post_input" || true
+    exit 4
+  }
+  if [[ $critical_fast -eq 1 ]]; then
+    mark_critical_consumed "$post_context" "$SCOPE_ROOT" || true
+  fi
+
+
+  notify_parent checkpoint
+  exit 0
+done
+
+echo "child input kept changing; leaving processed fingerprint stale" >&2
+exit 0

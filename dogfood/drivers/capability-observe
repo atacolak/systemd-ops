@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: capability-observe BRANCH" >&2
+  exit 2
+fi
+
+BRANCH=$1
+WORKTREE=${SYSTEMD_OPS_CWD:?SYSTEMD_OPS_CWD is required}
+export WORKTREE
+if [[ ! -d "$WORKTREE/.git" && ! -f "$WORKTREE/.git" ]]; then
+  echo "capability worktree is missing: $WORKTREE" >&2
+  exit 4
+fi
+
+SCOPE_ROOT=${SYSTEMD_OPS_SCOPE_ROOT:?SYSTEMD_OPS_SCOPE_ROOT is required}
+GEN_FILE="$SCOPE_ROOT/.systemd-ops/operations/managed-omp-release-watch/state/generation.json"
+[[ -r "$GEN_FILE" ]] || { echo "missing $GEN_FILE" >&2; exit 4; }
+target_generation=$(jq -er '.target_commit' "$GEN_FILE")
+
+local_head=$(git -C "$WORKTREE" rev-parse HEAD)
+remote_head=$(git -C "$WORKTREE" rev-parse "fork/$BRANCH")
+dirty=$(git -C "$WORKTREE" status --porcelain=v1 --untracked-files=normal | sha256sum | cut -d' ' -f1)
+
+# Include a critical-cleared digest only when a direct PR child has one.
+# Disk scan, not systemd: ordinary PR churn stays out of this fingerprint.
+critical=""
+parent=${SYSTEMD_OPS_OPERATION:-}
+if [[ -n "$parent" ]]; then
+  lines=""
+  has_clear=0
+  for auto in "$SCOPE_ROOT"/.systemd-ops/operations/*/automation.toml; do
+    [[ -r "$auto" ]] || continue
+    unit=$(basename "$(dirname -- "$auto")")
+    agent=$(awk -F ' *= *' '/^agent *=/{gsub(/"/, "", $2); print $2; exit}' "$auto")
+    par=$(awk -F ' *= *' '/^parent *=/{gsub(/"/, "", $2); print $2; exit}' "$auto")
+    [[ "$agent" == pr-maintainer && "$par" == "$parent" ]] || continue
+    rev=""
+    cleared="$SCOPE_ROOT/.systemd-ops/operations/$unit/state/critical-cleared.json"
+    if [[ -r "$cleared" ]]; then
+      rev=$(jq -r '.revision // empty' "$cleared")
+    fi
+    if [[ -n "$rev" ]]; then
+      has_clear=1
+    fi
+    lines+="$unit	$rev"$'\n'
+  done
+  if [[ $has_clear -eq 1 ]]; then
+    critical=$(printf '%s' "$lines" | sha256sum | cut -d' ' -f1)
+  fi
+fi
+
+if [[ -n "$critical" ]]; then
+  world=$(jq -cn \
+    --arg branch "$BRANCH" \
+    --arg target "$target_generation" \
+    --arg local_head "$local_head" \
+    --arg remote_head "$remote_head" \
+    --arg dirty "$dirty" \
+    --arg critical "$critical" \
+    '{branch:$branch,target:$target,local_head:$local_head,remote_head:$remote_head,dirty:$dirty,critical:$critical}' \
+    | sha256sum | cut -d' ' -f1)
+else
+  world=$(jq -cn \
+    --arg branch "$BRANCH" \
+    --arg target "$target_generation" \
+    --arg local_head "$local_head" \
+    --arg remote_head "$remote_head" \
+    --arg dirty "$dirty" \
+    '{branch:$branch,target:$target,local_head:$local_head,remote_head:$remote_head,dirty:$dirty}' \
+    | sha256sum | cut -d' ' -f1)
+fi
+jq -cn --arg world "$world" --arg generation "$target_generation" \
+  '{version:1,world_fingerprint:$world,generation:$generation}'

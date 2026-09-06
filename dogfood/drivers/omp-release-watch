@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Cheap OMP release generation watcher. No LLM.
+set -euo pipefail
+
+SCOPE_ROOT=${SYSTEMD_OPS_SCOPE_ROOT:-/home/sf/workspace/oh-my-pi}
+STATE_DIR=${STATE_DIR:-$SCOPE_ROOT/.systemd-ops/operations/managed-omp-release-watch/state}
+GEN_FILE="$STATE_DIR/generation.json"
+REPO=can1357/oh-my-pi
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+release_json=$(/home/sf/.local/bin/gh api "repos/$REPO/releases" \
+  --jq '[.[] | select(.prerelease==false and .draft==false)] | .[0] | {tag:.tag_name, target:.target_commitish}')
+release_tag=$(jq -er '.tag' <<<"$release_json")
+tag_type=$(/home/sf/.local/bin/gh api "repos/$REPO/git/ref/tags/${release_tag}" --jq '.object.type')
+if [[ "$tag_type" == tag ]]; then
+  release_commit=$(/home/sf/.local/bin/gh api "repos/$REPO/git/ref/tags/${release_tag}" --jq '.object.sha' \
+    | xargs -I{} /home/sf/.local/bin/gh api "repos/$REPO/git/tags/{}" --jq '.object.sha')
+else
+  release_commit=$(/home/sf/.local/bin/gh api "repos/$REPO/git/ref/tags/${release_tag}" --jq '.object.sha')
+fi
+[[ "$release_commit" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "could not resolve exact commit for release $release_tag" >&2
+  exit 4
+}
+
+if [[ -r "$GEN_FILE" ]]; then
+  existing=$(cat "$GEN_FILE")
+  mode=$(jq -er '.mode' <<<"$existing")
+  baseline=$(jq -er '.baseline_release_tag' <<<"$existing")
+  bootstrap=$(jq -er '.bootstrap_commit // .target_commit' <<<"$existing")
+else
+  mode=bootstrap
+  baseline=$release_tag
+  bootstrap=${BOOTSTRAP_TARGET:-}
+  [[ -n "$bootstrap" ]] || bootstrap=$(/home/sf/.local/bin/gh api "repos/$REPO/git/ref/heads/main" --jq '.object.sha')
+fi
+
+if [[ "$mode" == bootstrap && "$release_tag" == "$baseline" ]]; then
+  target=$bootstrap
+else
+  mode=release
+  target=$release_commit
+fi
+
+desired=$(jq -nc \
+  --arg mode "$mode" \
+  --arg baseline "$baseline" \
+  --arg tag "$release_tag" \
+  --arg commit "$release_commit" \
+  --arg target "$target" \
+  --arg bootstrap "$bootstrap" \
+  '{
+    version:1,
+    mode:$mode,
+    baseline_release_tag:$baseline,
+    release_tag:$tag,
+    release_commit:$commit,
+    bootstrap_commit:$bootstrap,
+    target_commit:$target
+  }')
+
+if [[ -r "$GEN_FILE" ]] && jq -e --argjson desired "$desired" '
+  .mode==$desired.mode
+  and .baseline_release_tag==$desired.baseline_release_tag
+  and .release_tag==$desired.release_tag
+  and .release_commit==$desired.release_commit
+  and .target_commit==$desired.target_commit
+' "$GEN_FILE" >/dev/null; then
+  exit 0
+fi
+
+tmp="$STATE_DIR/.generation.json.tmp.$$"
+printf '%s\n' "$desired" >"$tmp"
+chmod 600 "$tmp"
+mv -f -- "$tmp" "$GEN_FILE"
+printf 'release-watch %s tag=%s target=%s\n' "$mode" "$release_tag" "$target"
