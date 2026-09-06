@@ -233,4 +233,50 @@ write_omp "$scope/fake-omp" 'git rev-parse HEAD >"${SYSTEMD_OPS_SCOPE_ROOT}/retr
 run_pr "$scope" >/tmp/pr-attempt-fromb.out 2>/tmp/pr-attempt-fromb.err || fail "retry after push failed: $(cat /tmp/pr-attempt-fromb.err)"
 [[ $(cat "$scope/retry-head") == "$head_b" ]] || fail "retry after push started at $(cat "$scope/retry-head") want $head_b"
 
+# --- MERGED before pass: complete without a model invocation ---
+scope=$(make_scope merged-before-pass)
+mkdir -p "$scope/bin"
+cat >"$scope/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == pr && "${2:-}" == view ]]; then
+  echo MERGED
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$scope/bin/gh"
+real_bin=$BIN
+cat >"$scope/bin/systemd-ops" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+args=("\$@")
+joined=" \${args[*]} "
+if [[ "\$joined" == *" automation complete "* ]]; then
+  printf '%s\n' "\${args[*]}" >"$scope/complete-args"
+  echo '{"schema_version":1,"ok":true,"data":{"completed":true}}'
+  exit 0
+fi
+exec "$real_bin" "\${args[@]}"
+EOF
+chmod +x "$scope/bin/systemd-ops"
+write_omp "$scope/fake-omp" 'echo called >>"${SYSTEMD_OPS_SCOPE_ROOT}/agent-calls"
+"$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "should not run" --summary '\''["no"]'\'' --outcome ready >/dev/null'
+WORKTREE="$scope/user-worktree" \
+SYSTEMD_OPS_SCOPE_ROOT="$scope" \
+SYSTEMD_OPS_BIN="$scope/bin/systemd-ops" \
+OMP_BIN="$scope/fake-omp" \
+AGENT_CWD="$scope/agents" \
+UPSTREAM_GENERATION="${UPSTREAM_GENERATION:-deadbeef}" \
+PR_ATTEMPT_ROOT="$scope/attempts" \
+GIT_BASE="$scope/user-worktree" \
+GH_BIN="$scope/bin/gh" \
+"$scope/.systemd-ops/operations/$STEM/run" \
+  >/tmp/pr-attempt-merged.out 2>/tmp/pr-attempt-merged.err || fail "MERGED-before-pass wrapper failed: $(cat /tmp/pr-attempt-merged.err)"
+[[ ! -e $scope/agent-calls ]] || fail "MERGED-before-pass invoked OMP"
+[[ $(find "$scope/attempts" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l) -eq 0 ]] || fail "MERGED-before-pass created an attempt"
+grep -q 'automation complete' "$scope/complete-args" || fail "MERGED-before-pass did not complete: $(cat "$scope/complete-args" 2>/dev/null || true)"
+grep -q 'merged upstream' "$scope/complete-args" || fail "complete reason was not merged upstream"
+[[ -f $scope/user-worktree/user-dirty.txt ]] || fail "MERGED-before-pass destroyed user worktree"
+
 echo "pr-attempt ok"

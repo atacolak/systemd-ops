@@ -49,6 +49,17 @@ if input_is_processed "$current_input"; then
 fi
 wake_input=$current_input
 
+GH_BIN=${GH_BIN:-/home/sf/.local/bin/gh}
+if [[ -z "${PROOF_SKIP_GH:-}" && -x $GH_BIN ]]; then
+  pr_state=$("$GH_BIN" pr view "$PR_NUMBER" --repo can1357/oh-my-pi --json state --jq '.state') || pr_state=
+  if [[ "$pr_state" == MERGED ]]; then
+    ops automation complete --unit "$OPERATION_STEM" --reason "merged upstream" || exit $?
+    notify_parent completed
+    exit 0
+  fi
+fi
+
+
 upstream_generation=$(resolve_target_generation) || exit $?
 start_json=$(ops_bound operator iteration-start --unit "$OPERATION_STEM") || exit $?
 iteration_id=$(jq -er '.data.iteration_id' <<<"$start_json") || exit $?
@@ -167,8 +178,8 @@ clear_failure_budget
 
 notify_parent checkpoint
 
-if command -v /home/sf/.local/bin/gh >/dev/null && [[ -z "${PROOF_SKIP_GH:-}" ]]; then
-  pr_state=$(/home/sf/.local/bin/gh pr view "$PR_NUMBER" --repo can1357/oh-my-pi --json state --jq '.state') || exit $?
+if [[ -z "${PROOF_SKIP_GH:-}" && -x $GH_BIN ]]; then
+  pr_state=$("$GH_BIN" pr view "$PR_NUMBER" --repo can1357/oh-my-pi --json state --jq '.state') || exit $?
   if [[ "$pr_state" == MERGED ]]; then
     ops automation complete --unit "$OPERATION_STEM" --reason "merged upstream" || exit $?
     notify_parent completed
