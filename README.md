@@ -265,7 +265,8 @@ sudo make prefix=/usr/local install
 
 This installs `systemd-ops`, `systemd-ops-mcp`, the man page, the
 optional socket pair, the docs and the license. Packagers:
-[docs/PACKAGING.md](docs/PACKAGING.md).
+[docs/PACKAGING.md](docs/PACKAGING.md). Git (not the crates.io tarball)
+contains `dogfood/` for the OMP automation scripts the proofs load.
 
 Optional supervised MCP instance:
 

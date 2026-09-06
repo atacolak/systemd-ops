@@ -245,3 +245,9 @@ Also under consideration: the manager-wide log level (`systemctl
 log-level`, unit-less and therefore outside the current plan machinery)
 and journald maintenance (rotate, flush; vacuum deletes data and needs
 more than a precondition check).
+
+## OMP dogfood and automation semantics
+
+Tracked source for OMP automation scripts is `dogfood/{drivers,lib}` in this
+repository. Live OMP `.systemd-ops/{drivers,lib}` is a deployed copy. Tests
+must not default to the live tree.

@@ -9,7 +9,7 @@ wrong or missing for your distribution, that is a bug: please file it.
 |---|---|
 | Language | Rust 2021 |
 | Minimum toolchain | 1.82, declared as `rust-version` and verified in CI both directions |
-| Dependencies | serde, serde_json. No libsystemd, no D-Bus library, no async runtime |
+| Dependencies | serde, serde_json, toml. The TUI adds ratatui. No libsystemd, no D-Bus library, no async runtime |
 | Build-time requirements | cargo, rustc. Nothing else |
 | Runtime requirements | systemd. `systemctl`, `journalctl` and `systemd-analyze` on `PATH` |
 | Architecture | any that rustc targets. No architecture-specific code |
@@ -43,7 +43,7 @@ make CARGOFLAGS="--release --locked --offline"
 | `$(man1dir)/systemd-ops-mcp.1` | the man page, with the version substituted into its `.TH` line |
 | `$(unitdir)/systemd-ops-mcp.socket` | socket unit, `Accept=yes`, mode 0600 |
 | `$(unitdir)/systemd-ops-mcp@.service` | hardened per-connection template |
-| `$(docdir)/` | README and the docs directory |
+| `$(docdir)/` | README.md, TOOLS.md, DESIGN.md, TESTING.md, SCOPES.md, PACKAGING.md, SECURITY.md, CHANGELOG.md, AGENTS.md |
 | `$(licensedir)/LICENSE`, `$(licensedir)/NOTICE` | MIT license and upstream systemd-mcpd attribution |
 
 `unitdir` defaults to whatever `pkg-config --variable=systemdsystemunitdir systemd`
@@ -101,12 +101,15 @@ They are unsuitable for a build chroot and are excluded from the
 published crate. See [TESTING.md](TESTING.md) if you want to run them
 against an installed package.
 
+`dogfood/` is git-tracked OMP automation and is excluded from the crates.io
+package like `tests/` and `omp/`.
+
 ## Things that are deliberately absent
 
 - **No shipped `debian/` or `.spec` directory:** distribution packaging
   belongs to the distribution, and an upstream copy goes stale without
   anyone noticing.
-- **No bundled dependencies:** two crates, both packaged everywhere.
+- **No bundled dependencies:** four crates, all packaged everywhere: serde, serde_json, toml, and ratatui.
 - **No setuid, no capabilities, no `/etc` file:** the binary runs with
   the privileges of whoever spawns it. An HMAC key for plan tokens is
   created under `$XDG_STATE_HOME/systemd-ops/` on first plan.

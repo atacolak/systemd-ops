@@ -4,7 +4,7 @@ Versions are the crate versions in `Cargo.toml`. Dates are the release
 dates; entries describe what changed on the wire or on disk, since that
 is what a downstream package has to care about.
 
-## unreleased (not published)
+## 0.7.0 (not published)
 Generic observation is now first-class. `[observation]` names a
 scope-relative observer. `automation observe` validates observer payload
 version 1 and writes `state/observation.json`. Effective input is the
@@ -145,6 +145,13 @@ default manager is user. Live PID-1 suites pass `--manager system`.
 `ExecStart` argv refuses only NUL and newlines; `$` and `%` are quoted
 so they survive systemd expansion. LICENSE is standard MIT; NOTICE
 records that portions originate from systemd-mcpd.
+
+This boundary tracks OMP dogfood scripts under `dogfood/`, points tests at
+that tree, documents `[coordination] lead`, generic waiting versus OMP
+Runtime composition, PR project-root cwd plus disposable attempts,
+installed docs matching README, and cheap complete of already-MERGED PRs
+before a model pass. `managed-omp-pr-10922` uses the scope project-root
+cwd. Crate, tag, and GitHub publication are not part of this commit.
 
 
 

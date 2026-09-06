@@ -28,6 +28,19 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+      - name: Dogfood proofs
+        run: |
+          sudo apt-get install -y -qq jq
+          cargo build
+          bash tests/dogfood-source.sh
+          bash tests/capability-readiness.sh
+          bash tests/runtime-wave.sh
+          bash tests/pr-settlement.sh
+          bash tests/pr-severity.sh
+          bash tests/pr-critical.sh
+          bash tests/wrapper-contract.sh
+          bash tests/pr-attempt.sh
+          bash tests/capability-release-run.sh
       - name: Release build
         run: cargo build --release
       - name: Man page lint
@@ -50,7 +63,16 @@ jobs:
                    /tmp/stage/usr/lib/systemd/system/systemd-ops-mcp.socket \
                    /tmp/stage/usr/lib/systemd/system/systemd-ops-mcp@.service \
                    /tmp/stage/usr/share/licenses/systemd-ops/LICENSE \
-                   /tmp/stage/usr/share/licenses/systemd-ops/NOTICE; do
+                   /tmp/stage/usr/share/licenses/systemd-ops/NOTICE \
+                   /tmp/stage/usr/share/doc/systemd-ops/README.md \
+                   /tmp/stage/usr/share/doc/systemd-ops/TOOLS.md \
+                   /tmp/stage/usr/share/doc/systemd-ops/DESIGN.md \
+                   /tmp/stage/usr/share/doc/systemd-ops/TESTING.md \
+                   /tmp/stage/usr/share/doc/systemd-ops/SCOPES.md \
+                   /tmp/stage/usr/share/doc/systemd-ops/PACKAGING.md \
+                   /tmp/stage/usr/share/doc/systemd-ops/SECURITY.md \
+                   /tmp/stage/usr/share/doc/systemd-ops/CHANGELOG.md \
+                   /tmp/stage/usr/share/doc/systemd-ops/AGENTS.md; do
             [ -e "$f" ] || { echo "::error::make install did not produce $f"; exit 1; }
           done
           grep -q '^ExecStart=/usr/bin/systemd-ops-mcp ' \

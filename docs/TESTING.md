@@ -15,6 +15,16 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 bash tests/docs.sh
+cargo build
+bash tests/dogfood-source.sh
+bash tests/capability-readiness.sh
+bash tests/runtime-wave.sh
+bash tests/pr-settlement.sh
+bash tests/pr-severity.sh
+bash tests/pr-critical.sh
+bash tests/wrapper-contract.sh
+bash tests/pr-attempt.sh
+bash tests/capability-release-run.sh
 ```
 
 `make check` runs all of them. Scope discovery, `editable_spec`
@@ -25,6 +35,10 @@ tests under `src/scope.rs` and `src/operations.rs`.
 what Debian runs as `manpage-has-errors-from-man`, and `lexgrog`, which
 decides whether `apropos` can index it. It needs groff and lexgrog, and
 skips itself under `make check` if they are absent.
+
+The dogfood proofs need `jq` and `git`. They use temporary scopes and do
+not mutate the operator's live OMP units. They default to tracked
+`dogfood/{drivers,lib}` rather than a live OMP copy.
 
 It briefly also compared the scopes in `--help` against the man page,
 and the README tool table against the registry, by scraping both with

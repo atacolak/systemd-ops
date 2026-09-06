@@ -78,7 +78,7 @@ Rules:
 - `critical` is under `[scope]`, explicit stems, not globs. Each must match an owned glob.
 - `watch` entries are explicit stems. A stem must not be both owned and watched.
 - unknown keys are refused. There is no top-level `critical`.
-- no `owner_agent`, `hcom_agent`, `omp_profile`, `lead`, or `manager` fields.
+- no `owner_agent`, `hcom_agent`, `omp_profile`, or `manager` fields. Optional `[coordination] lead = "hcom:xxxx"` is an opaque four-letter HCom handle, not a registry, and rust never shells HCom.
 
 Once a manifest exists it is canonical scope identity. Agents may infer
 a first id and owned prefix at project setup; they must not keep guessing
@@ -175,7 +175,17 @@ remains independent. READY requires a current structured checkpoint matching
 the current observation, including generation when present and output
 revision when `output_revision_required` is true. WAITING is derived from any
 active declared child that is not semantically READY. Zero children are
-vacuously satisfied.
+vacuously satisfied. OMP Runtime composition is a wrapper-domain gate
+(`capability_sources_ready_for_generation`): direct `capability-maintainer`
+children, structured checkpoint for the current generation, idle, no current
+blocker. That gate is not `derive_semantic_states`. Zero declared children
+remain vacuously READY in core waiting. Runtime is automatic composition of
+accepted Capability checkpoints, not a lead-chosen cycle.
+
+Future PR-maintainer units set `WorkingDirectory` and the bound `pr-run`
+worktree argument to the scope project root. Durable identity is
+`fork/$HEAD_BRANCH`. Each intelligent pass uses a disposable attempt
+worktree. Recovered `fix/*` worktrees are not the normal PR path.
 
 Completed lifecycle state is stored at
 `<operation-home>/state/lifecycle.json`. Completion preserves the definition,

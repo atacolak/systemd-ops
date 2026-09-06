@@ -34,6 +34,7 @@ survives review.
 | `src/write.rs`          | plan/apply (lifecycle + authoring)                       |
 | `omp/systemd.ts`        | OMP custom tools spawning `systemd-ops --json`           |
 | `docs/SCOPES.md`        | responsibility-scope / TUI contract                      |
+| `dogfood/drivers`, `dogfood/lib` | tracked OMP dogfood scripts; tests default here; live OMP is a deploy copy |
 
 Scope paths have three distinct roles. The scope root contains the
 preferred `.systemd-ops/scope.toml` manifest; `.systemd-ops.toml` is
