@@ -686,7 +686,7 @@ Expected: all `cmp` silent; verify-merged-pr files still exist.
 
 **Verification (anti-gameable):** Re-run the commands below yourself. Do not trust builder “done”. Fail the task if any command disagrees.
 
-- [ ] **Step 1: Git hygiene**
+- [x] **Step 1: Git hygiene**
 
 ```bash
 cd /home/sf/workspace/systemd-ops
@@ -696,7 +696,7 @@ git log --oneline origin/main..HEAD
 
 Expected: no staged/unstaged source edits. Untracked may still include `.ai-bridge/` and `.systemd-ops/scope.toml` only. History still contains `2d86613` and `aafe91e` plus the Task 1–3 commits. No tag created (`git describe --tags --abbrev=0` still `v0.6.0` unless the operator tagged outside this work).
 
-- [ ] **Step 2: Rust gates**
+- [x] **Step 2: Rust gates**
 
 ```bash
 cargo test
@@ -706,7 +706,7 @@ cargo fmt --check
 
 Expected: all pass / `Finished` with zero clippy warnings; fmt check exits 0.
 
-- [ ] **Step 3: Dogfood proofs**
+- [x] **Step 3: Dogfood proofs**
 
 ```bash
 cargo build
@@ -724,7 +724,7 @@ bash tests/docs.sh
 
 Expected: each ok. `tests/dogfood-source.sh` greps no live OMP `.systemd-ops` path in `tests/*.sh`.
 
-- [ ] **Step 4: Staged install and crate list**
+- [x] **Step 4: Staged install and crate list**
 
 ```bash
 rm -rf /tmp/systemd-ops-verify-stage
@@ -738,7 +738,7 @@ cargo package --list --locked | grep -E '^dogfood/' && exit 1 || true
 
 Expected: docs and binary exist; grep for `^dogfood/` matches nothing (the `&& exit 1` must not fire).
 
-- [ ] **Step 5: Live 10922 and deploy**
+- [x] **Step 5: Live 10922 and deploy**
 
 ```bash
 systemctl --user show -p WorkingDirectory --value managed-omp-pr-10922.service
@@ -749,7 +749,7 @@ test -d /home/sf/worktrees/omp/fix/copy-outline-lazy-read
 
 Expected: WorkingDirectory is `/home/sf/workspace/oh-my-pi`; `cmp` silent; extra live lib still present; recovered worktree still on disk.
 
-- [ ] **Step 6: Agent contracts**
+- [x] **Step 6: Agent contracts**
 
 ```bash
 grep -n 'preserve dirty PR worktrees' /home/sf/worlds/base/agents/project-lead.md && exit 1 || true
@@ -768,7 +768,7 @@ Expected: first grep matches nothing; SCOPES documents the lead field.
 
 **Verification (anti-gameable):** `git status -sb` shows `main` in sync with `origin/main` after push, still no `v0.7.0` tag, still no crates.io publish.
 
-- [ ] **Step 1: Push**
+- [x] **Step 1: Push**
 
 ```bash
 git -C /home/sf/workspace/systemd-ops push origin main
@@ -776,7 +776,7 @@ git -C /home/sf/workspace/systemd-ops push origin main
 
 Expected: push succeeds. Include the pre-existing test commits `2d86613` and `aafe91e`. Do not `--force`. Do not `git tag`. Do not `cargo publish`. Do not run `.github/workflows/release.yml` by fabricating a tag.
 
-- [ ] **Step 2: Leave FOR USER publication**
+- [x] **Step 2: Leave FOR USER publication**
 
 Create no code. The lead files a blocked FOR USER item:
 
