@@ -163,12 +163,12 @@ redundant OWNED heading for owned-only scopes and shows relationship headings
 when watching entries exist. Cockpit detail renders the description,
 AGENT BRIEF, RECENT ITERATIONS, NOTABLE ACTIVITY, then objective RUNTIME. `d`
 
-toggles wiring detail. `l` independently attaches a lazy raw-journal drawer
+toggles wiring detail. `t` shows the author-written topology file for the scope. `l` independently attaches a lazy raw-journal drawer
 below the selected detail. Opening the TUI or moving selection while that drawer
 is closed does not fetch journald. `j`/`k` or the arrow keys select an
 operation. PageUp/PageDown scroll detail by one visible page; Home/End jump to
 the top/bottom. The mouse wheel targets the list, detail, or logs under the
-pointer. `/` filters, `r` refreshes, and `q` or Esc exits. Refresh and
+pointer. `/` filters, `r` refreshes, `t` toggles topology, and `q` or Esc exits. Refresh and
 journal reads run off the input/render loop; a slow backend cannot freeze
 the TUI. That 8s subprocess timeout is TUI-backend only, not a CLI/MCP
 guarantee.

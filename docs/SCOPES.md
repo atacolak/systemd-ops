@@ -300,10 +300,11 @@ Modes and drawers:
 | (default) | COCKPIT | description, AGENT BRIEF, RECENT ITERATIONS, NOTABLE ACTIVITY, objective RUNTIME |
 
 | `d` | WIRING detail | identity, responsibility, execution, activation |
+| `t` | TOPOLOGY | author-written `<scope-root>/.systemd-ops/topology.txt`, verbatim |
 | `l` | DIAGNOSTICS drawer | raw journal for the selected service, loaded lazily below the current detail |
 
-Esc or `d` returns wiring detail to cockpit; Esc or `l` closes the diagnostics
-drawer. Wiring and diagnostics toggle independently. Opening the TUI or moving
+Esc or `d` returns wiring detail to cockpit; Esc or `t` returns topology to cockpit; Esc or `l` closes the diagnostics
+drawer. Wiring, topology, and diagnostics toggle independently. Topology is a local UTF-8 file, not operational truth: it does not inspect systemd, change readiness or health, join automation membership, or get hashed into brain state merely by existing. A missing file renders `not authored yet`. Opening the TUI or moving
 the selection with the drawer closed does not fetch journald. `j`/`k` and
 Down/Up change the selected operation. PageDown/PageUp scroll the selected
 

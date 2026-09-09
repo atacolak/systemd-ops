@@ -2,7 +2,8 @@
 //!
 //! Consumes [`crate::scope::show`]. Does not shell the CLI. Does not
 //! mutate systemd. Default detail is the operator cockpit; wiring is
-//! an alternate detail and diagnostics is an attached lazy drawer.
+//! an alternate detail, topology is an author-written local file, and
+//! diagnostics is an attached lazy drawer.
 //!
 //! Input and render stay on the terminal thread. Scope inspection and
 //! journal reads run on a backend worker so a slow or hung systemctl
@@ -11,7 +12,7 @@
 //! thread-local timeout.
 
 use std::io::{self, stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::LazyLock;
@@ -52,6 +53,7 @@ const YELLOW: Color = Color::Rgb(230, 197, 120);
 enum DetailView {
     Cockpit,
     Wiring,
+    Topology,
 }
 
 struct App {
@@ -470,8 +472,16 @@ impl App {
 
     fn toggle_wiring(&mut self) {
         self.detail_view = match self.detail_view {
-            DetailView::Cockpit => DetailView::Wiring,
             DetailView::Wiring => DetailView::Cockpit,
+            DetailView::Cockpit | DetailView::Topology => DetailView::Wiring,
+        };
+        self.reset_detail_scroll();
+    }
+
+    fn toggle_topology(&mut self) {
+        self.detail_view = match self.detail_view {
+            DetailView::Topology => DetailView::Cockpit,
+            DetailView::Cockpit | DetailView::Wiring => DetailView::Topology,
         };
         self.reset_detail_scroll();
     }
@@ -493,7 +503,7 @@ impl App {
             self.toggle_diagnostics();
             return true;
         }
-        if self.detail_view == DetailView::Wiring {
+        if matches!(self.detail_view, DetailView::Wiring | DetailView::Topology) {
             self.detail_view = DetailView::Cockpit;
             self.reset_detail_scroll();
             return true;
@@ -1472,6 +1482,7 @@ fn event_loop(
                     KeyCode::Down | KeyCode::Char('j') => rt.app.move_sel(1),
                     KeyCode::Up | KeyCode::Char('k') => rt.app.move_sel(-1),
                     KeyCode::Char('d') => rt.app.toggle_wiring(),
+                    KeyCode::Char('t') => rt.app.toggle_topology(),
                     KeyCode::Char('l') => rt.app.toggle_diagnostics(),
                     _ => continue,
                 }
@@ -1834,12 +1845,51 @@ fn cockpit_plain(r: &Row, now: SystemTime) -> String {
     out.join("\n")
 }
 
+fn topology_path(root: &Path) -> PathBuf {
+    root.join(".systemd-ops").join("topology.txt")
+}
+
+fn load_topology(root: &Path) -> Option<String> {
+    std::fs::read_to_string(topology_path(root)).ok()
+}
+
+fn topology_detail_lines(text: Option<&str>) -> Vec<Line<'static>> {
+    match text {
+        None => vec![Line::from(Span::styled(
+            "not authored yet",
+            Style::default().fg(MUTED),
+        ))],
+        Some(body) => {
+            let mut lines: Vec<Line<'static>> = body
+                .lines()
+                .map(|line| Line::from(Span::styled(line.to_string(), Style::default().fg(TEXT))))
+                .collect();
+            if body.ends_with('\n') {
+                lines.push(Line::from(""));
+            }
+            if lines.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines
+        }
+    }
+}
+
 fn draw_detail(f: &mut Frame, area: Rect, app: &mut App) {
+    if app.detail_view == DetailView::Topology {
+        let body = topology_detail_lines(load_topology(&app.view.root).as_deref());
+        let visible = area.height.saturating_sub(2) as usize;
+        app.set_detail_extent(body.len(), visible);
+        let paragraph = Paragraph::new(body).block(panel("TOPOLOGY"));
+        f.render_widget(paragraph.scroll((app.detail_scroll, 0)), area);
+        return;
+    }
     let now = SystemTime::now();
     let body = if let Some(r) = app.selected() {
         match app.detail_view {
             DetailView::Wiring => wiring_detail_lines(r, now),
             DetailView::Cockpit => cockpit_detail_lines(r, now),
+            DetailView::Topology => unreachable!(),
         }
     } else {
         vec![Line::from(Span::styled(
@@ -1853,6 +1903,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &mut App) {
             .selected()
             .map(|r| r.title.clone())
             .unwrap_or_else(|| "cockpit".into()),
+        DetailView::Topology => "TOPOLOGY".into(),
     };
     let visible = area.height.saturating_sub(2) as usize;
     let width = area.width.saturating_sub(2).max(1);
@@ -2104,10 +2155,11 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         let detail = match app.detail_view {
             DetailView::Cockpit => "cockpit",
             DetailView::Wiring => "wiring",
+            DetailView::Topology => "topology",
         };
         let logs = if app.diagnostics_open { " + logs" } else { "" };
         Line::from(Span::styled(
-            format!("q quit   j/k move   wheel/PgUp/PgDn scroll   Home/End   / find   r refresh   d wiring   l logs   · {detail}{logs}"),
+            format!("q quit   j/k move   wheel/PgUp/PgDn scroll   Home/End   / find   r refresh   d wiring   t topology   l logs   · {detail}{logs}"),
             Style::default().fg(MUTED),
         ))
     };
@@ -3254,6 +3306,162 @@ mod tests {
         println!("CAPTURE LOGS\n{logs}");
     }
 
+    fn topology_fixture(text: Option<&str>) -> (PathBuf, App) {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "sdo-topo-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(root.join(".systemd-ops")).unwrap();
+        if let Some(text) = text {
+            std::fs::write(root.join(".systemd-ops").join("topology.txt"), text).unwrap();
+        }
+        let mut view = empty_view();
+        view.root = root.clone();
+        (root, App::from_view(view))
+    }
+
+    fn draw_app(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        buffer_text(&terminal)
+    }
+
+    #[test]
+    fn topology_absent_is_calm() {
+        let (_root, mut app) = topology_fixture(None);
+        app.toggle_topology();
+        let text = draw_app(&mut app, 80, 24);
+        assert!(text.contains("TOPOLOGY"));
+        assert!(text.contains("not authored yet"));
+        assert_eq!(app.detail_view, DetailView::Topology);
+        assert!(!app.diagnostics_open);
+        assert!(app.logs.is_empty());
+    }
+
+    #[test]
+    fn topology_present_preserves_unicode_and_indent() {
+        let diagram = "OMP\n│\n├─ release watch          deterministic\n│      │\n│      └─ new generation\n│             └────► HCOM → midi\n";
+        let (_root, mut app) = topology_fixture(Some(diagram));
+        app.toggle_topology();
+        let text = draw_app(&mut app, 80, 24);
+        assert!(text.contains("TOPOLOGY"));
+        assert!(text.contains("OMP"));
+        assert!(text.contains("├─ release watch          deterministic"));
+        assert!(text.contains("│      └─ new generation"));
+        assert!(text.contains("└────► HCOM → midi"));
+        assert!(!text.contains("not authored yet"));
+    }
+
+    #[test]
+    fn topology_toggle_and_escape_return_to_cockpit() {
+        let mut h = Harness::new();
+        assert_eq!(h.app.detail_view, DetailView::Cockpit);
+        h.key(KeyCode::Char('t'));
+        assert_eq!(h.app.detail_view, DetailView::Topology);
+        h.key(KeyCode::Char('t'));
+        assert_eq!(h.app.detail_view, DetailView::Cockpit);
+        h.key(KeyCode::Char('t'));
+        h.key(KeyCode::Esc);
+        assert_eq!(h.app.detail_view, DetailView::Cockpit);
+        h.key(KeyCode::Char('d'));
+        assert_eq!(h.app.detail_view, DetailView::Wiring);
+        h.key(KeyCode::Char('t'));
+        assert_eq!(h.app.detail_view, DetailView::Topology);
+        h.key(KeyCode::Char('d'));
+        assert_eq!(h.app.detail_view, DetailView::Wiring);
+        h.key(KeyCode::Esc);
+        assert_eq!(h.app.detail_view, DetailView::Cockpit);
+    }
+
+    #[test]
+    fn topology_scrolls_with_detail_keys() {
+        let mut lines = vec!["OMP".to_string()];
+        for i in 0..40 {
+            lines.push(format!("├─ item {i}"));
+        }
+        let (_root, mut app) = topology_fixture(Some(&format!("{}\n", lines.join("\n"))));
+        app.toggle_topology();
+        draw_app(&mut app, 80, 16);
+        assert!(app.detail_max_scroll > 0);
+        assert!(handle_detail_navigation(&mut app, &KeyCode::PageDown));
+        assert!(app.detail_scroll > 0);
+        handle_detail_navigation(&mut app, &KeyCode::End);
+        assert_eq!(app.detail_scroll, app.detail_max_scroll);
+        handle_detail_navigation(&mut app, &KeyCode::Home);
+        assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn topology_resize_clamps_scroll() {
+        let mut lines = vec!["OMP".to_string()];
+        for i in 0..40 {
+            lines.push(format!("├─ item {i}"));
+        }
+        let (_root, mut app) = topology_fixture(Some(&lines.join("\n")));
+        app.toggle_topology();
+        draw_app(&mut app, 80, 16);
+        app.detail_end();
+        let tall = app.detail_scroll;
+        assert!(tall > 0);
+        draw_app(&mut app, 40, 40);
+        assert!(app.detail_scroll <= app.detail_max_scroll);
+        draw_app(&mut app, 40, 12);
+        assert!(app.detail_scroll <= app.detail_max_scroll);
+    }
+
+    #[test]
+    fn topology_toggle_dispatches_no_backend() {
+        let mut h = Harness::new();
+        h.key(KeyCode::Char('t'));
+        assert_eq!(h.dispatched.len(), 0);
+        assert_eq!(h.app.detail_view, DetailView::Topology);
+        h.key(KeyCode::Char('t'));
+        assert_eq!(h.dispatched.len(), 0);
+        h.key(KeyCode::Char('d'));
+        h.key(KeyCode::Char('l'));
+        assert_eq!(h.dispatched.len(), 0);
+        assert_eq!(h.app.detail_view, DetailView::Wiring);
+        assert!(h.app.diagnostics_open);
+    }
+
+    #[test]
+    fn topology_draw_does_not_inspect_systemd() {
+        let (_root, mut app) = topology_fixture(Some("LOCAL FILE\n"));
+        app.toggle_topology();
+        let text = draw_app(&mut app, 80, 24);
+        assert!(text.contains("LOCAL FILE"));
+        assert!(text.contains("TOPOLOGY"));
+    }
+
+    #[test]
+    fn topology_keeps_existing_cockpit_wiring_logs() {
+        let mut app = App::from_view(empty_view());
+        app.toggle_topology();
+        app.toggle_wiring();
+        assert_eq!(app.detail_view, DetailView::Wiring);
+        app.toggle_diagnostics();
+        app.logs = vec![LogLine {
+            text: "journal line".into(),
+            alert: false,
+        }];
+        let text = draw_app(&mut app, 100, 34);
+        assert!(
+            text.contains("wiring")
+                || text.contains("WIRING")
+                || text.contains("identity")
+                || text.contains("scope")
+        );
+        assert!(text.contains("journal line"));
+        app.toggle_topology();
+        assert_eq!(app.detail_view, DetailView::Topology);
+        app.toggle_topology();
+        assert_eq!(app.detail_view, DetailView::Cockpit);
+        assert!(app.diagnostics_open);
+    }
+
     fn two_ops_view() -> ScopeView {
         let mut view = empty_view();
         view.owned.push(serde_json::json!({
@@ -3341,9 +3549,16 @@ mod tests {
                     self.quit = true;
                     return true;
                 }
+                KeyCode::Esc => {
+                    let _ = self.app.return_cockpit();
+                }
                 KeyCode::Char('r') => self.request_refresh(),
+                KeyCode::Char('d') => self.app.toggle_wiring(),
+                KeyCode::Char('t') => self.app.toggle_topology(),
+                KeyCode::Char('l') => self.app.toggle_diagnostics(),
                 KeyCode::Down | KeyCode::Char('j') => self.app.move_sel(1),
                 KeyCode::Up | KeyCode::Char('k') => self.app.move_sel(-1),
+                other if handle_detail_navigation(&mut self.app, &other) => {}
                 _ => {}
             }
             self.quit
