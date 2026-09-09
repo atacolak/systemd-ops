@@ -85,9 +85,12 @@ PR: $PR_URL
 PR number: $PR_NUMBER
 Head branch: $HEAD_BRANCH
 Operation stem: $OPERATION_STEM
-Required target generation: $upstream_generation
+Current local OMP release pin (informational): $upstream_generation
+Do not merge or rebase onto that pin unless publication correctness requires it (conflict, reviewer request, meaningful compatibility break, or an established repository convention). A new local runtime release is not itself a reason to churn this PR.
 Durable publication branch: fork/$HEAD_BRANCH
 This cwd is a disposable attempt snapshot of fork/$HEAD_BRANCH at $ATTEMPT_START_HEAD. Push verified commits to fork/$HEAD_BRANCH. Do not expect this worktree to survive the pass.
+
+P2 is not automatically fixable. Fix P2 only when it is inside this PR's intended contract: it violates behavior this PR introduced or claimed, is a regression this PR caused, or is required for correctness or safety of the implemented feature. Adjacent hardening, unrelated lifecycle semantics, speculative completeness, and while-we-are-here improvements stay out of scope even if a reviewer found a real edge case. READY is valid with unreplied out-of-scope P2s. P0/P1 remain must-fix after comparing against current code and actual PR scope. P3 stays ignored.
 
 Call automation_report with outcome=ready or outcome=blocked before exit.
 BLOCKED reports require route=self|parent. READY means the PR is locally safe to keep as a publication stream, not that upstream accepted it. READY requires the intended repair committed and pushed to fork/$HEAD_BRANCH with a clean attempt worktree. BLOCKED must leave the attempt clean without speculative uncommitted edits. Perform exactly one maintenance pass, then exit."

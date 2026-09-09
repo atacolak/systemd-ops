@@ -22,6 +22,8 @@ bash tests/runtime-wave.sh
 bash tests/pr-settlement.sh
 bash tests/pr-severity.sh
 bash tests/pr-critical.sh
+bash tests/pr-observe-wake.sh
+bash tests/failure-budget.sh
 bash tests/wrapper-contract.sh
 bash tests/pr-attempt.sh
 bash tests/capability-release-run.sh

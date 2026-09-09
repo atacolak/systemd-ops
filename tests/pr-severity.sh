@@ -70,7 +70,7 @@ state_p1=$(extract_codex_severity "$(jq -s '.' <(printf '%s' "$t_p1"))" "$HEAD_A
 [[ $(codex_repair_policy "$state_p1") == repair-p1 ]] || fail "P1 was not MUST-fix"
 
 state_p2=$(extract_codex_severity "$(jq -s '.' <(printf '%s' "$t_p2"))" "$HEAD_A")
-[[ $(codex_repair_policy "$state_p2") == repair-p2 ]] || fail "P2 was not normal-repair"
+[[ $(codex_repair_policy "$state_p2") == consider-p2 ]] || fail "P2 was not consider-p2"
 
 state_p3=$(extract_codex_severity "$(jq -s '.' <(printf '%s' "$t_p3"))" "$HEAD_A")
 jq -e '.p0==[] and .p1==[] and .p2==[] and .p3==["PRRT_p3"]' <<<"$state_p3" >/dev/null \

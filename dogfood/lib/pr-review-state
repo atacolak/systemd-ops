@@ -63,11 +63,69 @@ codex_repair_policy() {
   jq -er '
     if (.p0 | length) > 0 then "repair-p0"
     elif (.p1 | length) > 0 then "repair-p1"
-    elif (.p2 | length) > 0 then "repair-p2"
+    elif (.p2 | length) > 0 then "consider-p2"
     elif (.p3 | length) > 0 then "ignore-p3"
     else "none"
     end
   ' <<<"$state"
+}
+
+# Publication-wake object for PR observers. Intentionally omits:
+# - local OMP release-watch generation (caps/runtime retarget; PRs do not)
+# - queued/running/success/skipped checks (only terminal failures)
+# - review/comment metadata with no unresolved actionable thread
+# - P3-only Codex threads (ignored by default)
+# Bodies are used only to classify Codex severity and are not present in the
+# returned object, so fetching bodies cannot by itself change the hash.
+pr_wake_object() {
+  local pr_json=$1
+  local threads_json=$2
+  jq -nc --argjson pr "$pr_json" --argjson threads "$threads_json" '
+    def failing_conclusions: ["FAILURE","ERROR","CANCELLED","TIMED_OUT","ACTION_REQUIRED"];
+    def failing:
+      [($pr.checks // [])[]
+        | select((.conclusion // "") as $c | (failing_conclusions | index($c)) != null)
+        | {name: (.name // null), context: (.context // null), conclusion}]
+      | sort_by([.name, .context, .conclusion]);
+    def comment_list:
+      if (.comments.nodes | type) == "array" then .comments.nodes
+      elif (.comments | type) == "array" then .comments
+      else [] end;
+    def last_comment:
+      comment_list | .[-1] // {};
+    def badge_sev:
+      ((last_comment.body // "") | capture("badge/P(?<sev>[0-3])-")? | .sev) // null;
+    def comment_author:
+      (last_comment.author.login // last_comment.author // "");
+    def keep_thread:
+      (comment_author != "chatgpt-codex-connector")
+      or (badge_sev == "0")
+      or (badge_sev == "1")
+      or (badge_sev == "2");
+    def actionable:
+      [($threads // [])[]
+        | select((.isResolved // false) != true)
+        | select((.isOutdated // false) != true)
+        | select(keep_thread)
+        | {
+            id,
+            author: comment_author,
+            sev: (if badge_sev == null then null else ("P" + badge_sev) end),
+            last_id: (last_comment.id // null),
+            last_commit: ((last_comment.commit.oid // last_comment.commit // "") | tostring)
+          }]
+      | sort_by(.id);
+    {
+      number: $pr.number,
+      state: $pr.state,
+      headRefName: $pr.headRefName,
+      headRefOid: $pr.headRefOid,
+      reviewDecision: $pr.reviewDecision,
+      mergeable: $pr.mergeable,
+      failingChecks: failing,
+      actionableReview: actionable
+    }
+  '
 }
 
 # Record / clear OMP-domain critical sidecars. Not systemd-ops core state.

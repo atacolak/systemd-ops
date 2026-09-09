@@ -3,7 +3,8 @@
 # Durable progress is fork/$HEAD_BRANCH. Scratch worktrees are disposable.
 
 PR_ATTEMPT_ROOT=${PR_ATTEMPT_ROOT:-/home/sf/workspace/worktrees/omp-automation}
-PR_FAILURE_BUDGET=${PR_FAILURE_BUDGET:-2}
+PR_FAILURE_BUDGET=${PR_FAILURE_BUDGET:-${FAILURE_BUDGET:-2}}
+FAILURE_BUDGET=${PR_FAILURE_BUDGET}
 
 pr_attempt_path() {
   local iteration=${1:?}
@@ -85,38 +86,6 @@ dispose_pr_attempt() {
     git -C "$base" worktree prune >/dev/null 2>&1 || true
   fi
   ATTEMPT_WORKTREE=""
-}
-
-failure_budget_file() {
-  printf '%s\n' "$STATE_DIR/failure-budget.json"
-}
-
-failure_budget_count() {
-  local input=$1
-  local f
-  f=$(failure_budget_file)
-  if [[ ! -r "$f" ]]; then
-    echo 0
-    return 0
-  fi
-  jq -er --arg fp "$input" 'if .input_fingerprint==$fp then (.failures // 0) else 0 end' "$f"
-}
-
-record_attempt_failure() {
-  local input=$1
-  local kind=$2
-  local f n
-  f=$(failure_budget_file)
-  mkdir -p "$STATE_DIR"
-  n=$(failure_budget_count "$input")
-  n=$((n + 1))
-  jq -nc --arg fp "$input" --argjson n "$n" --arg kind "$kind" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{version:1,input_fingerprint:$fp,failures:$n,last_kind:$kind,last_at:$at}' >"$f"
-  printf '%s\n' "$n"
-}
-
-clear_failure_budget() {
-  rm -f "$(failure_budget_file)"
 }
 
 park_pr_input() {

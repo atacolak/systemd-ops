@@ -57,15 +57,11 @@ if [[ -n "$head" ]]; then
   record_codex_critical_state "$op_home/state" "$severity"
 fi
 
-# Hash without comment bodies so fetching bodies for severity cannot wake PRs.
-world=$(jq -n -cS \
-  --arg target "$target_generation" \
-  --slurpfile pr "$pr_file" \
-  --slurpfile threads "$threads_file" \
-  '{
-    target: $target,
-    pr: $pr[0],
-    reviewThreads: (($threads[0] // []) | map(.comments.nodes[]? |= del(.body)) | sort_by(.id))
-  }' | sha256sum | cut -d' ' -f1)
+# Generation is reported for settlement but is not part of the wake hash.
+# Local OMP release pins retarget capabilities/runtime, not every open PR.
+pr_json=$(jq -c '.' "$pr_file")
+threads_json=$(jq -c '.' "$threads_file")
+wake=$(pr_wake_object "$pr_json" "$threads_json")
+world=$(jq -cS '.' <<<"$wake" | sha256sum | cut -d' ' -f1)
 jq -n -c --arg world "$world" --arg generation "$target_generation" \
   '{version:1,world_fingerprint:$world,generation:$generation}'

@@ -369,3 +369,64 @@ ensure_clean_worktree() {
     fi
   fi
 }
+
+
+FAILURE_BUDGET=${FAILURE_BUDGET:-2}
+
+failure_budget_file() {
+  printf '%s\n' "$STATE_DIR/failure-budget.json"
+}
+
+failure_budget_count() {
+  local input=$1
+  local f
+  f=$(failure_budget_file)
+  if [[ ! -r "$f" ]]; then
+    echo 0
+    return 0
+  fi
+  jq -er --arg fp "$input" 'if .input_fingerprint==$fp then (.failures // 0) else 0 end' "$f"
+}
+
+record_attempt_failure() {
+  local input=$1
+  local kind=$2
+  local f n
+  f=$(failure_budget_file)
+  mkdir -p "$STATE_DIR"
+  n=$(failure_budget_count "$input")
+  n=$((n + 1))
+  jq -nc --arg fp "$input" --argjson n "$n" --arg kind "$kind" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{version:1,input_fingerprint:$fp,failures:$n,last_kind:$kind,last_at:$at}' >"$f"
+  printf '%s\n' "$n"
+}
+
+clear_failure_budget() {
+  rm -f "$(failure_budget_file)"
+}
+
+park_identical_input() {
+  local input=$1
+  local kind=$2
+  local n=${3:-$FAILURE_BUDGET}
+  local summary="parked after ${n} identical $kind failures on unchanged input"
+  mark_processed "$input" blocked || true
+  record_blocker semantic-blocked 0 "$summary" "${iteration_id:-}" parent "$input" || true
+}
+
+# Return 0 if parked (caller exits 0). Return 1 if budget remains (caller
+# exits with the original operational code so the timer may retry).
+operational_failure_maybe_park() {
+  local input=$1
+  local kind=$2
+  local code=$3
+  local n
+  n=$(record_attempt_failure "$input" "$kind")
+  record_blocker iteration-failed "$code" "${kind} with exit ${code}" "${iteration_id:-}" parent "$input" || true
+  if [[ "$n" -ge "${FAILURE_BUDGET}" ]]; then
+    park_identical_input "$input" "$kind" "$n"
+    echo "parked after $n identical $kind failures on unchanged input" >&2
+    return 0
+  fi
+  return 1
+}

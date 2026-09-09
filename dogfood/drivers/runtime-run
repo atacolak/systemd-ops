@@ -101,17 +101,27 @@ Reconcile the integration graph first. $prompt_mode Perform exactly one runtime 
   finish_json=$(finish_iteration "$omp_code")
   finish_code=$?
   if [[ $omp_code -ne 0 ]]; then
-    record_blocker iteration-failed "$omp_code" "intelligent iteration failed with exit $omp_code" "$iteration_id" parent || true
+    kind=crash
+    if [[ $omp_code -eq 124 ]]; then
+      kind=timeout
+    fi
+    if operational_failure_maybe_park "$wake_input" "$kind" "$omp_code"; then
+      exit 0
+    fi
     exit "$omp_code"
   fi
   if [[ $finish_code -ne 0 ]]; then
-    record_blocker iteration-failed "$finish_code" "iteration-finish failed with exit $finish_code" "$iteration_id" parent || true
+    if operational_failure_maybe_park "$wake_input" crash "$finish_code"; then
+      exit 0
+    fi
     exit "$finish_code"
   fi
   reconsolidated=$(jq -r '.data.reconsolidated // false' <<<"$finish_json") || exit $?
   if [[ "$reconsolidated" != true ]]; then
     echo "automation_report is required before a successful integrator exit" >&2
-    record_blocker contract-failure 3 "automation_report is required before a successful integrator exit" "$iteration_id" parent || true
+    if operational_failure_maybe_park "$wake_input" contract-failure 3; then
+      exit 0
+    fi
     exit 3
   fi
 
@@ -132,6 +142,7 @@ Reconcile the integration graph first. $prompt_mode Perform exactly one runtime 
     fi
     mark_processed "$post_input" blocked || exit $?
     record_blocker semantic-blocked 0 "$summary" "$iteration_id" "${route:-lead}" "$post_input" || true
+    clear_failure_budget
     exit 0
   fi
 
@@ -159,6 +170,7 @@ Reconcile the integration graph first. $prompt_mode Perform exactly one runtime 
     record_blocker postcondition-failed 4 "structured checkpoint write failed" "$iteration_id" lead "$post_input" || true
     exit 4
   }
+  clear_failure_budget
 
   exit 0
 
