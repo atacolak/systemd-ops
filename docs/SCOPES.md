@@ -285,6 +285,14 @@ not store subscriber lists. No notification behavior in this slice.
 `SYSTEMD_OPS_SCOPE_ROOT`, then cwd discovery. No manifest is an error,
 not an all-systemd dashboard.
 
+Input and drawing stay on the terminal thread. Scope inspection and
+journal reads run on one backend worker so a slow or hung `systemctl`
+cannot freeze keyboard processing. That worker bounds its
+`systemctl`/`journalctl` waits (8s). A slow or timed-out backend leaves
+the last snapshot on screen; `q` still quits. The timeout is TUI-backend
+only. CLI and MCP subprocess waits remain unbounded unless a caller sets
+the thread-local timeout.
+
 Modes and drawers:
 
 | key | surface | content |
@@ -298,133 +306,5 @@ Esc or `d` returns wiring detail to cockpit; Esc or `l` closes the diagnostics
 drawer. Wiring and diagnostics toggle independently. Opening the TUI or moving
 the selection with the drawer closed does not fetch journald. `j`/`k` and
 Down/Up change the selected operation. PageDown/PageUp scroll the selected
-detail by one visible page; End/Home jump to the bottom/top. Detail scroll
-resets on selection, refresh, filter rebuild, and wiring change, and clamps to
-the rendered detail height. The mouse wheel routes to the list, selected detail,
-or logs according to pointer region. `/` filters, `r` refreshes, and `q` or Esc
-exits when no alternate surface is open.
 
-RECENT ITERATIONS renders the active session first with `●` and
-`iteration in progress`. Finished sessions follow newest first: `✓` for
-exit 0, `✖` for a nonzero exit, and `?` for an interrupted session with no
-exit code. A finished session without reconsolidated brief state says
-`exited before reconsolidating a brief`; an interrupted one says
-`interrupted before producing a final brief`.
-
-The automations list sorts by hierarchy, not health. Semantic marks are
-`●` ready, `▶` running, `⏳` waiting, `◌` stale, `■` blocked, `○` neutral.
-A failed systemd health is an independent red `✖` beside the semantic mark.
-Wiring detail exposes `semantic` as its own field.
-
-Header: `SCOPE_ID   HEALTH` then `N owned · M watching · K attention`.
-
-
-## Operator soft state
-
-The canonical file for each owned stem is:
-
-```
-<scope-root>/.systemd-ops/operations/<stem>/state/operator.json
-```
-
-
-The legacy `<scope-root>/.systemd-ops/operator/<stem>.json` path is read
-only when the canonical file is absent. The next successful operator write
-writes the canonical file and may remove the legacy file. If both files
-exist, the canonical file wins and ScopeView carries a warning; their
-contents are not merged.
-
-Schema v1 keeps bounded operator brief and activity fields and adds
-`active_iteration` plus the latest 20 finished `iterations`. Activity is
-a note stream. An iteration is an explicit operator work session with a
-start and finish, not a timer activation, service health check, process
-run, or other systemd event. Those belong to objective runtime.
-
-CLI:
-
-```
-systemd-ops operator show --unit STEM
-systemd-ops operator set --unit STEM [--about TEXT] [--headline TEXT] [--body TEXT]
-systemd-ops operator append --unit STEM --text TEXT
-systemd-ops operator iteration-start --unit STEM
-systemd-ops operator iteration-finish --unit STEM --iteration ID --exit-code N
-systemd-ops operator clear --unit STEM
-```
-
-`set` stamps `updated_at` and `basis_revision = definition_revision`.
-`append` preserves those brief stamps. Iteration start and finish update
-advisory work history. Direct soft writes are intentional; they are not
-systemd mutations and do not use plan/apply.
-
-## Bound autonomous operation surface
-
-The generic narrow CLI is:
-
-```
-systemd-ops automation context
-systemd-ops automation report --headline TEXT --summary JSON_ARRAY
-systemd-ops automation activity --text TEXT
-```
-
-All three commands require `SYSTEMD_OPS_OPERATION` and resolve the responsibility
-scope using the normal `--scope-root`, `SYSTEMD_OPS_SCOPE_ROOT`, then cwd
-precedence. There is deliberately no `--unit` argument. The environment-bound
-stem must match the resolved scope's `owned` globs. Missing bindings and watched
-or other stems are rejected before a write.
-
-`automation context` is focused working context: scope identity; operation
-unit, title, canonical purpose, health, operator state, and definition revision;
-objective state, substate, last result, next activation, and kind; current human
-report; active iteration; latest 20 finished iterations; and notable activity.
-It does not return raw journal data.
-
-`automation report` writes the compatible operator `headline` and `body`, stamps
-`updated_at` and `basis_revision`, and marks the active iteration as reported.
-Its strict schema is:
-
-- `headline`: required, one non-empty line, at most 80 characters
-- `summary`: required array of 1 to 5 strings
-- each summary string: non-empty, no CR/LF, at most 280 characters
-- stored `body`: summary strings joined by `\n\n`
-
-`automation activity` requires an active iteration and accepts one required,
-non-empty, CR/LF-free line of at most 200 characters. It is optional and does not
-stamp the report or reconsolidate the iteration by itself. A finished iteration
-is reconsolidated only when exit code is zero and that exact active iteration
-submitted a report.
-
-The OMP adapter describes four audiences: broad inspect for project
-builders/operators/admins; lifecycle control for trusted operators/admins;
-definition authoring for automation builders/admins; low-level operator state
-for manual administration. Ordinary autonomous maintainers use only the three
-bound automation tools. Current OMP profile filtering is launcher/session based,
-not a systemd-ops agent registry: dogfood wrappers pass an explicit `--tools`
-allowlist, and delegated workers receive no bound automation tools unless their
-launcher explicitly grants them.
-
-The dogfood wrapper success contract is external to systemd-ops: run OMP, finish
-the iteration, require `reconsolidated: true`, then recompute and atomically
-advance the external fingerprint. OMP failure, missing report, or iteration
-finish failure leaves the fingerprint unchanged for a later retry.
-
-`tests/automation-cli.sh` covers the environment binding, strict report and
-activity bounds, report stamps, and reconsolidation rule against the built CLI.
-`tests/wrapper-contract.sh` runs the dogfood wrapper against temporary scopes
-and fake OMP executables to prove report-required success, fingerprint advance
-after full success, preservation after OMP/report/finish failure, and the
-unchanged-fingerprint fast path.
-
-Deleting an operation home's operator state leaves the operation
-unchanged. Operation homes do not replace unit-file operational truth.
-
-
-## Deferred
-
-- functional health probes
-- generic failure-handler command / OnFailure helper units
-- HCom, agent wakeup, owner-agent fields
-- subscriber notifications
-- retry / incident management
-- `scope init` onboarding
-- mass-rename of live units
-- TUI mutation
+[Showing lines 1-300 of 431. Use :301 to continue]

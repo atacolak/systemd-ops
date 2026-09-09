@@ -11,8 +11,10 @@
 use serde_json::{json, Map, Value};
 use std::cell::{Cell, RefCell};
 use std::fmt;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Manager {
@@ -57,6 +59,7 @@ thread_local! {
     static MANAGER: Cell<Manager> = const { Cell::new(Manager::System) };
     static SURFACE: Cell<Surface> = const { Cell::new(Surface::Full) };
     static WRITE_PREFIX: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    static PROC_TIMEOUT_MS: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 pub fn set_manager(manager: Manager) {
@@ -97,6 +100,17 @@ pub fn set_write_prefix(prefix: Option<String>) {
 
 pub fn write_prefix() -> Option<Vec<String>> {
     WRITE_PREFIX.with(|c| c.borrow().clone())
+}
+
+/// Bound `systemctl`/`journalctl` waits on this thread only. `None` is unbounded
+/// (CLI default). The TUI worker sets this so a wedged D-Bus cannot freeze a
+/// backend job forever.
+pub fn set_proc_timeout(timeout: Option<Duration>) {
+    PROC_TIMEOUT_MS.with(|c| c.set(timeout.map(|d| d.as_millis() as u64)));
+}
+
+pub fn proc_timeout() -> Option<Duration> {
+    PROC_TIMEOUT_MS.with(|c| c.get().map(Duration::from_millis))
 }
 
 pub fn write_unit_allowed(name: &str) -> bool {
@@ -315,27 +329,25 @@ impl Proc {
         {
             cmd.arg("--user");
         }
-        let output = cmd
-            .args(&self.args)
+        cmd.args(&self.args)
             .env("LC_ALL", "C")
             .env("SYSTEMD_PAGER", "cat")
             .env("SYSTEMD_COLORS", "false")
-            .output()
-            .map_err(|e| BackendError(format!("failed to run {}: {e}", self.program)))?;
-        let empty_search = self.journal_empty_ok
-            && output.status.code() == Some(1)
-            && output.stdout.is_empty()
-            && output.stderr.is_empty();
-        if output.status.success() || empty_search {
-            Ok(output)
-        } else {
-            Err(BackendError(format!(
-                "{} exited with {}: {}",
-                self.program,
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            )))
-        }
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = match proc_timeout() {
+            None => cmd
+                .output()
+                .map_err(|e| BackendError(format!("failed to run {}: {e}", self.program)))?,
+            Some(timeout) => {
+                let child = cmd
+                    .spawn()
+                    .map_err(|e| BackendError(format!("failed to run {}: {e}", self.program)))?;
+                wait_output_timeout(child, timeout, self.program)?
+            }
+        };
+        classify_proc_output(self.program, self.journal_empty_ok, output)
     }
 
     fn stdout(self) -> Result<Vec<u8>, BackendError> {
@@ -369,6 +381,80 @@ impl Proc {
             })
             .collect())
     }
+}
+
+fn classify_proc_output(
+    program: &str,
+    journal_empty_ok: bool,
+    output: Output,
+) -> Result<Output, BackendError> {
+    let empty_search = journal_empty_ok
+        && output.status.code() == Some(1)
+        && output.stdout.is_empty()
+        && output.stderr.is_empty();
+    if output.status.success() || empty_search {
+        Ok(output)
+    } else {
+        Err(BackendError(format!(
+            "{} exited with {}: {}",
+            program,
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+fn wait_output_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+    program: &str,
+) -> Result<Output, BackendError> {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| BackendError(format!("{program}: missing stdout pipe")))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| BackendError(format!("{program}: missing stderr pipe")))?;
+    let stdout_h = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_h = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_h.join();
+                let _ = stderr_h.join();
+                return Err(BackendError(format!(
+                    "{program} timed out after {}ms",
+                    timeout.as_millis()
+                )));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => {
+                let _ = child.kill();
+                return Err(BackendError(format!("{program}: wait failed: {e}")));
+            }
+        }
+    };
+    let stdout = stdout_h.join().unwrap_or_default();
+    let stderr = stderr_h.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn systemctl() -> Proc {
@@ -1356,5 +1442,19 @@ graphical.target @1min 30.5s
         assert!(compact_tool("get_unit"));
         assert!(!compact_tool("unit_security"));
         assert!(!compact_tool("boot_times"));
+    }
+
+    #[test]
+    fn proc_timeout_kills_a_hung_child() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = cmd.spawn().expect("spawn sleep");
+        let started = Instant::now();
+        let err = wait_output_timeout(child, Duration::from_millis(200), "sleep").unwrap_err();
+        assert!(err.0.contains("timed out"), "got {}", err.0);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

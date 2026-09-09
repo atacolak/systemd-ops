@@ -75,7 +75,10 @@ distinct from systemd executions and checks.
 
 TUI default mode is the operator cockpit; `d` is wiring and `l` is
 diagnostics and no longer loads journald on open or selection. Semantic
-state is an independent axis from systemd health. Cockpit
+state is an independent axis from systemd health. The TUI input and
+render loop no longer waits on `systemctl`/`journalctl`: inspection runs
+on a backend worker with an 8s subprocess timeout. CLI and MCP waits
+remain unbounded unless a caller sets the thread-local timeout. Cockpit
 
 content can be scrolled without changing the selected operation. OMP
 adapter calls prefer session cwd, pass it as CLI and process cwd, and

@@ -3,9 +3,17 @@
 //! Consumes [`crate::scope::show`]. Does not shell the CLI. Does not
 //! mutate systemd. Default detail is the operator cockpit; wiring is
 //! an alternate detail and diagnostics is an attached lazy drawer.
+//!
+//! Input and render stay on the terminal thread. Scope inspection and
+//! journal reads run on a backend worker so a slow or hung systemctl
+//! cannot freeze keyboard processing. The worker bounds its subprocess
+//! waits; CLI and MCP waits stay unbounded unless a caller sets the
+//! thread-local timeout.
 
 use std::io::{self, stdout};
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -55,6 +63,13 @@ struct App {
     logs: Vec<LogLine>,
     last_error: Option<String>,
     last_refresh: Instant,
+    last_input: Instant,
+    last_frame: Instant,
+    last_backend_cmd: Option<String>,
+    last_backend_elapsed: Option<Duration>,
+    refreshing: bool,
+    inflight_since: Option<Instant>,
+    want_logs: bool,
     detail_view: DetailView,
     diagnostics_open: bool,
     detail_scroll: u16,
@@ -73,7 +88,7 @@ enum ListRow {
     Op(Box<Row>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct LogLine {
     text: String,
     alert: bool,
@@ -269,6 +284,7 @@ fn hierarchy_rows(rows: Vec<Row>) -> Vec<Row> {
 }
 
 impl App {
+    #[allow(dead_code)]
     fn load(scope_root: Option<&str>, cwd: Option<&str>) -> Result<Self, BackendError> {
         let view = scope::show_resolved(scope_root, cwd)?;
         Ok(Self::from_view(view))
@@ -284,6 +300,13 @@ impl App {
             logs: Vec::new(),
             last_error: None,
             last_refresh: Instant::now(),
+            last_input: Instant::now(),
+            last_frame: Instant::now(),
+            last_backend_cmd: None,
+            last_backend_elapsed: None,
+            refreshing: false,
+            inflight_since: None,
+            want_logs: false,
             detail_view: DetailView::Cockpit,
             diagnostics_open: false,
             detail_scroll: 0,
@@ -376,44 +399,33 @@ impl App {
             if matches!(self.rows.get(i as usize), Some(ListRow::Op(_))) {
                 self.list.select(Some(i as usize));
                 self.reset_detail_scroll();
-                if self.diagnostics_open {
-                    self.reload_logs();
-                }
+                self.mark_logs_needed();
                 return;
             }
         }
     }
 
-    fn reload_logs(&mut self) {
-        let Some(row) = self.selected() else {
-            self.logs.clear();
-            return;
-        };
-        let unit = logs_unit(&row.unit);
-        let filter = LogFilter {
-            lines: 40,
-            priority: None,
-            since: None,
-            until: None,
-            boot: None,
-            grep: None,
-        };
-        match systemd::unit_logs(&unit, &filter) {
-            Ok(payload) => {
-                self.logs = extract_log_entries(&payload)
-                    .iter()
-                    .map(format_log)
-                    .collect();
-                self.last_error = None;
-            }
-            Err(e) => {
+    fn mark_logs_needed(&mut self) {
+        if self.diagnostics_open {
+            self.want_logs = true;
+        }
+    }
+
+    fn apply_logs(&mut self, logs: Vec<LogLine>, error: Option<String>) {
+        self.logs = logs;
+        if let Some(error) = error {
+            if self.logs.is_empty() {
                 self.logs = vec![LogLine {
-                    text: format!("logs unavailable: {e}"),
+                    text: format!("logs unavailable: {error}"),
                     alert: true,
                 }];
             }
         }
         self.log_scroll = 0;
+    }
+
+    fn selected_log_unit(&self) -> Option<String> {
+        self.selected().map(|row| logs_unit(&row.unit))
     }
 
     fn reset_detail_scroll(&mut self) {
@@ -452,17 +464,8 @@ impl App {
         self.view = view;
         self.last_error = None;
         self.rebuild_rows();
-        if self.diagnostics_open {
-            self.reload_logs();
-        }
+        self.mark_logs_needed();
         self.last_refresh = Instant::now();
-    }
-
-    fn refresh(&mut self, scope_root: Option<&str>, cwd: Option<&str>) {
-        match scope::show_resolved(scope_root, cwd) {
-            Ok(view) => self.replace_view(view),
-            Err(e) => self.last_error = Some(e.0),
-        }
     }
 
     fn toggle_wiring(&mut self) {
@@ -478,9 +481,10 @@ impl App {
         self.log_scroll = 0;
         self.log_max_scroll = 0;
         if self.diagnostics_open {
-            self.reload_logs();
+            self.mark_logs_needed();
         } else {
             self.logs.clear();
+            self.want_logs = false;
         }
     }
 
@@ -956,15 +960,182 @@ fn panel(title: impl Into<String>) -> Block<'static> {
         ))
 }
 
+const BACKEND_TIMEOUT: Duration = Duration::from_secs(8);
+const HUNG_AFTER: Duration = Duration::from_secs(2);
+const POLL_IDLE: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BackendJob {
+    Refresh {
+        gen: u64,
+        scope_root: Option<String>,
+        cwd: Option<String>,
+    },
+    Logs {
+        gen: u64,
+        unit: String,
+    },
+}
+
+#[derive(Debug)]
+enum BackendEvent {
+    RefreshDone {
+        gen: u64,
+        result: Result<ScopeView, String>,
+        elapsed: Duration,
+        cmd: String,
+    },
+    LogsDone {
+        gen: u64,
+        unit: String,
+        logs: Vec<LogLine>,
+        error: Option<String>,
+        elapsed: Duration,
+    },
+}
+
+#[derive(Debug, Default)]
+struct BackendCtl {
+    refresh_wanted: u64,
+    refresh_inflight: Option<u64>,
+    logs_wanted: u64,
+    logs_inflight: Option<u64>,
+    pending_refresh: bool,
+    pending_logs: Option<String>,
+    busy: bool,
+}
+
+impl BackendCtl {
+    fn request_refresh(&mut self) -> Option<u64> {
+        // Coalesce: one extra generation is enough. Re-bumping while a
+        // refresh is already pending would make the in-flight result stale
+        // on every timer tick and the snapshot would never apply.
+        if self.pending_refresh {
+            return None;
+        }
+        self.refresh_wanted += 1;
+        self.pending_refresh = true;
+        self.try_dispatch_refresh()
+    }
+
+    fn request_logs(&mut self, unit: String) -> Option<(u64, String)> {
+        self.logs_wanted += 1;
+        self.pending_logs = Some(unit);
+        self.try_dispatch_logs()
+    }
+
+    fn try_dispatch_refresh(&mut self) -> Option<u64> {
+        if self.busy || !self.pending_refresh {
+            return None;
+        }
+        self.pending_refresh = false;
+        self.busy = true;
+        self.refresh_inflight = Some(self.refresh_wanted);
+        Some(self.refresh_wanted)
+    }
+
+    fn try_dispatch_logs(&mut self) -> Option<(u64, String)> {
+        if self.busy || self.pending_refresh {
+            return None;
+        }
+        let unit = self.pending_logs.take()?;
+        self.busy = true;
+        self.logs_inflight = Some(self.logs_wanted);
+        Some((self.logs_wanted, unit))
+    }
+
+    fn try_dispatch_any(&mut self) -> Option<BackendJob> {
+        if let Some(gen) = self.try_dispatch_refresh() {
+            return Some(BackendJob::Refresh {
+                gen,
+                scope_root: None,
+                cwd: None,
+            });
+        }
+        self.try_dispatch_logs()
+            .map(|(gen, unit)| BackendJob::Logs { gen, unit })
+    }
+
+    fn finish_refresh(&mut self, gen: u64) -> (bool, Option<BackendJob>) {
+        if self.refresh_inflight != Some(gen) {
+            return (false, self.try_dispatch_any());
+        }
+        self.refresh_inflight = None;
+        self.busy = false;
+        let apply = gen == self.refresh_wanted;
+        (apply, self.try_dispatch_any())
+    }
+
+    fn finish_logs(&mut self, gen: u64) -> (bool, Option<BackendJob>) {
+        if self.logs_inflight != Some(gen) {
+            return (false, self.try_dispatch_any());
+        }
+        self.logs_inflight = None;
+        self.busy = false;
+        let apply = gen == self.logs_wanted;
+        (apply, self.try_dispatch_any())
+    }
+
+    fn inflight_refresh(&self) -> bool {
+        self.refresh_inflight.is_some() || self.pending_refresh
+    }
+}
+
+struct WorkerCfg {
+    manager: systemd::Manager,
+    surface: systemd::Surface,
+    write_prefix: Option<String>,
+    timeout: Duration,
+}
+
+fn tui_trace(event: &str, detail: &str) {
+    static SINK: LazyLock<Option<String>> =
+        LazyLock::new(|| match std::env::var("SYSTEMD_OPS_TUI_TRACE") {
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => Some("-".into()),
+            Ok(v) if !v.is_empty() => Some(v),
+            _ => None,
+        });
+    let Some(sink) = SINK.as_ref() else {
+        return;
+    };
+    let now = Instant::now();
+    let line = format!("tui {event} {detail} mono={now:?}\n");
+    if sink == "-" {
+        eprint!("{line}");
+        return;
+    }
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(sink)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(line.as_bytes())
+        });
+}
+
+fn loading_view() -> ScopeView {
+    ScopeView {
+        id: "loading".into(),
+        automation_agent_root: None,
+        coordination_lead: None,
+        root: PathBuf::from("."),
+        health: crate::scope::ScopeHealth::Unknown,
+        owned: Vec::new(),
+        watching: Vec::new(),
+        attention: Vec::new(),
+        warnings: vec!["loading scope".into()],
+    }
+}
+
 pub fn run(scope_root: Option<&str>, cwd: Option<&str>) -> Result<(), BackendError> {
-    let mut app = App::load(scope_root, cwd)?;
     enable_raw_mode().map_err(|e| BackendError(format!("tui: {e}")))?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
         .map_err(|e| BackendError(format!("tui: {e}")))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| BackendError(format!("tui: {e}")))?;
-    let result = event_loop(&mut terminal, &mut app, scope_root, cwd);
+    let result = event_loop(&mut terminal, scope_root, cwd);
     disable_raw_mode().ok();
     execute!(
         terminal.backend_mut(),
@@ -986,22 +1157,259 @@ fn handle_detail_navigation(app: &mut App, key: &KeyCode) -> bool {
     true
 }
 
+struct TuiRuntime {
+    app: App,
+    gate: BackendCtl,
+    jobs: Sender<BackendJob>,
+    events: Receiver<BackendEvent>,
+    scope_root: Option<String>,
+    cwd: Option<String>,
+}
+
+impl TuiRuntime {
+    fn dispatch(&mut self, job: BackendJob) {
+        let job = match job {
+            BackendJob::Refresh { gen, .. } => BackendJob::Refresh {
+                gen,
+                scope_root: self.scope_root.clone(),
+                cwd: self.cwd.clone(),
+            },
+            other => other,
+        };
+        tui_trace("dispatch", &format!("{job:?}"));
+        let _ = self.jobs.send(job);
+        self.app.refreshing = self.gate.inflight_refresh() || self.gate.busy;
+        if self.app.inflight_since.is_none() {
+            self.app.inflight_since = Some(Instant::now());
+        }
+    }
+
+    fn request_refresh(&mut self) {
+        tui_trace("refresh_request", "");
+        if let Some(gen) = self.gate.request_refresh() {
+            self.dispatch(BackendJob::Refresh {
+                gen,
+                scope_root: None,
+                cwd: None,
+            });
+        } else {
+            self.app.refreshing = true;
+        }
+    }
+
+    fn maybe_auto_refresh(&mut self) {
+        if self.gate.inflight_refresh() || self.gate.busy {
+            return;
+        }
+        if self.app.last_refresh.elapsed() >= REFRESH_EVERY {
+            tui_trace("auto_refresh", "");
+            self.request_refresh();
+        }
+    }
+
+    fn maybe_request_logs(&mut self) {
+        if !self.app.want_logs {
+            return;
+        }
+        self.app.want_logs = false;
+        if !self.app.diagnostics_open {
+            return;
+        }
+        let Some(unit) = self.app.selected_log_unit() else {
+            self.app.logs.clear();
+            return;
+        };
+        if let Some((gen, unit)) = self.gate.request_logs(unit) {
+            self.dispatch(BackendJob::Logs { gen, unit });
+        }
+    }
+
+    fn drain_events(&mut self) {
+        loop {
+            match self.events.try_recv() {
+                Ok(ev) => self.apply_event(ev),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.app.last_error = Some("tui backend worker exited".into());
+                    break;
+                }
+            }
+        }
+        self.app.refreshing = self.gate.inflight_refresh() || self.gate.busy;
+        if !self.gate.busy {
+            self.app.inflight_since = None;
+        }
+        self.maybe_request_logs();
+    }
+
+    fn apply_event(&mut self, ev: BackendEvent) {
+        match ev {
+            BackendEvent::RefreshDone {
+                gen,
+                result,
+                elapsed,
+                cmd,
+            } => {
+                tui_trace(
+                    "refresh_done",
+                    &format!(
+                        "gen={gen} elapsed_ms={} ok={}",
+                        elapsed.as_millis(),
+                        result.is_ok()
+                    ),
+                );
+                self.app.last_backend_cmd = Some(cmd);
+                self.app.last_backend_elapsed = Some(elapsed);
+                let (apply, next) = self.gate.finish_refresh(gen);
+                if apply {
+                    match result {
+                        Ok(view) => self.app.replace_view(view),
+                        Err(e) => {
+                            self.app.last_error = Some(e);
+                            self.app.last_refresh = Instant::now();
+                        }
+                    }
+                } else {
+                    tui_trace(
+                        "refresh_stale",
+                        &format!("gen={gen} wanted={}", self.gate.refresh_wanted),
+                    );
+                }
+                if let Some(job) = next {
+                    self.dispatch(job);
+                }
+            }
+            BackendEvent::LogsDone {
+                gen,
+                unit,
+                logs,
+                error,
+                elapsed,
+            } => {
+                tui_trace(
+                    "logs_done",
+                    &format!(
+                        "gen={gen} unit={unit} elapsed_ms={} err={}",
+                        elapsed.as_millis(),
+                        error.is_some()
+                    ),
+                );
+                self.app.last_backend_elapsed = Some(elapsed);
+                let (apply, next) = self.gate.finish_logs(gen);
+                if apply && self.app.selected_log_unit().as_deref() == Some(unit.as_str()) {
+                    self.app.apply_logs(logs, error);
+                }
+                if let Some(job) = next {
+                    self.dispatch(job);
+                }
+            }
+        }
+    }
+}
+
+fn backend_worker(jobs: Receiver<BackendJob>, events: Sender<BackendEvent>, cfg: WorkerCfg) {
+    systemd::set_manager(cfg.manager);
+    systemd::set_surface(cfg.surface);
+    systemd::set_write_prefix(cfg.write_prefix);
+    systemd::set_proc_timeout(Some(cfg.timeout));
+    while let Ok(job) = jobs.recv() {
+        match job {
+            BackendJob::Refresh {
+                gen,
+                scope_root,
+                cwd,
+            } => {
+                tui_trace("refresh_start", &format!("gen={gen}"));
+                let started = Instant::now();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    scope::show_resolved(scope_root.as_deref(), cwd.as_deref())
+                }))
+                .unwrap_or_else(|_| Err(BackendError("scope show panicked".into())))
+                .map_err(|e| e.0);
+                if events
+                    .send(BackendEvent::RefreshDone {
+                        gen,
+                        result,
+                        elapsed: started.elapsed(),
+                        cmd: "scope show".into(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            BackendJob::Logs { gen, unit } => {
+                tui_trace("logs_start", &format!("gen={gen} unit={unit}"));
+                let started = Instant::now();
+                let filter = LogFilter {
+                    lines: 40,
+                    priority: None,
+                    since: None,
+                    until: None,
+                    boot: None,
+                    grep: None,
+                };
+                let (logs, error) = match systemd::unit_logs(&unit, &filter) {
+                    Ok(payload) => (
+                        extract_log_entries(&payload)
+                            .iter()
+                            .map(format_log)
+                            .collect(),
+                        None,
+                    ),
+                    Err(e) => (Vec::new(), Some(e.0)),
+                };
+                if events
+                    .send(BackendEvent::LogsDone {
+                        gen,
+                        unit,
+                        logs,
+                        error,
+                        elapsed: started.elapsed(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
     scope_root: Option<&str>,
     cwd: Option<&str>,
 ) -> Result<(), BackendError> {
+    let (job_tx, job_rx) = mpsc::channel();
+    let (ev_tx, ev_rx) = mpsc::channel();
+    let cfg = WorkerCfg {
+        manager: systemd::manager(),
+        surface: systemd::surface(),
+        write_prefix: systemd::write_prefix().map(|g| g.join(",")),
+        timeout: BACKEND_TIMEOUT,
+    };
+    std::thread::Builder::new()
+        .name("systemd-ops-tui-backend".into())
+        .spawn(move || backend_worker(job_rx, ev_tx, cfg))
+        .map_err(|e| BackendError(format!("tui backend: {e}")))?;
+    let mut rt = TuiRuntime {
+        app: App::from_view(loading_view()),
+        gate: BackendCtl::default(),
+        jobs: job_tx,
+        events: ev_rx,
+        scope_root: scope_root.map(str::to_string),
+        cwd: cwd.map(str::to_string),
+    };
+    rt.request_refresh();
     loop {
+        rt.drain_events();
+        rt.app.last_frame = Instant::now();
         terminal
-            .draw(|f| draw(f, app))
+            .draw(|f| draw(f, &mut rt.app))
             .map_err(|e| BackendError(format!("tui: {e}")))?;
-        if !event::poll(Duration::from_millis(250))
-            .map_err(|e| BackendError(format!("tui: {e}")))?
-        {
-            if app.last_refresh.elapsed() >= REFRESH_EVERY {
-                app.refresh(scope_root, cwd);
-            }
+        if !event::poll(POLL_IDLE).map_err(|e| BackendError(format!("tui: {e}")))? {
+            rt.maybe_auto_refresh();
             continue;
         }
         match event::read().map_err(|e| BackendError(format!("tui: {e}")))? {
@@ -1011,57 +1419,63 @@ fn event_loop(
                     MouseEventKind::ScrollDown => 3,
                     _ => continue,
                 };
-                app.handle_mouse_scroll(mouse.column, mouse.row, delta);
+                rt.app.last_input = Instant::now();
+                rt.app.handle_mouse_scroll(mouse.column, mouse.row, delta);
+                rt.maybe_request_logs();
                 continue;
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if app.filtering {
+                rt.app.last_input = Instant::now();
+                tui_trace("input", &format!("{:?}", key.code));
+                if rt.app.filtering {
                     match key.code {
                         KeyCode::Esc => {
-                            app.filtering = false;
-                            app.filter.clear();
-                            app.rebuild_rows();
-                            if app.diagnostics_open {
-                                app.reload_logs();
-                            }
+                            rt.app.filtering = false;
+                            rt.app.filter.clear();
+                            rt.app.rebuild_rows();
+                            rt.app.mark_logs_needed();
                         }
                         KeyCode::Enter => {
-                            app.filtering = false;
-                            app.rebuild_rows();
-                            if app.diagnostics_open {
-                                app.reload_logs();
-                            }
+                            rt.app.filtering = false;
+                            rt.app.rebuild_rows();
+                            rt.app.mark_logs_needed();
                         }
                         KeyCode::Backspace => {
-                            app.filter.pop();
-                            app.rebuild_rows();
+                            rt.app.filter.pop();
+                            rt.app.rebuild_rows();
                         }
                         KeyCode::Char(c) => {
-                            app.filter.push(c);
-                            app.rebuild_rows();
+                            rt.app.filter.push(c);
+                            rt.app.rebuild_rows();
                         }
                         _ => {}
                     }
+                    rt.maybe_request_logs();
                     continue;
                 }
-                if handle_detail_navigation(app, &key.code) {
+                if handle_detail_navigation(&mut rt.app, &key.code) {
                     continue;
                 }
                 match key.code {
-                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Char('q') => {
+                        tui_trace("quit", "requested");
+                        return Ok(());
+                    }
                     KeyCode::Esc => {
-                        if !app.return_cockpit() {
+                        if !rt.app.return_cockpit() {
+                            tui_trace("quit", "esc");
                             return Ok(());
                         }
                     }
-                    KeyCode::Char('r') => app.refresh(scope_root, cwd),
-                    KeyCode::Char('/') => app.filtering = true,
-                    KeyCode::Down | KeyCode::Char('j') => app.move_sel(1),
-                    KeyCode::Up | KeyCode::Char('k') => app.move_sel(-1),
-                    KeyCode::Char('d') => app.toggle_wiring(),
-                    KeyCode::Char('l') => app.toggle_diagnostics(),
+                    KeyCode::Char('r') => rt.request_refresh(),
+                    KeyCode::Char('/') => rt.app.filtering = true,
+                    KeyCode::Down | KeyCode::Char('j') => rt.app.move_sel(1),
+                    KeyCode::Up | KeyCode::Char('k') => rt.app.move_sel(-1),
+                    KeyCode::Char('d') => rt.app.toggle_wiring(),
+                    KeyCode::Char('l') => rt.app.toggle_diagnostics(),
                     _ => continue,
                 }
+                rt.maybe_request_logs();
             }
             _ => continue,
         }
@@ -1666,11 +2080,24 @@ fn draw_logs(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+    let hung = app
+        .inflight_since
+        .is_some_and(|started| started.elapsed() >= HUNG_AFTER);
     let msg = if let Some(err) = &app.last_error {
         Line::from(Span::styled(err.clone(), Style::default().fg(RED)))
     } else if app.filtering {
         Line::from(Span::styled(
             format!("filter  {}   enter apply · esc clear", app.filter),
+            Style::default().fg(ACCENT),
+        ))
+    } else if hung {
+        Line::from(Span::styled(
+            "backend slow · showing last snapshot   q still quits",
+            Style::default().fg(YELLOW),
+        ))
+    } else if app.refreshing {
+        Line::from(Span::styled(
+            "refreshing…   q quit   j/k still move",
             Style::default().fg(ACCENT),
         ))
     } else {
@@ -2825,5 +3252,228 @@ mod tests {
         println!("CAPTURE WIRING\n{wiring}");
         println!("CAPTURE COMBINED\n{combined}");
         println!("CAPTURE LOGS\n{logs}");
+    }
+
+    fn two_ops_view() -> ScopeView {
+        let mut view = empty_view();
+        view.owned.push(serde_json::json!({
+            "unit": "managed-personal-other",
+            "title": "Other",
+            "health": "healthy",
+            "kind": "oneshot",
+            "activation": "timer",
+            "operator": Value::Null,
+            "operator_state": "missing"
+        }));
+        view
+    }
+
+    struct Harness {
+        app: App,
+        gate: BackendCtl,
+        dispatched: Vec<BackendJob>,
+        quit: bool,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Self {
+                app: App::from_view(two_ops_view()),
+                gate: BackendCtl::default(),
+                dispatched: Vec::new(),
+                quit: false,
+            }
+        }
+
+        fn dispatch(&mut self, job: BackendJob) {
+            self.dispatched.push(job);
+            self.app.refreshing = true;
+            if self.app.inflight_since.is_none() {
+                self.app.inflight_since = Some(Instant::now());
+            }
+        }
+
+        fn request_refresh(&mut self) {
+            if let Some(gen) = self.gate.request_refresh() {
+                self.dispatch(BackendJob::Refresh {
+                    gen,
+                    scope_root: None,
+                    cwd: None,
+                });
+            } else {
+                self.app.refreshing = true;
+            }
+        }
+
+        fn maybe_auto_refresh(&mut self) {
+            if self.gate.inflight_refresh() || self.gate.busy {
+                return;
+            }
+            if self.app.last_refresh.elapsed() >= REFRESH_EVERY {
+                self.request_refresh();
+            }
+        }
+
+        fn complete_refresh(&mut self, gen: u64, view: Result<ScopeView, String>) {
+            let (apply, next) = self.gate.finish_refresh(gen);
+            if apply {
+                match view {
+                    Ok(view) => self.app.replace_view(view),
+                    Err(e) => {
+                        self.app.last_error = Some(e);
+                        self.app.last_refresh = Instant::now();
+                    }
+                }
+            }
+            if let Some(job) = next {
+                self.dispatch(job);
+            }
+            self.app.refreshing = self.gate.inflight_refresh() || self.gate.busy;
+            if !self.gate.busy {
+                self.app.inflight_since = None;
+            }
+        }
+
+        fn key(&mut self, code: KeyCode) -> bool {
+            self.app.last_input = Instant::now();
+            match code {
+                KeyCode::Char('q') => {
+                    self.quit = true;
+                    return true;
+                }
+                KeyCode::Char('r') => self.request_refresh(),
+                KeyCode::Down | KeyCode::Char('j') => self.app.move_sel(1),
+                KeyCode::Up | KeyCode::Char('k') => self.app.move_sel(-1),
+                _ => {}
+            }
+            self.quit
+        }
+
+        fn selected_unit(&self) -> Option<String> {
+            self.app.selected().map(|row| row.unit.clone())
+        }
+    }
+
+    #[test]
+    fn slow_refresh_does_not_block_navigation() {
+        let mut h = Harness::new();
+        let first = h.selected_unit();
+        h.key(KeyCode::Char('r'));
+        assert_eq!(h.dispatched.len(), 1);
+        assert!(h.app.refreshing);
+        h.key(KeyCode::Down);
+        let moved = h.selected_unit();
+        assert_ne!(moved, first);
+        h.complete_refresh(1, Ok(two_ops_view()));
+        assert_eq!(h.selected_unit(), moved);
+        assert!(h.app.last_input <= Instant::now());
+    }
+
+    #[test]
+    fn hung_refresh_still_quits() {
+        let mut h = Harness::new();
+        h.key(KeyCode::Char('r'));
+        assert!(h.app.refreshing);
+        assert!(h.key(KeyCode::Char('q')));
+        assert!(h.quit);
+        assert_eq!(h.dispatched.len(), 1);
+    }
+
+    #[test]
+    fn repeated_refresh_does_not_queue_unbounded_jobs() {
+        let mut h = Harness::new();
+        h.request_refresh();
+        h.request_refresh();
+        h.request_refresh();
+        h.request_refresh();
+        h.request_refresh();
+        assert_eq!(h.dispatched.len(), 1);
+        h.complete_refresh(1, Ok(two_ops_view()));
+        assert_eq!(h.dispatched.len(), 2);
+        h.complete_refresh(2, Ok(two_ops_view()));
+        assert_eq!(h.dispatched.len(), 2);
+        assert!(!h.gate.busy);
+    }
+
+    #[test]
+    fn stale_refresh_does_not_overwrite_newer_wanted_state() {
+        let mut h = Harness::new();
+        h.request_refresh();
+        h.request_refresh();
+        let mut poison = two_ops_view();
+        poison.id = "poison".into();
+        h.complete_refresh(1, Ok(poison));
+        assert_ne!(h.app.view.id, "poison");
+        assert_eq!(h.dispatched.len(), 2);
+        match &h.dispatched[1] {
+            BackendJob::Refresh { gen, .. } => assert_eq!(*gen, 2),
+            _ => panic!("expected refresh"),
+        }
+        let mut fresh = two_ops_view();
+        fresh.id = "fresh".into();
+        h.complete_refresh(2, Ok(fresh));
+        assert_eq!(h.app.view.id, "fresh");
+    }
+
+    #[test]
+    fn auto_refresh_does_not_stale_inflight_or_storm() {
+        let mut h = Harness::new();
+        h.request_refresh();
+        assert_eq!(h.dispatched.len(), 1);
+        h.app.last_refresh = Instant::now() - REFRESH_EVERY;
+        for _ in 0..20 {
+            h.maybe_auto_refresh();
+        }
+        assert_eq!(h.dispatched.len(), 1);
+        assert_eq!(h.gate.refresh_wanted, 1);
+        let mut live = two_ops_view();
+        live.id = "live".into();
+        h.complete_refresh(1, Ok(live));
+        assert_eq!(h.app.view.id, "live");
+        assert_eq!(h.dispatched.len(), 1);
+        assert!(!h.gate.busy);
+        h.app.last_refresh = Instant::now() - REFRESH_EVERY;
+        h.maybe_auto_refresh();
+        assert_eq!(h.dispatched.len(), 2);
+        h.maybe_auto_refresh();
+        assert_eq!(h.dispatched.len(), 2);
+    }
+
+    #[test]
+    fn failed_refresh_does_not_retry_every_poll_tick() {
+        let mut h = Harness::new();
+        h.request_refresh();
+        h.complete_refresh(1, Err("systemctl timed out after 8000ms".into()));
+        assert!(!h.gate.busy);
+        for _ in 0..10 {
+            h.maybe_auto_refresh();
+        }
+        assert_eq!(h.dispatched.len(), 1);
+    }
+
+    #[test]
+    fn backend_failure_leaves_ui_usable() {
+        let mut h = Harness::new();
+        assert!(h.selected_unit().is_some());
+        h.request_refresh();
+        h.complete_refresh(1, Err("systemctl timed out after 8000ms".into()));
+        assert!(h.app.last_error.as_deref().unwrap().contains("timed out"));
+        let before = h.selected_unit();
+        h.key(KeyCode::Down);
+        assert!(h.selected_unit().is_some());
+        assert!(h.app.last_error.as_deref().unwrap().contains("timed out"));
+        assert_eq!(h.selected_unit().is_some(), before.is_some());
+        assert!(!h.key(KeyCode::Char('x')));
+        assert!(!h.quit);
+    }
+
+    #[test]
+    fn loading_view_draw_does_not_touch_systemd() {
+        let mut app = App::from_view(loading_view());
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.to_lowercase().contains("loading") || text.contains("LOADING"));
     }
 }

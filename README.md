@@ -168,7 +168,10 @@ below the selected detail. Opening the TUI or moving selection while that drawer
 is closed does not fetch journald. `j`/`k` or the arrow keys select an
 operation. PageUp/PageDown scroll detail by one visible page; Home/End jump to
 the top/bottom. The mouse wheel targets the list, detail, or logs under the
-pointer. `/` filters, `r` refreshes, and `q` or Esc exits.
+pointer. `/` filters, `r` refreshes, and `q` or Esc exits. Refresh and
+journal reads run off the input/render loop; a slow backend cannot freeze
+the TUI. That 8s subprocess timeout is TUI-backend only, not a CLI/MCP
+guarantee.
 Details: [docs/SCOPES.md](docs/SCOPES.md).
 
 ### Operator state and iterations
