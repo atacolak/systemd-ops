@@ -2,7 +2,7 @@
 set -uo pipefail
 
 OPERATION_STEM=managed-omp-runtime-integrator
-WORKTREE=${WORKTREE:-/home/sf/worktrees/omp/runtime}
+WORKTREE=${WORKTREE:-$PWD}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 SCOPE_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 STATE_DIR="${STATE_DIR:-$SCOPE_ROOT/.systemd-ops/operations/$OPERATION_STEM/state}"
@@ -48,12 +48,18 @@ omp_install_is_repointable() {
 copy_untracked_runtime_payload() {
   local src=$1 dest=$2
   local f rel saved
-  if [[ -d "$src/node_modules" ]]; then
-    if [[ -d "$dest/node_modules" ]]; then
-      cp -a "$src/node_modules/." "$dest/node_modules/" || return 1
-    else
-      cp -a "$src/node_modules" "$dest/node_modules" || return 1
-    fi
+  if [[ ! -d "$src/node_modules" ]]; then
+    echo "compose worktree is missing node_modules: $src" >&2
+    return 1
+  fi
+  if [[ -d "$dest/node_modules" ]]; then
+    cp -a "$src/node_modules/." "$dest/node_modules/" || return 1
+  else
+    cp -a "$src/node_modules" "$dest/node_modules" || return 1
+  fi
+  if [[ ! -d "$dest/node_modules" ]]; then
+    echo "node_modules copy left $dest without node_modules" >&2
+    return 1
   fi
   saved=$(shopt -p nullglob)
   shopt -s nullglob

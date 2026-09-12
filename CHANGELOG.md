@@ -21,6 +21,15 @@ flips `generations/current`, and only then may repoint `~/.bun/bin/omp` when
 it already resolved into the compose worktree or a generation. Failure
 records `postcondition-failed` route=lead and retries the same input.
 
+`runtime-run` defaults `WORKTREE` from `$PWD` so a rebound WorkingDirectory
+survives the next tick. A hardcoded compose-tree path re-targeted the dirty
+canonical tree and leaked recovered worktrees. `replacement_worktree_path`
+strips stacked `-recovered-<stamp>` suffixes so a second recovery does not nest.
+`copy_untracked_runtime_payload` fails closed when the compose tree has no
+`node_modules`, so a dependency-less generation cannot be published or
+repointed. `ensure_clean_worktree` re-seeds `node_modules` from a donor tree
+or `bun install` after recover.
+
 `ensure_clean_worktree` copies a validation-pinned `packages/natives/native/*.node`
 and asserts the export surface (`countTokens`, `executeShell`, `visibleWidth`,
 `DesktopSession`, `hashlineStripPrefixes`, `EditStore`) before handing a tree

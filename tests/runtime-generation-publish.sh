@@ -100,6 +100,22 @@ publish_runtime_generation gen-1 "$rev1" || fail "idempotent republish failed"
 count=$(find "$GENS" -mindepth 1 -maxdepth 1 -type d | wc -l)
 [[ $count -eq 1 ]] || fail "idempotent republish created extra generation dirs ($count)"
 
+hollow=$TMP/hollow
+mkdir -p "$hollow/packages/coding-agent/scripts"
+if copy_untracked_runtime_payload "$hollow" "$GENS/$rev1"; then
+  fail "copy_untracked_runtime_payload succeeded without src node_modules"
+fi
+[[ -d $GENS/$rev1/node_modules ]] || fail "failed copy removed dest node_modules"
+before_omp=$(readlink -f "$BINDIR/omp")
+WORKTREE=$hollow
+if publish_runtime_generation gen-hollow "$rev1"; then
+  fail "publish succeeded from a node_modules-less worktree"
+fi
+[[ $(readlink -f "$BINDIR/omp") == "$before_omp" ]] \
+  || fail "failed publish repointed omp"
+WORKTREE=$COMPOSE
+
+
 foreign=$TMP/foreign-omp
 ln -s /bin/true "$foreign"
 OMP_INSTALL=$foreign

@@ -282,6 +282,9 @@ replacement_worktree_path() {
   local parent stem stamp
   parent=$(dirname -- "$old")
   stem=$(basename -- "$old")
+  while [[ "$stem" =~ ^(.*)-recovered-[0-9]{8}T[0-9]{6}Z$ ]]; do
+    stem=${BASH_REMATCH[1]}
+  done
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
   printf '%s/%s-recovered-%s\n' "$parent" "$stem" "$stamp"
 }
@@ -435,6 +438,57 @@ provision_native_addon() {
   return 0
 }
 
+node_modules_source_dir() {
+  local dest=$WORKTREE/node_modules
+  local dest_resolved="" cand cand_resolved
+  if [[ -d "$dest" ]]; then
+    dest_resolved=$(readlink -f "$dest") || dest_resolved=""
+  fi
+  if [[ -n "${NODE_MODULES_SOURCE:-}" ]]; then
+    [[ -d "$NODE_MODULES_SOURCE" ]] || return 1
+    printf '%s\n' "$NODE_MODULES_SOURCE"
+    return 0
+  fi
+  for cand in \
+    "${NODE_MODULES_DIR:-/home/sf/worktrees/omp/runtime/node_modules}"
+  do
+    [[ -d "$cand" ]] || continue
+    cand_resolved=$(readlink -f "$cand") || continue
+    if [[ -n "$dest_resolved" && "$cand_resolved" == "$dest_resolved" ]]; then
+      continue
+    fi
+    printf '%s\n' "$cand"
+    return 0
+  done
+  return 1
+}
+
+provision_node_modules() {
+  local dest src
+  if [[ ! -f "$WORKTREE/package.json" ]]; then
+    return 0
+  fi
+  dest="$WORKTREE/node_modules"
+  if [[ -d "$dest" ]]; then
+    return 0
+  fi
+  if src=$(node_modules_source_dir); then
+    rm -rf "$dest"
+    cp -a "$src" "$dest" || return 1
+    [[ -d "$dest" ]] || return 1
+    return 0
+  fi
+  if command -v bun >/dev/null 2>&1; then
+    (cd "$WORKTREE" && bun install --frozen-lockfile) \
+      || (cd "$WORKTREE" && bun install) || return 1
+    [[ -d "$dest" ]] || return 1
+    return 0
+  fi
+  echo "no node_modules donor and bun is missing for $WORKTREE" >&2
+  return 1
+}
+
+
 ensure_clean_worktree() {
   local expected_branch=$1
   local kind summary
@@ -458,6 +512,11 @@ ensure_clean_worktree() {
   if ! provision_native_addon; then
     echo "native provisioning failed for $WORKTREE" >&2
     record_blocker native-provisioning 4 "native addon missing or export-deficient in $WORKTREE" "" parent || true
+    return 4
+  fi
+  if ! provision_node_modules; then
+    echo "node_modules provisioning failed for $WORKTREE" >&2
+    record_blocker native-provisioning 4 "node_modules missing in $WORKTREE" "" parent || true
     return 4
   fi
 }

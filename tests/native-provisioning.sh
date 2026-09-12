@@ -52,6 +52,43 @@ WORKTREE=$TMP/no-natives
 mkdir -p "$WORKTREE"
 provision_native_addon || fail "tree without packages/natives should skip"
 
+# Trees without package.json skip node_modules provisioning.
+WORKTREE=$TMP/no-pkg
+mkdir -p "$WORKTREE"
+provision_node_modules || fail "tree without package.json should skip node_modules"
+
+# Missing node_modules is filled from a pinned donor.
+WORKTREE=$TMP/nm-missing
+mkdir -p "$WORKTREE" "$TMP/nm-donor/pkg"
+echo '{}' >"$WORKTREE/package.json"
+echo donor >"$TMP/nm-donor/pkg/index.js"
+NODE_MODULES_SOURCE=$TMP/nm-donor
+provision_node_modules || fail "missing node_modules was not provisioned from donor"
+[[ -f $WORKTREE/node_modules/pkg/index.js ]] || fail "donor node_modules was not copied"
+
+# Present node_modules is left alone.
+WORKTREE=$TMP/nm-good
+mkdir -p "$WORKTREE/node_modules/pkg"
+echo '{}' >"$WORKTREE/package.json"
+echo keep >"$WORKTREE/node_modules/pkg/index.js"
+provision_node_modules || fail "present node_modules was treated as a failure"
+[[ $(cat "$WORKTREE/node_modules/pkg/index.js") == keep ]] \
+  || fail "present node_modules was overwritten"
+
+# Missing node_modules with no donor fails unless bun can install.
+WORKTREE=$TMP/nm-none
+mkdir -p "$WORKTREE"
+echo '{}' >"$WORKTREE/package.json"
+unset NODE_MODULES_SOURCE
+NODE_MODULES_DIR=$TMP/nm-does-not-exist
+if ! command -v bun >/dev/null 2>&1; then
+  if provision_node_modules; then
+    fail "missing node_modules with no donor was accepted"
+  fi
+fi
+unset NODE_MODULES_DIR
+
+
 # Missing dest is filled from the pinned source.
 WORKTREE=$TMP/missing
 mkdir -p "$WORKTREE/packages/natives/native"
