@@ -348,6 +348,93 @@ recover_worktree() {
 
 }
 
+native_addon_filename() {
+  printf '%s\n' "${NATIVE_ADDON_NAME:-pi_natives.linux-x64-modern.node}"
+}
+
+native_addon_has_exports() {
+  local file=$1
+  local missing
+  missing=$(NATIVE_ADDON_EXPORTS="${NATIVE_ADDON_EXPORTS:-}" python3 - "$file" <<'PY'
+import os, sys
+path = sys.argv[1]
+need = os.environ.get("NATIVE_ADDON_EXPORTS", "countTokens executeShell visibleWidth DesktopSession hashlineStripPrefixes EditStore").split()
+data = open(path, "rb").read()
+missing = [name for name in need if name.encode() not in data]
+if missing:
+    sys.stdout.write(" ".join(missing))
+    sys.exit(1)
+PY
+) || {
+    echo "$missing"
+    return 1
+  }
+  return 0
+}
+
+native_addon_source_file() {
+  local name dest cand dest_resolved="" cand_resolved
+  name=$(native_addon_filename)
+  dest="$WORKTREE/packages/natives/native/$name"
+  if [[ -e "$dest" ]]; then
+    dest_resolved=$(readlink -f "$dest") || dest_resolved=""
+  fi
+  if [[ -n "${NATIVE_ADDON_SOURCE:-}" ]]; then
+    printf '%s\n' "$NATIVE_ADDON_SOURCE"
+    return 0
+  fi
+  for cand in \
+    "${NATIVE_ADDON_DIR:-/tmp/omp-runtime-natives}/$name" \
+    "/home/sf/worktrees/omp/runtime/packages/natives/native/$name"
+  do
+    [[ -f "$cand" ]] || continue
+    cand_resolved=$(readlink -f "$cand") || continue
+    if [[ -n "$dest_resolved" && "$cand_resolved" == "$dest_resolved" ]]; then
+      continue
+    fi
+    printf '%s\n' "$cand"
+    return 0
+  done
+  if [[ -f "$dest" ]]; then
+    printf '%s\n' "$dest"
+    return 0
+  fi
+  return 1
+}
+
+provision_native_addon() {
+  local dest_dir dest src missing
+  dest_dir="$WORKTREE/packages/natives/native"
+  if [[ ! -d "$WORKTREE/packages/natives" ]]; then
+    return 0
+  fi
+  dest="$dest_dir/$(native_addon_filename)"
+  if [[ -f "$dest" ]] && native_addon_has_exports "$dest" >/dev/null; then
+    return 0
+  fi
+  src=$(native_addon_source_file) || {
+    echo "no validation-pinned native addon for $dest" >&2
+    return 1
+  }
+  if [[ "$(readlink -f "$src" 2>/dev/null || true)" == "$(readlink -f "$dest" 2>/dev/null || true)" ]]; then
+    echo "native addon at $dest is export-deficient and has no other pinned source" >&2
+    return 1
+  fi
+  missing=$(native_addon_has_exports "$src" 2>/dev/null || true)
+  if [[ -n "$missing" ]]; then
+    echo "native addon source is export-deficient ($src missing $missing)" >&2
+    return 1
+  fi
+  mkdir -p "$dest_dir" || return 1
+  cp -a "$src" "$dest" || return 1
+  missing=$(native_addon_has_exports "$dest" 2>/dev/null || true)
+  if [[ -n "$missing" ]]; then
+    echo "native addon at $dest is export-deficient (missing $missing)" >&2
+    return 1
+  fi
+  return 0
+}
+
 ensure_clean_worktree() {
   local expected_branch=$1
   local kind summary
@@ -367,6 +454,11 @@ ensure_clean_worktree() {
       recover_worktree "$expected_branch" worktree-diverged \
         "dedicated worktree diverged from fork/$expected_branch" || return 4
     fi
+  fi
+  if ! provision_native_addon; then
+    echo "native provisioning failed for $WORKTREE" >&2
+    record_blocker native-provisioning 4 "native addon missing or export-deficient in $WORKTREE" "" parent || true
+    return 4
   fi
 }
 

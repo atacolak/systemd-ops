@@ -40,6 +40,7 @@ const BLOCKER_KINDS: &[&str] = &[
     "worktree-diverged",
     "worktree-detached",
     "worktree-missing",
+    "native-provisioning",
     "contract-failure",
     "stale-generation",
     "postcondition-failed",
@@ -2894,6 +2895,40 @@ mod tests {
             )
             .unwrap();
             assert!(load_blocker(&root, "managed-child").unwrap().is_none());
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_provisioning_is_a_known_blocker_kind() {
+        let root = tmp_root("native-provisioning-kind");
+        with_bound_operation(&root, "managed-child", || {
+            write_parent_fixture(&root, "managed-child", None);
+            let written = write_blocker(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                "native-provisioning",
+                Some("parent"),
+                Some("fp-native"),
+                None,
+                Some(4),
+                "native addon missing or export-deficient",
+            )
+            .unwrap();
+            assert_eq!(written["changed"], true);
+            assert_eq!(written["blocker"]["kind"], "native-provisioning");
+            let err = write_blocker(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                "not-a-kind",
+                Some("parent"),
+                Some("fp-native"),
+                None,
+                Some(4),
+                "bogus kind",
+            )
+            .unwrap_err();
+            assert!(err.0.contains("unknown blocker kind"));
         });
         let _ = fs::remove_dir_all(root);
     }

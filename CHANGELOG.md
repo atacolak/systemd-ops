@@ -21,6 +21,12 @@ flips `generations/current`, and only then may repoint `~/.bun/bin/omp` when
 it already resolved into the compose worktree or a generation. Failure
 records `postcondition-failed` route=lead and retries the same input.
 
+`ensure_clean_worktree` copies a validation-pinned `packages/natives/native/*.node`
+and asserts the export surface (`countTokens`, `executeShell`, `visibleWidth`,
+`DesktopSession`, `hashlineStripPrefixes`, `EditStore`) before handing a tree
+to the agent. Failure is blocker kind `native-provisioning`, not a 20-minute
+contract-failure park.
+
 Generic observation is now first-class. `[observation]` names a
 scope-relative observer. `automation observe` validates observer payload
 version 1 and writes `state/observation.json`. Effective input is the

@@ -25,6 +25,7 @@ bash tests/pr-severity.sh
 bash tests/pr-critical.sh
 bash tests/pr-observe-wake.sh
 bash tests/failure-budget.sh
+bash tests/native-provisioning.sh
 bash tests/wrapper-contract.sh
 bash tests/operator-report.sh
 bash tests/pr-attempt.sh
