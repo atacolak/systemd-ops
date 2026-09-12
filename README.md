@@ -217,8 +217,9 @@ not require `SYSTEMD_OPS_OPERATION`. `operator iteration-finish --unit STEM
 iteration plus exit 0 reconsolidates. The cockpit shows BRIEF when no agent is
 bound, AGENT BRIEF when one is, and marks blocked iterations even on exit 0
 without treating them as a crashed wrapper. Iteration ids stay in wiring and
-inspect JSON. The surface shows the active iteration and the latest 20
-finished iterations, newest first. Runtime is objective state derived from systemd. Timer
+inspect JSON. The cockpit peeks the active iteration and the latest 5 finished
+iterations, newest first, as glyph + relative time + headline. The ledger still
+keeps 20 in operator.json, inspect JSON, and wiring. Runtime is objective state derived from systemd. Timer
 activations, service checks, and other systemd executions are runtime
 facts, not operator iterations. None of the advisory fields affect
 operation or scope health.

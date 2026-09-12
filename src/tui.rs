@@ -39,6 +39,7 @@ use crate::systemd::{self, BackendError, LogFilter};
 
 const REFRESH_EVERY: Duration = Duration::from_secs(3);
 const ACTIVITY_MAX: usize = 6;
+const COCKPIT_ITERATIONS_MAX: usize = 5;
 
 const BORDER: Color = Color::Rgb(86, 90, 108);
 const MUTED: Color = Color::Rgb(138, 142, 158);
@@ -1702,6 +1703,10 @@ fn activity_window(activity: &[ActivityEntry], max: usize) -> (usize, &[Activity
         (skip, &activity[skip..])
     }
 }
+fn cockpit_iterations(iterations: &[Iteration]) -> &[Iteration] {
+    let end = iterations.len().min(COCKPIT_ITERATIONS_MAX);
+    &iterations[..end]
+}
 
 fn iteration_stamp(iteration: &Iteration) -> &str {
     if iteration.finished_at.is_empty() {
@@ -1742,8 +1747,6 @@ fn iteration_text(iteration: &Iteration) -> String {
         "exited before reconsolidating a brief".into()
     } else if !iteration.headline.is_empty() {
         iteration.headline.clone()
-    } else if !iteration.summary.is_empty() {
-        iteration.summary.clone()
     } else if iteration.outcome == "blocked" {
         "blocked".into()
     } else {
@@ -1823,7 +1826,7 @@ fn cockpit_plain(r: &Row, now: SystemTime) -> String {
             if let Some(active) = &r.active_iteration {
                 out.push(format!("●  {}", active_iteration_label(active, now)));
             }
-            for iteration in &r.iterations {
+            for iteration in cockpit_iterations(&r.iterations) {
                 out.push(format!(
                     "{}  {}",
                     iteration_glyph(iteration),
@@ -1991,7 +1994,7 @@ fn cockpit_detail_lines(r: &Row, now: SystemTime) -> Vec<Line<'static>> {
                     ),
                 ]));
             }
-            for iteration in &r.iterations {
+            for iteration in cockpit_iterations(&r.iterations) {
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{}  ", iteration_glyph(iteration)),
@@ -3309,6 +3312,69 @@ mod tests {
         assert_eq!(row.iterations.len(), 20);
         assert_eq!(row.iterations[0].id, "iter-24");
         assert_eq!(row.iterations[19].id, "iter-05");
+    }
+
+    #[test]
+    fn cockpit_peeks_five_iterations_headline_only() {
+        let mut view = empty_view();
+        let operator = view.owned[0].get_mut("operator").unwrap();
+        operator["active_iteration"] = Value::Null;
+        operator["iterations"] = Value::Array(
+            (0..8)
+                .map(|i| {
+                    serde_json::json!({
+                        "id": format!("iter-{i:02}"),
+                        "started_at": format!("2026-08-22T10:{i:02}:00Z"),
+                        "finished_at": format!("2026-08-22T10:{i:02}:30Z"),
+                        "exit_code": 0,
+                        "reconsolidated": true,
+                        "headline": format!("shipped {i}"),
+                        "summary": format!("long body paragraph for iteration {i} that must not appear under the cockpit row")
+                    })
+                })
+                .collect(),
+        );
+        let app = App::from_view(view);
+        let row = app.selected().unwrap();
+        assert_eq!(row.iterations.len(), 8);
+        let now = UNIX_EPOCH
+            + Duration::from_secs(parse_rfc3339_utc("2026-08-22T11:30:00Z").unwrap() as u64);
+        let text = cockpit_plain(row, now);
+        assert!(text.contains("✓  1h ago  shipped 7"));
+        assert!(text.contains("✓  1h ago  shipped 3"));
+        assert!(!text.contains("shipped 2"));
+        assert!(!text.contains("long body paragraph"));
+        let wiring = wiring_detail_lines(row, now)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(wiring.contains("iter-07"));
+        assert!(wiring.contains("iter-00"));
+    }
+
+    #[test]
+    fn cockpit_iteration_line_does_not_use_summary() {
+        let mut view = empty_view();
+        let operator = view.owned[0].get_mut("operator").unwrap();
+        operator["active_iteration"] = Value::Null;
+        operator["iterations"] = serde_json::json!([{
+            "id": "iter-summary-only",
+            "started_at": "2026-08-22T10:00:00Z",
+            "finished_at": "2026-08-22T10:05:00Z",
+            "exit_code": 0,
+            "reconsolidated": true,
+            "headline": null,
+            "summary": "paged vase with a long upgrade paragraph"
+        }]);
+        let app = App::from_view(view);
+        let row = app.selected().unwrap();
+        let now = UNIX_EPOCH
+            + Duration::from_secs(parse_rfc3339_utc("2026-08-22T11:30:00Z").unwrap() as u64);
+        let text = cockpit_plain(row, now);
+        assert!(text.contains("✓  1h ago  completed"));
+        assert!(!text.contains("paged vase"));
+        assert!(!text.contains("iter-summary-only"));
     }
 
     #[test]

@@ -11,7 +11,9 @@ unbound lead sessions. It uses the same ready|blocked (+ route) schema as
 require `SYSTEMD_OPS_OPERATION`. The OMP `systemd_operator` adapter grows
 `report`, `iteration-start`, and `iteration-finish`. The cockpit labels BRIEF
 when no agent is bound, hides iteration ids from the iteration line, and marks
-blocked reconsolidated rows even when exit is 0.
+blocked reconsolidated rows even when exit is 0. The cockpit peeks the latest
+5 finished iterations as glyph + relative time + headline. operator.json,
+inspect JSON, and wiring still keep 20.
 
 Generic observation is now first-class. `[observation]` names a
 scope-relative observer. `automation observe` validates observer payload
