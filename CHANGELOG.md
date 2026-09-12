@@ -15,6 +15,12 @@ blocked reconsolidated rows even when exit is 0. The cockpit peeks the latest
 5 finished iterations as glyph + relative time + headline. operator.json,
 inspect JSON, and wiring still keep 20.
 
+READY runtime composition publishes a detached generation under
+`/home/sf/worktrees/omp/generations/<output_revision>` before checkpoint,
+flips `generations/current`, and only then may repoint `~/.bun/bin/omp` when
+it already resolved into the compose worktree or a generation. Failure
+records `postcondition-failed` route=lead and retries the same input.
+
 Generic observation is now first-class. `[observation]` names a
 scope-relative observer. `automation observe` validates observer payload
 version 1 and writes `state/observation.json`. Effective input is the

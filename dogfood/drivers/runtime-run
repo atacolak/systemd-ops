@@ -3,9 +3,9 @@ set -uo pipefail
 
 OPERATION_STEM=managed-omp-runtime-integrator
 WORKTREE=${WORKTREE:-/home/sf/worktrees/omp/runtime}
-SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 SCOPE_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
-STATE_DIR="$SCOPE_ROOT/.systemd-ops/operations/$OPERATION_STEM/state"
+STATE_DIR="${STATE_DIR:-$SCOPE_ROOT/.systemd-ops/operations/$OPERATION_STEM/state}"
 
 RECONCILE_TOOL=${RECONCILE_TOOL:-$SCOPE_ROOT/.systemd-ops/drivers/runtime-reconcile}
 
@@ -20,7 +20,162 @@ export SYSTEMD_OPS_OPERATION="$OPERATION_STEM"
 export PATH="/home/sf/.bun/bin:/home/sf/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
 # shellcheck source=../../lib/automation-wrapper
-source "$SCOPE_ROOT/.systemd-ops/lib/automation-wrapper"
+source "${WRAPPER_LIB:-$SCOPE_ROOT/.systemd-ops/lib/automation-wrapper}"
+
+GENERATIONS_ROOT=${GENERATIONS_ROOT:-/home/sf/worktrees/omp/generations}
+OMP_INSTALL=${OMP_INSTALL:-/home/sf/.bun/bin/omp}
+
+omp_install_is_repointable() {
+  local omp=$OMP_INSTALL
+  local runtime gens resolved
+  runtime=$(readlink -f "$WORKTREE") || return 1
+  gens=$(readlink -f "$GENERATIONS_ROOT" 2>/dev/null || true)
+  if [[ ! -e "$omp" && ! -L "$omp" ]]; then
+    echo "omp install is missing: $omp" >&2
+    return 1
+  fi
+  resolved=$(readlink -f "$omp") || return 1
+  if [[ "$resolved" == "$runtime" || "$resolved" == "$runtime"/* ]]; then
+    return 0
+  fi
+  if [[ -n "$gens" && ( "$resolved" == "$gens" || "$resolved" == "$gens"/* ) ]]; then
+    return 0
+  fi
+  echo "omp install resolves outside compose worktree and generations: $resolved" >&2
+  return 1
+}
+
+copy_untracked_runtime_payload() {
+  local src=$1 dest=$2
+  local f rel saved
+  if [[ -d "$src/node_modules" ]]; then
+    if [[ -d "$dest/node_modules" ]]; then
+      cp -a "$src/node_modules/." "$dest/node_modules/" || return 1
+    else
+      cp -a "$src/node_modules" "$dest/node_modules" || return 1
+    fi
+  fi
+  saved=$(shopt -p nullglob)
+  shopt -s nullglob
+  for f in "$src/packages/natives/native/"*.node; do
+    rel=${f#"$src/"}
+    if git -C "$src" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
+      continue
+    fi
+    mkdir -p "$dest/$(dirname -- "$rel")" || {
+      eval "$saved"
+      return 1
+    }
+    cp -a "$f" "$dest/$rel" || {
+      eval "$saved"
+      return 1
+    }
+  done
+  eval "$saved"
+  return 0
+}
+
+ensure_omp_points_at_current() {
+  local omp=$OMP_INSTALL
+  local gens target desired resolved tmp
+  gens=$(readlink -f "$GENERATIONS_ROOT") || return 1
+  target="$gens/current/packages/coding-agent/scripts/ompalt"
+  if [[ ! -e "$target" && ! -L "$target" ]]; then
+    echo "published generation is missing $target" >&2
+    return 1
+  fi
+  desired=$(readlink -f "$target") || return 1
+  resolved=$(readlink -f "$omp") || return 1
+  if [[ "$resolved" == "$desired" ]]; then
+    return 0
+  fi
+  tmp="$omp.tmp.$$"
+  ln -s "$target" "$tmp" || return 1
+  if ! mv -T "$tmp" "$omp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  return 0
+}
+
+write_published_generation_json() {
+  local generation=$1 output_revision=$2 gen_dir=$3
+  local published_at path tmp out
+  published_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  path=$(readlink -f "$gen_dir") || return 1
+  mkdir -p "$STATE_DIR" || return 1
+  out="$STATE_DIR/published-generation.json"
+  tmp="$out.tmp.$$"
+  jq -n \
+    --arg generation "$generation" \
+    --arg output_revision "$output_revision" \
+    --arg published_at "$published_at" \
+    --arg path "$path" \
+    '{version:1,generation:$generation,output_revision:$output_revision,published_at:$published_at,path:$path}' \
+    >"$tmp" || return 1
+  mv -T "$tmp" "$out"
+}
+
+prune_runtime_generations() {
+  local d resolved current_target=""
+  local -A keep=()
+  [[ -d "$GENERATIONS_ROOT" ]] || return 0
+  if [[ -L "$GENERATIONS_ROOT/current" || -e "$GENERATIONS_ROOT/current" ]]; then
+    current_target=$(readlink -f "$GENERATIONS_ROOT/current" 2>/dev/null || true)
+  fi
+  if [[ -n "$current_target" && -d "$current_target" ]]; then
+    keep["$current_target"]=1
+  fi
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    resolved=$(readlink -f "$d" 2>/dev/null || true)
+    [[ -n "$resolved" ]] || continue
+    if [[ -n "${keep[$resolved]:-}" ]]; then
+      continue
+    fi
+    if (( ${#keep[@]} < 3 )); then
+      keep["$resolved"]=1
+      continue
+    fi
+    if ! git -C "$WORKTREE" worktree remove --force "$d"; then
+      echo "generation prune warning: could not remove $d" >&2
+    fi
+  done < <(find "$GENERATIONS_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@\t%p\n' | sort -nr | cut -f2-)
+  return 0
+}
+
+publish_runtime_generation() {
+  local generation=$1 output_revision=$2
+  local gen_dir tmp
+  omp_install_is_repointable || return 1
+  mkdir -p "$GENERATIONS_ROOT" || return 1
+  gen_dir="$GENERATIONS_ROOT/$output_revision"
+  if [[ ! -d "$gen_dir" ]]; then
+    if ! git -C "$WORKTREE" worktree add --detach "$gen_dir" "$output_revision"; then
+      echo "git worktree add failed for $output_revision" >&2
+      return 1
+    fi
+  fi
+  if ! copy_untracked_runtime_payload "$WORKTREE" "$gen_dir"; then
+    echo "untracked runtime payload copy failed" >&2
+    return 1
+  fi
+  tmp="$GENERATIONS_ROOT/.current.tmp.$$"
+  ln -s "$gen_dir" "$tmp" || return 1
+  if ! mv -T "$tmp" "$GENERATIONS_ROOT/current"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  ensure_omp_points_at_current || return 1
+  write_published_generation_json "$generation" "$output_revision" "$gen_dir" || return 1
+  prune_runtime_generations
+  return 0
+}
+
+if [[ "${RUNTIME_RUN_LIB:-}" == 1 ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 
 ensure_clean_worktree runtime || exit $?
 
@@ -161,6 +316,12 @@ Reconcile the integration graph first. $prompt_mode Perform exactly one runtime 
   if [[ "$post_upstream" != "$upstream_generation" ]]; then
     echo "target generation advanced during runtime maintenance; refusing a stale checkpoint" >&2
     record_blocker stale-generation 4 "target generation advanced during runtime maintenance; refusing a stale checkpoint" "$iteration_id" lead "$post_input" || true
+    exit 4
+  fi
+
+  if ! publish_runtime_generation "$upstream_generation" "$post_head"; then
+    echo "runtime generation publish failed" >&2
+    record_blocker postcondition-failed 4 "runtime generation publish failed" "$iteration_id" lead "$post_input" || true
     exit 4
   fi
 
