@@ -189,6 +189,11 @@ systemd-ops --json --scope-root ~/worlds/personal operator show \
   --unit managed-personal-youtube-poll
 systemd-ops --json --scope-root ~/worlds/personal operator iteration-start \
   --unit managed-personal-youtube-poll
+systemd-ops --json --scope-root ~/worlds/personal operator report \
+  --unit managed-personal-youtube-poll \
+  --headline "waiting for next poll" \
+  --summary '["Last poll succeeded; next timer is armed."]' \
+  --outcome ready
 systemd-ops --json --scope-root ~/worlds/personal operator iteration-finish \
   --unit managed-personal-youtube-poll --iteration ITERATION_ID --exit-code 0
 ```
@@ -204,10 +209,16 @@ file wins with a warning and their contents are not merged. Deleting
 operator state has no effect on systemd operations.
 
 Activity is a stream of advisory notes. `operator iteration-start --unit
-STEM` opens an explicit advisory work session. `operator iteration-finish
---unit STEM --iteration ID --exit-code N` closes that exact session. The
-surface shows the active iteration and the latest 20 finished iterations,
-newest first. Runtime is objective state derived from systemd. Timer
+STEM` opens an explicit advisory work session. `operator report --unit
+STEM` writes the same ready|blocked (+ route=self|parent|lead) English as
+`automation report`, stamps `reported_at` on the active iteration, and does
+not require `SYSTEMD_OPS_OPERATION`. `operator iteration-finish --unit STEM
+--iteration ID --exit-code N` closes that exact session. A report from that
+iteration plus exit 0 reconsolidates. The cockpit shows BRIEF when no agent is
+bound, AGENT BRIEF when one is, and marks blocked iterations even on exit 0
+without treating them as a crashed wrapper. Iteration ids stay in wiring and
+inspect JSON. The surface shows the active iteration and the latest 20
+finished iterations, newest first. Runtime is objective state derived from systemd. Timer
 activations, service checks, and other systemd executions are runtime
 facts, not operator iterations. None of the advisory fields affect
 operation or scope health.
@@ -225,7 +236,9 @@ broad read surface for project builders, operators, and admins.
 definitions; ordinary runtime maintainers should receive neither.
 `systemd_operator` is the low-level manual advisory-state surface. Bound
 runtime maintainers instead receive only `automation_context`,
-`automation_report`, and `automation_activity`.
+`automation_report`, and `automation_activity`. Lead sessions use
+`systemd_operator` `report` / `iteration-start` / `iteration-finish` on an
+owned `--unit` instead of binding `automation_*`.
 
 The narrow commands take no operation argument. They require inherited
 `SYSTEMD_OPS_SCOPE_ROOT` and `SYSTEMD_OPS_OPERATION`, resolve that exact owned

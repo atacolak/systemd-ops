@@ -662,13 +662,42 @@ pub fn automation_report(
     outcome: Option<&str>,
     route: Option<&str>,
 ) -> Result<Value, BackendError> {
+    let (manifest, stem) = bound_operation_manifest(explicit_root, cwd)?;
+    apply_report(&manifest, &stem, headline, summary, outcome, route)
+}
+
+/// Stem-addressed report for an unbound lead session.
+///
+/// Same ready|blocked (+ route) schema as `automation_report`, but the
+/// unit is an argument. Does not require `SYSTEMD_OPS_OPERATION`.
+pub fn report(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+    stem: &str,
+    headline: &str,
+    summary: &[String],
+    outcome: Option<&str>,
+    route: Option<&str>,
+) -> Result<Value, BackendError> {
+    let manifest = resolved_manifest(explicit_root, cwd)?;
+    require_owned(&manifest, stem)?;
+    apply_report(&manifest, stem, headline, summary, outcome, route)
+}
+
+fn apply_report(
+    manifest: &ScopeManifest,
+    stem: &str,
+    headline: &str,
+    summary: &[String],
+    outcome: Option<&str>,
+    route: Option<&str>,
+) -> Result<Value, BackendError> {
     let headline = strict_single_line("headline", headline, MAX_AUTOMATION_HEADLINE)?;
     let summary = strict_summary(summary)?;
     let body = summary.join("\n\n");
     let (outcome, route) = validate_report_outcome(outcome, route)?;
-    let (manifest, stem) = bound_operation_manifest(explicit_root, cwd)?;
 
-    let (load, warning) = load_with_warning(&manifest.root, &stem);
+    let (load, warning) = load_with_warning(&manifest.root, stem);
     let mut surface = match load {
         OperatorLoad::Ready(surface) => surface,
         OperatorLoad::Missing => empty_surface(),
@@ -679,17 +708,18 @@ pub fn automation_report(
         }
     };
     let now = now_stamp();
-    let active = surface.active_iteration.as_mut().ok_or_else(|| {
-        BackendError("automation_report requires an active agent iteration".into())
-    })?;
+    let active = surface
+        .active_iteration
+        .as_mut()
+        .ok_or_else(|| BackendError("report requires an active iteration".into()))?;
     surface.headline = Some(headline);
     surface.body = Some(body);
     surface.outcome = outcome.clone();
     surface.route = route.clone();
     surface.updated_at = Some(now.clone());
-    surface.basis_revision = current_definition_revision(&manifest, &stem);
+    surface.basis_revision = current_definition_revision(manifest, stem);
     active.reported_at = Some(now);
-    finish_write(&manifest.root, &stem, &surface)?;
+    finish_write(&manifest.root, stem, &surface)?;
     Ok(json!({
         "unit": stem,
         "operator": surface.to_json(),
@@ -1507,6 +1537,88 @@ mod tests {
             format!("it-{}", MAX_ITERATIONS + 4)
         );
         assert_eq!(surface.iterations.last().unwrap().id, "it-5");
+    }
+
+    fn scoped_root() -> PathBuf {
+        let root = tmp_root();
+        fs::create_dir_all(root.join(".systemd-ops")).unwrap();
+        fs::write(
+            root.join(".systemd-ops/scope.toml"),
+            "[scope]\nid = \"personal\"\nowned = [\"managed-personal-*\"]\n",
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn stem_report_stamps_without_bound_operation() {
+        let root = scoped_root();
+        let stem = "managed-personal-watch";
+        let root_s = root.to_str().unwrap();
+        let start = iteration_start(Some(root_s), None, stem).unwrap();
+        let iteration_id = start["iteration_id"].as_str().unwrap().to_string();
+        let reported = report(
+            Some(root_s),
+            None,
+            stem,
+            "new tag for the lead",
+            &["CLIProxy 1.2.3 is newer than installed.".into()],
+            Some("blocked"),
+            Some("lead"),
+        )
+        .unwrap();
+        assert_eq!(reported["reported"], true);
+        assert_eq!(reported["unit"], stem);
+        assert_eq!(reported["operator"]["headline"], "new tag for the lead");
+        assert_eq!(reported["operator"]["outcome"], "blocked");
+        assert_eq!(reported["operator"]["route"], "lead");
+        assert!(reported["operator"]["active_iteration"]["reported_at"].is_string());
+        let finished = iteration_finish(Some(root_s), None, stem, &iteration_id, 0).unwrap();
+        assert_eq!(finished["reconsolidated"], true);
+        assert_eq!(finished["operator"]["iterations"][0]["outcome"], "blocked");
+        assert_eq!(finished["operator"]["iterations"][0]["route"], "lead");
+        assert_eq!(
+            finished["operator"]["iterations"][0]["headline"],
+            "new tag for the lead"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stem_report_requires_active_iteration() {
+        let root = scoped_root();
+        let stem = "managed-personal-watch";
+        let root_s = root.to_str().unwrap();
+        let err = report(
+            Some(root_s),
+            None,
+            stem,
+            "headline",
+            &["summary".into()],
+            Some("ready"),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.0.contains("active iteration"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stem_report_refuses_unowned_stems() {
+        let root = scoped_root();
+        let root_s = root.to_str().unwrap();
+        let err = report(
+            Some(root_s),
+            None,
+            "managed-cpa-farm-cliproxy-watch",
+            "headline",
+            &["summary".into()],
+            Some("ready"),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.0.contains("restricted to owned stems"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

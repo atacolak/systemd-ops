@@ -195,6 +195,50 @@ test("operator set/append/clear argv", () => {
 		"--unit",
 		"managed-omp-pr-maintainer",
 	]);
+	expect(
+		operatorArgv("report", {
+			unit: "managed-cpa-farm-cliproxy-watch",
+			headline: "newer tag",
+			summary: ["paged vase"],
+			outcome: "blocked",
+			route: "lead",
+		}),
+	).toEqual([
+		"operator",
+		"report",
+		"--unit",
+		"managed-cpa-farm-cliproxy-watch",
+		"--headline",
+		"newer tag",
+		"--summary",
+		JSON.stringify(["paged vase"]),
+		"--outcome",
+		"blocked",
+		"--route",
+		"lead",
+	]);
+	expect(operatorArgv("iteration-start", { unit: "managed-cpa-farm-cliproxy-watch" })).toEqual([
+		"operator",
+		"iteration-start",
+		"--unit",
+		"managed-cpa-farm-cliproxy-watch",
+	]);
+	expect(
+		operatorArgv("iteration-finish", {
+			unit: "managed-cpa-farm-cliproxy-watch",
+			iteration: "it-abc",
+			exit_code: 0,
+		}),
+	).toEqual([
+		"operator",
+		"iteration-finish",
+		"--unit",
+		"managed-cpa-farm-cliproxy-watch",
+		"--iteration",
+		"it-abc",
+		"--exit-code",
+		"0",
+	]);
 });
 
 test("operator argv forwards session cwd", () => {
@@ -281,6 +325,16 @@ test("broad tools state their capability audiences", () => {
 	expect(byName.get("systemd_control")).toContain("Trusted project operator and admin");
 	expect(byName.get("systemd_author")).toContain("Automation and system builder");
 	expect(byName.get("systemd_operator")).toContain("Low-level manual operator-state");
+	expect(byName.get("systemd_operator")).toContain("iteration-start");
+	const operator = tools.find((tool) => tool.name === "systemd_operator");
+	expect(operator?.parameters?.properties?.action?.enum).toEqual([
+		"set",
+		"append",
+		"clear",
+		"report",
+		"iteration-start",
+		"iteration-finish",
+	]);
 });
 
 test("automation author argv carries typed metadata", () => {

@@ -467,6 +467,38 @@ export function operatorArgv(action: string, args: Json): string[] {
 			return ["operator", "append", "--unit", unit, "--text", String(args.text ?? "")];
 		case "clear":
 			return ["operator", "clear", "--unit", unit];
+		case "report": {
+			const argv = [
+				"operator",
+				"report",
+				"--unit",
+				unit,
+				"--headline",
+				String(args.headline ?? ""),
+				"--summary",
+				JSON.stringify(args.summary ?? []),
+			];
+			if (typeof args.outcome === "string" && args.outcome.length > 0) {
+				argv.push("--outcome", args.outcome);
+			}
+			if (typeof args.route === "string" && args.route.length > 0) {
+				argv.push("--route", args.route);
+			}
+			return argv;
+		}
+		case "iteration-start":
+			return ["operator", "iteration-start", "--unit", unit];
+		case "iteration-finish":
+			return [
+				"operator",
+				"iteration-finish",
+				"--unit",
+				unit,
+				"--iteration",
+				String(args.iteration ?? ""),
+				"--exit-code",
+				String(args.exit_code ?? ""),
+			];
 		default:
 			throw new Error(`unknown operator action '${action}'`);
 	}
@@ -802,6 +834,7 @@ export default function systemdTools(pi: { cwd?: string }) {
 			description:
 				"Low-level manual operator-state administration and compatibility surface for project operators and admins. " +
 				"Ordinary autonomous runtime maintainers should use automation_report and automation_activity. " +
+				"Lead sessions use report, iteration-start, and iteration-finish on an owned stem without binding automation_*. " +
 				"Mutates advisory operator state, never systemd definitions or objective health.",
 			parameters: {
 				type: "object",
@@ -809,17 +842,44 @@ export default function systemdTools(pi: { cwd?: string }) {
 				properties: {
 					action: {
 						type: "string",
-						enum: ["set", "append", "clear"],
-						description: "set brief fields, append an activity line, or clear the note",
+						enum: ["set", "append", "clear", "report", "iteration-start", "iteration-finish"],
+						description:
+							"set brief fields, append an activity line, clear the note, write a stem-addressed report, or start/finish an iteration",
 					},
 					unit: {
 						type: "string",
 						description: "Owned operation stem, e.g. managed-personal-youtube-poll",
 					},
 					about: { type: "string", description: "set: stable what/why text" },
-					headline: { type: "string", description: "set: short current headline" },
+					headline: {
+						type: "string",
+						description: "set: short current headline; report: one-line reconsolidation headline",
+					},
 					body: { type: "string", description: "set: current reconsolidated understanding" },
 					text: { type: "string", description: "append: one semantic activity line" },
+					summary: {
+						type: "array",
+						items: { type: "string" },
+						description: "report: 1..5 single-paragraph strings",
+					},
+					outcome: {
+						type: "string",
+						enum: ["ready", "blocked"],
+						description: "report: ready or blocked",
+					},
+					route: {
+						type: "string",
+						enum: ["self", "parent", "lead"],
+						description: "report: required when outcome is blocked",
+					},
+					iteration: {
+						type: "string",
+						description: "iteration-finish: exact active iteration id",
+					},
+					exit_code: {
+						type: "number",
+						description: "iteration-finish: process exit code; 0 plus a report reconsolidates",
+					},
 				},
 			},
 			async execute(_id: string, params: Json, _onUpdate: unknown, ctx: SessionLike) {
@@ -842,8 +902,30 @@ export default function systemdTools(pi: { cwd?: string }) {
 					if (typeof params.text !== "string" || params.text.length === 0) {
 						return textResult("append requires text.", { isError: true });
 					}
+				} else if (action === "report") {
+					if (typeof params.headline !== "string" || params.headline.length === 0) {
+						return textResult("report requires headline.", { isError: true });
+					}
+					if (!Array.isArray(params.summary) || params.summary.length === 0) {
+						return textResult("report requires summary.", { isError: true });
+					}
+					if (typeof params.outcome !== "string" || params.outcome.length === 0) {
+						return textResult("report requires outcome=ready|blocked.", { isError: true });
+					}
+				} else if (action === "iteration-start") {
+					// unit already required
+				} else if (action === "iteration-finish") {
+					if (typeof params.iteration !== "string" || params.iteration.length === 0) {
+						return textResult("iteration-finish requires iteration.", { isError: true });
+					}
+					if (typeof params.exit_code !== "number") {
+						return textResult("iteration-finish requires exit_code.", { isError: true });
+					}
 				} else if (action !== "clear") {
-					return textResult("systemd_operator action is set, append, or clear.", { isError: true });
+					return textResult(
+						"systemd_operator action is set, append, clear, report, iteration-start, or iteration-finish.",
+						{ isError: true },
+					);
 				}
 				const cwd = sessionCwd(ctx, factoryCwd);
 				try {

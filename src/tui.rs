@@ -118,6 +118,8 @@ struct Iteration {
     reconsolidated: bool,
     headline: String,
     summary: String,
+    outcome: String,
+    route: String,
 }
 
 #[derive(Clone)]
@@ -652,6 +654,8 @@ fn row_from_view(v: &Value, relationship: &'static str) -> Option<Row> {
                         .unwrap_or(false),
                     headline: json_str(item, "headline"),
                     summary: json_str(item, "summary"),
+                    outcome: json_str(item, "outcome"),
+                    route: json_str(item, "route"),
                 })
                 .collect()
         })
@@ -1672,6 +1676,14 @@ fn operator_brief_style(state: &str) -> Style {
     }
 }
 
+fn brief_heading(agent: &str) -> &'static str {
+    if agent.is_empty() {
+        "BRIEF"
+    } else {
+        "AGENT BRIEF"
+    }
+}
+
 fn operator_brief_cue(state: &str) -> Option<&'static str> {
     match state {
         "outdated" => Some("outdated"),
@@ -1699,24 +1711,32 @@ fn iteration_stamp(iteration: &Iteration) -> &str {
     }
 }
 
-fn iteration_glyph(exit_code: Option<i64>) -> &'static str {
-    match exit_code {
-        Some(0) => "✓",
-        Some(_) => "✖",
-        None => "?",
+fn iteration_glyph(iteration: &Iteration) -> &'static str {
+    if iteration.outcome == "blocked" {
+        "⊘"
+    } else {
+        match iteration.exit_code {
+            Some(0) => "✓",
+            Some(_) => "✖",
+            None => "?",
+        }
     }
 }
 
-fn iteration_style(exit_code: Option<i64>) -> Style {
-    match exit_code {
-        Some(0) => Style::default().fg(GREEN),
-        Some(_) => Style::default().fg(RED),
-        None => Style::default().fg(YELLOW),
+fn iteration_style(iteration: &Iteration) -> Style {
+    if iteration.outcome == "blocked" {
+        Style::default().fg(YELLOW)
+    } else {
+        match iteration.exit_code {
+            Some(0) => Style::default().fg(GREEN),
+            Some(_) => Style::default().fg(RED),
+            None => Style::default().fg(YELLOW),
+        }
     }
 }
 
 fn iteration_text(iteration: &Iteration) -> String {
-    let text = if iteration.exit_code.is_none() {
+    if iteration.exit_code.is_none() {
         "interrupted before producing a final brief".into()
     } else if !iteration.reconsolidated {
         "exited before reconsolidating a brief".into()
@@ -1724,17 +1744,14 @@ fn iteration_text(iteration: &Iteration) -> String {
         iteration.headline.clone()
     } else if !iteration.summary.is_empty() {
         iteration.summary.clone()
+    } else if iteration.outcome == "blocked" {
+        "blocked".into()
     } else {
         match iteration.exit_code {
             Some(0) => "completed".into(),
             Some(code) => format!("exited {code}"),
             None => unreachable!(),
         }
-    };
-    if iteration.id.is_empty() {
-        text
-    } else {
-        format!("{}  {text}", iteration.id)
     }
 }
 
@@ -1759,11 +1776,7 @@ fn active_iteration_label(iteration: &ActiveIteration, now: SystemTime) -> Strin
     } else {
         relative_label(&iteration.started_at, now)
     };
-    let mut text = if iteration.id.is_empty() {
-        "iteration in progress".into()
-    } else {
-        format!("{}  iteration in progress", iteration.id)
-    };
+    let mut text = String::from("iteration in progress");
     if !iteration.observed_updated_at.is_empty() {
         text.push_str(&format!(
             " · brief observed {}",
@@ -1790,7 +1803,7 @@ fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
 fn cockpit_plain(r: &Row, now: SystemTime) -> String {
     let mut out = vec![description_for(r).to_string()];
     if r.relationship == "owned" {
-        let mut brief = String::from("AGENT BRIEF");
+        let mut brief = String::from(brief_heading(&r.agent));
         if !r.updated_at.is_empty() {
             brief.push_str(&format!("  {}", relative_label(&r.updated_at, now)));
         }
@@ -1813,7 +1826,7 @@ fn cockpit_plain(r: &Row, now: SystemTime) -> String {
             for iteration in &r.iterations {
                 out.push(format!(
                     "{}  {}",
-                    iteration_glyph(iteration.exit_code),
+                    iteration_glyph(iteration),
                     iteration_label(iteration, now)
                 ));
             }
@@ -1930,7 +1943,7 @@ fn cockpit_detail_lines(r: &Row, now: SystemTime) -> Vec<Line<'static>> {
     if r.relationship == "owned" {
         lines.push(Line::from(""));
         let mut brief = vec![Span::styled(
-            "AGENT BRIEF",
+            brief_heading(&r.agent),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )];
         if !r.updated_at.is_empty() {
@@ -1981,8 +1994,8 @@ fn cockpit_detail_lines(r: &Row, now: SystemTime) -> Vec<Line<'static>> {
             for iteration in &r.iterations {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{}  ", iteration_glyph(iteration.exit_code)),
-                        iteration_style(iteration.exit_code),
+                        format!("{}  ", iteration_glyph(iteration)),
+                        iteration_style(iteration),
                     ),
                     Span::styled(iteration_label(iteration, now), Style::default().fg(TEXT)),
                 ]));
@@ -2051,6 +2064,19 @@ fn wiring_detail_lines(r: &Row, _now: SystemTime) -> Vec<Line<'static>> {
     push_detail(&mut lines, "basis", r.basis_revision.clone(), MUTED);
     push_detail(&mut lines, "def", r.definition_revision.clone(), MUTED);
     push_detail(&mut lines, "agent", r.agent.clone(), TEXT);
+    if let Some(active) = &r.active_iteration {
+        push_detail(&mut lines, "iteration", active.id.clone(), TEXT);
+    }
+    for iteration in &r.iterations {
+        let mut value = iteration.id.clone();
+        if !iteration.outcome.is_empty() {
+            value.push_str(&format!("  {}", iteration.outcome));
+        }
+        if !iteration.route.is_empty() {
+            value.push_str(&format!("  {}", iteration.route));
+        }
+        push_detail(&mut lines, "iteration", value, MUTED);
+    }
     push_detail(&mut lines, "agent root", short_path(&r.agent_root), MUTED);
     push_detail(&mut lines, "parent", r.parent.clone(), TEXT);
 
@@ -2543,6 +2569,9 @@ mod tests {
                 "health_basis": "timer",
                 "definition_revision": "sha256:abc",
                 "critical": false,
+                "automation": {
+                    "agent": "pr-maintainer"
+                },
                 "operator": {
                     "version": 1,
                     "about": "Keeps PR queues honest",
@@ -3164,26 +3193,95 @@ mod tests {
     }
 
     #[test]
+    fn agentless_cockpit_uses_brief_not_agent_brief() {
+        let mut view = empty_view();
+        view.owned[0].as_object_mut().unwrap().remove("automation");
+        let app = App::from_view(view);
+        let row = app.selected().unwrap();
+        let now = UNIX_EPOCH
+            + Duration::from_secs(parse_rfc3339_utc("2026-08-22T11:30:00Z").unwrap() as u64);
+        let text = cockpit_plain(row, now);
+        assert!(text.contains("BRIEF"));
+        assert!(!text.contains("AGENT BRIEF"));
+        assert_eq!(brief_heading(""), "BRIEF");
+        assert_eq!(brief_heading("pr-maintainer"), "AGENT BRIEF");
+    }
+
+    #[test]
+    fn blocked_exit_zero_is_not_a_failed_wrapper() {
+        let mut view = empty_view();
+        let operator = view.owned[0].get_mut("operator").unwrap();
+        operator["active_iteration"] = Value::Null;
+        operator["iterations"] = serde_json::json!([{
+            "id": "iter-blocked",
+            "started_at": "2026-08-22T10:00:00Z",
+            "finished_at": "2026-08-22T10:05:00Z",
+            "exit_code": 0,
+            "reconsolidated": true,
+            "headline": "newer GitHub tag; upgrade belongs to the lead",
+            "summary": "paged vase",
+            "outcome": "blocked",
+            "route": "lead"
+        }]);
+        let app = App::from_view(view);
+        let row = app.selected().unwrap();
+        let now = UNIX_EPOCH
+            + Duration::from_secs(parse_rfc3339_utc("2026-08-22T11:30:00Z").unwrap() as u64);
+        assert_eq!(row.iterations[0].outcome, "blocked");
+        assert_eq!(row.iterations[0].route, "lead");
+        assert_eq!(iteration_glyph(&row.iterations[0]), "⊘");
+        let text = cockpit_plain(row, now);
+        assert!(text.contains("⊘  1h ago  newer GitHub tag; upgrade belongs to the lead"));
+        assert!(!text.contains("✖"));
+        assert!(!text.contains("iter-blocked"));
+        let wiring = wiring_detail_lines(row, now)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(wiring.contains("iter-blocked"));
+    }
+
+    #[test]
+    fn wiring_keeps_iteration_ids() {
+        let app = App::from_view(empty_view());
+        let row = app.selected().unwrap();
+        let now = UNIX_EPOCH
+            + Duration::from_secs(parse_rfc3339_utc("2026-08-22T11:30:00Z").unwrap() as u64);
+        let wiring = wiring_detail_lines(row, now)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(wiring.contains("iter-active"));
+        assert!(wiring.contains("iter-failed"));
+        assert!(wiring.contains("iter-ok"));
+    }
+
+    #[test]
     fn iterations_are_newest_first_with_exit_code_only_glyphs() {
         let app = App::from_view(empty_view());
         let row = app.selected().unwrap();
         let now = UNIX_EPOCH
             + Duration::from_secs(parse_rfc3339_utc("2026-08-22T11:30:00Z").unwrap() as u64);
         let text = cockpit_plain(row, now);
-        let active = text
-            .find("●  10m ago  iter-active  iteration in progress")
-            .unwrap();
+        let active = text.find("●  10m ago  iteration in progress").unwrap();
         let failed = text
-            .find("✖  40m ago  iter-failed  exited before reconsolidating a brief")
+            .find("✖  40m ago  exited before reconsolidating a brief")
             .unwrap();
-        let success = text.find("✓  1h ago  iter-ok  Queue drained").unwrap();
+        let success = text.find("✓  1h ago  Queue drained").unwrap();
         let interrupted = text
-            .find("?  2h ago  iter-interrupted  interrupted before producing a final brief")
+            .find("?  2h ago  interrupted before producing a final brief")
             .unwrap();
         assert!(active < failed && failed < success && success < interrupted);
-        assert_eq!(iteration_glyph(Some(0)), "✓");
-        assert_eq!(iteration_glyph(Some(143)), "✖");
-        assert_eq!(iteration_glyph(None), "?");
+        assert!(!text.contains("iter-active"));
+        assert!(!text.contains("iter-failed"));
+        assert!(!text.contains("iter-ok"));
+        let ok = &row.iterations[1];
+        assert_eq!(ok.id, "iter-ok");
+        assert_eq!(iteration_glyph(ok), "✓");
+        assert_eq!(iteration_glyph(&row.iterations[0]), "✖");
+        assert_eq!(iteration_glyph(&row.iterations[2]), "?");
     }
 
     #[test]

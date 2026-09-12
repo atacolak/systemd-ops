@@ -5,6 +5,14 @@ dates; entries describe what changed on the wire or on disk, since that
 is what a downstream package has to care about.
 
 ## 0.7.0 (not published)
+`operator report --unit STEM` is the stem-addressed English close path for
+unbound lead sessions. It uses the same ready|blocked (+ route) schema as
+`automation report`, stamps `reported_at` on the active iteration, and does not
+require `SYSTEMD_OPS_OPERATION`. The OMP `systemd_operator` adapter grows
+`report`, `iteration-start`, and `iteration-finish`. The cockpit labels BRIEF
+when no agent is bound, hides iteration ids from the iteration line, and marks
+blocked reconsolidated rows even when exit is 0.
+
 Generic observation is now first-class. `[observation]` names a
 scope-relative observer. `automation observe` validates observer payload
 version 1 and writes `state/observation.json`. Effective input is the

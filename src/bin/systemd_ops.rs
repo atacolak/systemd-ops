@@ -58,6 +58,7 @@ Commands:
   operator clear --unit STEM
   operator iteration-start --unit STEM
   operator iteration-finish --unit STEM --iteration ID --exit-code N
+  operator report --unit STEM --headline TEXT --summary JSON_ARRAY --outcome ready|blocked [--route self|parent|lead]
 
   automation context
   automation observe
@@ -571,6 +572,38 @@ fn run_author(cmd: &str, args: &mut Vec<String>, cwd: Option<&str>) -> Result<Va
     }
 }
 
+struct ReportFields {
+    headline: String,
+    summary: Vec<String>,
+    outcome: Option<String>,
+    route: Option<String>,
+}
+
+fn report_fields(args: &mut Vec<String>) -> Result<ReportFields, BackendError> {
+    let headline = require_opt(args, "--headline").map_err(BackendError)?;
+    let summary = json_arg(args, "--summary")
+        .map_err(BackendError)?
+        .ok_or_else(|| BackendError("missing --summary".into()))?;
+    let summary = summary
+        .as_array()
+        .ok_or_else(|| BackendError("--summary must be a JSON array".into()))?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| BackendError("--summary items must be strings".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let outcome = take_opt(args, "--outcome").map_err(BackendError)?;
+    let route = take_opt(args, "--route").map_err(BackendError)?;
+    Ok(ReportFields {
+        headline,
+        summary,
+        outcome,
+        route,
+    })
+}
+
 fn run_operator(
     cmd: &str,
     args: &mut Vec<String>,
@@ -617,6 +650,20 @@ fn run_operator(
             remaining_flags(args).map_err(BackendError)?;
             operator::iteration_finish(scope_root, cwd, &unit, &iteration, exit_code)
         }
+        "report" => {
+            let unit = require_opt(args, "--unit").map_err(BackendError)?;
+            let fields = report_fields(args)?;
+            remaining_flags(args).map_err(BackendError)?;
+            operator::report(
+                scope_root,
+                cwd,
+                &unit,
+                &fields.headline,
+                &fields.summary,
+                fields.outcome.as_deref(),
+                fields.route.as_deref(),
+            )
+        }
         other => Err(BackendError(format!("unknown operator command '{other}'"))),
     }
 }
@@ -645,30 +692,15 @@ fn run_automation(
         }
 
         "report" => {
-            let headline = require_opt(args, "--headline").map_err(BackendError)?;
-            let summary = json_arg(args, "--summary")
-                .map_err(BackendError)?
-                .ok_or_else(|| BackendError("missing --summary".into()))?;
-            let summary = summary
-                .as_array()
-                .ok_or_else(|| BackendError("--summary must be a JSON array".into()))?
-                .iter()
-                .map(|item| {
-                    item.as_str()
-                        .map(str::to_string)
-                        .ok_or_else(|| BackendError("--summary items must be strings".into()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let outcome = take_opt(args, "--outcome").map_err(BackendError)?;
-            let route = take_opt(args, "--route").map_err(BackendError)?;
+            let fields = report_fields(args)?;
             remaining_flags(args).map_err(BackendError)?;
             operator::automation_report(
                 scope_root,
                 cwd,
-                &headline,
-                &summary,
-                outcome.as_deref(),
-                route.as_deref(),
+                &fields.headline,
+                &fields.summary,
+                fields.outcome.as_deref(),
+                fields.route.as_deref(),
             )
         }
         "activity" => {
@@ -1010,5 +1042,8 @@ mod tests {
         assert!(
             USAGE.contains("operator iteration-finish --unit STEM --iteration ID --exit-code N")
         );
+        assert!(USAGE.contains(
+            "operator report --unit STEM --headline TEXT --summary JSON_ARRAY --outcome ready|blocked"
+        ));
     }
 }

@@ -297,7 +297,7 @@ Modes and drawers:
 
 | key | surface | content |
 |---|---|---|
-| (default) | COCKPIT | description, AGENT BRIEF, RECENT ITERATIONS, NOTABLE ACTIVITY, objective RUNTIME |
+| (default) | COCKPIT | description, BRIEF (AGENT BRIEF only when an agent is bound), RECENT ITERATIONS, NOTABLE ACTIVITY, objective RUNTIME |
 
 | `d` | WIRING detail | identity, responsibility, execution, activation |
 | `t` | TOPOLOGY | author-written `<scope-root>/.systemd-ops/topology.txt`, verbatim |
