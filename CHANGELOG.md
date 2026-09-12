@@ -29,7 +29,7 @@ strips stacked `-recovered-<stamp>` suffixes so a second recovery does not nest.
 `node_modules`, so a dependency-less generation cannot be published or
 repointed. It also copies gitignored build artifacts except `target/` and
 `node_modules`. `publish_runtime_generation` runs the generation's `ompalt
---help` before flipping `generations/current` or `~/.bun/bin/omp`.
+--smoke-test` before flipping `generations/current` or `~/.bun/bin/omp`.
 `ensure_clean_worktree` re-seeds `node_modules` from a donor tree
 or `bun install` after recover.
 

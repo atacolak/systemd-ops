@@ -48,10 +48,15 @@ git -C "$COMPOSE" config core.autocrlf false
 cat >"$COMPOSE/packages/coding-agent/scripts/ompalt" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == --help ]]; then
-  echo ompalt-help
+  echo ompalt-help-fast-path
+  exit 0
+fi
+if [[ "${1:-}" == --smoke-test ]]; then
+  echo ompalt-smoke
   exit 0
 fi
 echo ompalt-v1
+exit 0
 EOF
 chmod 0755 "$COMPOSE/packages/coding-agent/scripts/ompalt"
 printf 'node_modules\n*.node\ntarget/\npackages/coding-agent/src/export/html/tool-views.generated.js\npackages/stats/dist/\n' >"$COMPOSE/.gitignore"
@@ -134,15 +139,19 @@ before_current=$(readlink -f "$GENS/current")
 before_omp=$(readlink -f "$BINDIR/omp")
 cat >"$COMPOSE/packages/coding-agent/scripts/ompalt" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${1:-}" == --help ]]; then
+  echo ompalt-help-fast-path
+  exit 0
+fi
 echo cannot import tool-views.generated.js >&2
 exit 1
 EOF
 chmod 0755 "$COMPOSE/packages/coding-agent/scripts/ompalt"
 git -C "$COMPOSE" add packages/coding-agent/scripts/ompalt
-git -C "$COMPOSE" commit -qm 'broken-help'
+git -C "$COMPOSE" commit -qm 'broken-smoke'
 rev_broken=$(git -C "$COMPOSE" rev-parse HEAD)
 if publish_runtime_generation gen-broken "$rev_broken"; then
-  fail "publish succeeded when generation --help failed"
+  fail "publish succeeded when generation --smoke-test failed"
 fi
 [[ $(readlink -f "$GENS/current") == "$before_current" ]] \
   || fail "failed load postcondition flipped generations/current"
@@ -152,12 +161,17 @@ git -C "$COMPOSE" worktree remove --force "$GENS/$rev_broken" >/dev/null 2>&1 \
   || rm -rf "$GENS/$rev_broken"
 cat >"$COMPOSE/packages/coding-agent/scripts/ompalt" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${1:-}" == --help || "${1:-}" == --smoke-test ]]; then
+  echo ompalt-ok
+  exit 0
+fi
 echo ompalt-ok
 exit 0
 EOF
 chmod 0755 "$COMPOSE/packages/coding-agent/scripts/ompalt"
 git -C "$COMPOSE" add packages/coding-agent/scripts/ompalt
-git -C "$COMPOSE" commit -qm 'restore-help'
+git -C "$COMPOSE" commit -qm 'restore-smoke'
+
 
 
 
@@ -177,6 +191,10 @@ revs=("$rev1")
 for n in 2 3 4; do
   cat >"$COMPOSE/packages/coding-agent/scripts/ompalt" <<EOF
 #!/usr/bin/env bash
+if [[ "\${1:-}" == --help || "\${1:-}" == --smoke-test ]]; then
+  echo ompalt-v$n
+  exit 0
+fi
 echo ompalt-v$n
 exit 0
 EOF

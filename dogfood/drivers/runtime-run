@@ -99,11 +99,11 @@ generation_is_loadable() {
     return 1
   fi
   home=$(mktemp -d) || return 1
-  HOME="$home" timeout "${OMP_SMOKE_TIMEOUT:-30}" "$launcher" --help >/dev/null 2>&1
+  HOME="$home" timeout "${OMP_SMOKE_TIMEOUT:-30}" "$launcher" --smoke-test >/dev/null 2>&1
   rc=$?
   rm -rf "$home"
   if [[ $rc -ne 0 ]]; then
-    echo "generation failed load postcondition: $launcher --help exited $rc" >&2
+    echo "generation failed load postcondition: $launcher --smoke-test exited $rc" >&2
     return 1
   fi
   return 0
