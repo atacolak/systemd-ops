@@ -78,6 +78,34 @@ copy_untracked_runtime_payload() {
     }
   done
   eval "$saved"
+  local rel
+  while IFS= read -r -d '' rel; do
+    case "$rel" in
+      target/*|*/target/*|node_modules/*|*/node_modules/*|.git/*) continue ;;
+    esac
+    [[ -e "$src/$rel" && ! -d "$src/$rel" ]] || continue
+    mkdir -p "$dest/$(dirname -- "$rel")" || return 1
+    cp -a "$src/$rel" "$dest/$rel" || return 1
+  done < <(git -C "$src" ls-files -z --others --ignored --exclude-standard)
+  return 0
+}
+
+generation_is_loadable() {
+  local gen_dir=$1
+  local launcher=$gen_dir/packages/coding-agent/scripts/ompalt
+  local home rc
+  if [[ ! -x "$launcher" && ! -e "$launcher" ]]; then
+    echo "generation is missing $launcher" >&2
+    return 1
+  fi
+  home=$(mktemp -d) || return 1
+  HOME="$home" timeout "${OMP_SMOKE_TIMEOUT:-30}" "$launcher" --help >/dev/null 2>&1
+  rc=$?
+  rm -rf "$home"
+  if [[ $rc -ne 0 ]]; then
+    echo "generation failed load postcondition: $launcher --help exited $rc" >&2
+    return 1
+  fi
   return 0
 }
 
@@ -164,6 +192,10 @@ publish_runtime_generation() {
   fi
   if ! copy_untracked_runtime_payload "$WORKTREE" "$gen_dir"; then
     echo "untracked runtime payload copy failed" >&2
+    return 1
+  fi
+  if ! generation_is_loadable "$gen_dir"; then
+    echo "generation load postcondition failed for $gen_dir" >&2
     return 1
   fi
   tmp="$GENERATIONS_ROOT/.current.tmp.$$"

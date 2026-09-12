@@ -47,15 +47,25 @@ git -C "$COMPOSE" config core.autocrlf false
 
 cat >"$COMPOSE/packages/coding-agent/scripts/ompalt" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${1:-}" == --help ]]; then
+  echo ompalt-help
+  exit 0
+fi
 echo ompalt-v1
 EOF
 chmod 0755 "$COMPOSE/packages/coding-agent/scripts/ompalt"
-printf 'node_modules\n*.node\n' >"$COMPOSE/.gitignore"
+printf 'node_modules\n*.node\ntarget/\npackages/coding-agent/src/export/html/tool-views.generated.js\npackages/stats/dist/\n' >"$COMPOSE/.gitignore"
+mkdir -p "$COMPOSE/packages/coding-agent/src/export/html" \
+  "$COMPOSE/packages/stats/dist/client" \
+  "$COMPOSE/target/debug"
+echo generated-js >"$COMPOSE/packages/coding-agent/src/export/html/tool-views.generated.js"
+echo stats-client >"$COMPOSE/packages/stats/dist/client/index.js"
+echo rust-target >"$COMPOSE/target/debug/omp"
 git -C "$COMPOSE" add packages .gitignore
 git -C "$COMPOSE" commit -qm 'v1'
 
 rev1=$(git -C "$COMPOSE" rev-parse HEAD)
-mkdir -p "$COMPOSE/node_modules/pkg"
+mkdir -p "$COMPOSE/node_modules/pkg" "$COMPOSE/packages/natives/native"
 echo payload-v1 >"$COMPOSE/node_modules/pkg/index.js"
 echo native-v1 >"$COMPOSE/packages/natives/native/pi_natives.linux-x64-modern.node"
 
@@ -82,6 +92,11 @@ publish_runtime_generation gen-1 "$rev1" || fail "first publish failed"
 [[ -f $GENS/$rev1/node_modules/pkg/index.js ]] || fail "node_modules payload was not copied"
 [[ -f $GENS/$rev1/packages/natives/native/pi_natives.linux-x64-modern.node ]] \
   || fail "untracked .node payload was not copied"
+[[ -f $GENS/$rev1/packages/coding-agent/src/export/html/tool-views.generated.js ]] \
+  || fail "ignored tool-views.generated.js was dropped"
+[[ -f $GENS/$rev1/packages/stats/dist/client/index.js ]] \
+  || fail "ignored packages/stats/dist was dropped"
+[[ ! -e $GENS/$rev1/target/debug/omp ]] || fail "target/ leaked into the generation"
 jq -e --arg gen gen-1 --arg rev "$rev1" --arg path "$(readlink -f "$GENS/$rev1")" '
   .version==1
   and .generation==$gen
@@ -115,6 +130,38 @@ fi
   || fail "failed publish repointed omp"
 WORKTREE=$COMPOSE
 
+before_current=$(readlink -f "$GENS/current")
+before_omp=$(readlink -f "$BINDIR/omp")
+cat >"$COMPOSE/packages/coding-agent/scripts/ompalt" <<'EOF'
+#!/usr/bin/env bash
+echo cannot import tool-views.generated.js >&2
+exit 1
+EOF
+chmod 0755 "$COMPOSE/packages/coding-agent/scripts/ompalt"
+git -C "$COMPOSE" add packages/coding-agent/scripts/ompalt
+git -C "$COMPOSE" commit -qm 'broken-help'
+rev_broken=$(git -C "$COMPOSE" rev-parse HEAD)
+if publish_runtime_generation gen-broken "$rev_broken"; then
+  fail "publish succeeded when generation --help failed"
+fi
+[[ $(readlink -f "$GENS/current") == "$before_current" ]] \
+  || fail "failed load postcondition flipped generations/current"
+[[ $(readlink -f "$BINDIR/omp") == "$before_omp" ]] \
+  || fail "failed load postcondition repointed omp"
+git -C "$COMPOSE" worktree remove --force "$GENS/$rev_broken" >/dev/null 2>&1 \
+  || rm -rf "$GENS/$rev_broken"
+cat >"$COMPOSE/packages/coding-agent/scripts/ompalt" <<'EOF'
+#!/usr/bin/env bash
+echo ompalt-ok
+exit 0
+EOF
+chmod 0755 "$COMPOSE/packages/coding-agent/scripts/ompalt"
+git -C "$COMPOSE" add packages/coding-agent/scripts/ompalt
+git -C "$COMPOSE" commit -qm 'restore-help'
+
+
+
+
 
 foreign=$TMP/foreign-omp
 ln -s /bin/true "$foreign"
@@ -128,7 +175,12 @@ OMP_INSTALL=$BINDIR/omp
 
 revs=("$rev1")
 for n in 2 3 4; do
-  echo "ompalt-v$n" >"$COMPOSE/packages/coding-agent/scripts/ompalt"
+  cat >"$COMPOSE/packages/coding-agent/scripts/ompalt" <<EOF
+#!/usr/bin/env bash
+echo ompalt-v$n
+exit 0
+EOF
+  chmod 0755 "$COMPOSE/packages/coding-agent/scripts/ompalt"
   git -C "$COMPOSE" add packages/coding-agent/scripts/ompalt
   git -C "$COMPOSE" commit -qm "v$n"
   rev=$(git -C "$COMPOSE" rev-parse HEAD)

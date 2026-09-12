@@ -27,7 +27,10 @@ canonical tree and leaked recovered worktrees. `replacement_worktree_path`
 strips stacked `-recovered-<stamp>` suffixes so a second recovery does not nest.
 `copy_untracked_runtime_payload` fails closed when the compose tree has no
 `node_modules`, so a dependency-less generation cannot be published or
-repointed. `ensure_clean_worktree` re-seeds `node_modules` from a donor tree
+repointed. It also copies gitignored build artifacts except `target/` and
+`node_modules`. `publish_runtime_generation` runs the generation's `ompalt
+--help` before flipping `generations/current` or `~/.bun/bin/omp`.
+`ensure_clean_worktree` re-seeds `node_modules` from a donor tree
 or `bun install` after recover.
 
 `ensure_clean_worktree` copies a validation-pinned `packages/natives/native/*.node`
