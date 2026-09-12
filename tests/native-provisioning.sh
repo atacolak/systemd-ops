@@ -78,6 +78,25 @@ provision_native_addon || fail "stale dest was not replaced"
 native_addon_has_exports "$WORKTREE/packages/natives/native/$NATIVE_ADDON_NAME" \
   || fail "replaced dest is still export-deficient"
 
+# Production never sets NATIVE_ADDON_EXPORTS. Unset and empty must still
+# replace a present-but-export-deficient dest.
+WORKTREE=$TMP/stale-unset
+mkdir -p "$WORKTREE/packages/natives/native"
+cp -a "$TMP/stale.node" "$WORKTREE/packages/natives/native/$NATIVE_ADDON_NAME"
+unset NATIVE_ADDON_EXPORTS
+provision_native_addon || fail "unset NATIVE_ADDON_EXPORTS left a stale dest in place"
+native_addon_has_exports "$WORKTREE/packages/natives/native/$NATIVE_ADDON_NAME" \
+  || fail "unset-var provisioned dest is still export-deficient"
+NATIVE_ADDON_EXPORTS=
+WORKTREE=$TMP/stale-empty
+mkdir -p "$WORKTREE/packages/natives/native"
+cp -a "$TMP/stale.node" "$WORKTREE/packages/natives/native/$NATIVE_ADDON_NAME"
+provision_native_addon || fail "empty NATIVE_ADDON_EXPORTS left a stale dest in place"
+native_addon_has_exports "$WORKTREE/packages/natives/native/$NATIVE_ADDON_NAME" \
+  || fail "empty-var provisioned dest is still export-deficient"
+export NATIVE_ADDON_EXPORTS="${good_exports[*]}"
+
+
 # Stale dest with no other source fails fast.
 WORKTREE=$TMP/stale-only
 mkdir -p "$WORKTREE/packages/natives/native"

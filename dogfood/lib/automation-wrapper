@@ -355,10 +355,10 @@ native_addon_filename() {
 native_addon_has_exports() {
   local file=$1
   local missing
-  missing=$(NATIVE_ADDON_EXPORTS="${NATIVE_ADDON_EXPORTS:-}" python3 - "$file" <<'PY'
+  missing=$(python3 - "$file" <<'PY'
 import os, sys
 path = sys.argv[1]
-need = os.environ.get("NATIVE_ADDON_EXPORTS", "countTokens executeShell visibleWidth DesktopSession hashlineStripPrefixes EditStore").split()
+need = (os.environ.get("NATIVE_ADDON_EXPORTS") or "countTokens executeShell visibleWidth DesktopSession hashlineStripPrefixes EditStore").split()
 data = open(path, "rb").read()
 missing = [name for name in need if name.encode() not in data]
 if missing:

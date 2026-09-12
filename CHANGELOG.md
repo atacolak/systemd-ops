@@ -25,7 +25,8 @@ records `postcondition-failed` route=lead and retries the same input.
 and asserts the export surface (`countTokens`, `executeShell`, `visibleWidth`,
 `DesktopSession`, `hashlineStripPrefixes`, `EditStore`) before handing a tree
 to the agent. Failure is blocker kind `native-provisioning`, not a 20-minute
-contract-failure park.
+contract-failure park. An unset or empty `NATIVE_ADDON_EXPORTS` still uses that
+default list.
 
 Generic observation is now first-class. `[observation]` names a
 scope-relative observer. `automation observe` validates observer payload
