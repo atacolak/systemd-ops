@@ -25,6 +25,10 @@ cat >"$BIN_DIR/hcom" <<'EOF'
 #!/usr/bin/env bash
 for arg in "$@"; do printf '%s\n' "$arg" >>"$HCOM_LOG"; done
 printf '%s\n' '@@end-call' >>"$HCOM_LOG"
+# HCOM_IGNORE_TERM models a call that traps TERM. The ignored disposition is
+# inherited across exec, so the `sleep` started afterwards is not killed by the
+# TERM either, and only the bound's own kill ends the call.
+if [[ ${HCOM_IGNORE_TERM:-0} -eq 1 ]]; then trap '' TERM; fi
 case ${1:-} in
   list)
     sleep "${HCOM_LIST_SLEEP:-0}"
@@ -125,7 +129,7 @@ start_case() {
   export HCOM_BIN=$BIN_DIR/hcom
   export SYSTEMD_OPS_BIN=$BIN_DIR/systemd-ops
   export SYSTEMD_OPS_SCOPE_ROOT=$CASE
-  unset HCOM_EXIT HCOM_LIST_EXIT HCOM_R_EXIT HCOM_LIST_SLEEP HCOM_R_SLEEP HCOM_SEND_SLEEP OPS_EXIT HCOM_TIMEOUT HCOM_SEND_TIMEOUT
+  unset HCOM_EXIT HCOM_LIST_EXIT HCOM_R_EXIT HCOM_LIST_SLEEP HCOM_R_SLEEP HCOM_SEND_SLEEP OPS_EXIT HCOM_TIMEOUT HCOM_SEND_TIMEOUT HCOM_IGNORE_TERM
   SCOPE_SHOW=$scope_show
 }
 
@@ -552,13 +556,55 @@ if command -v timeout >/dev/null 2>&1; then
   [[ $RESUME_HANG_SECONDS -lt 6 ]] || fail "hung resume took ${RESUME_HANG_SECONDS}s, HCOM_TIMEOUT did not bound it"
 fi
 
+# The kill-after grace applies through the same helper for the roster read and
+# the resume, so the bound means one thing for every call the seam makes. A
+# roster read that ignores TERM is killed 2s after its 1s bound, its failure
+# stays silent and best effort, and the delivery is not held up by it.
+start_case roster-ignores-term "$LEAD_OK" "$ROSTER_STOPPED"
+export HCOM_TIMEOUT=1 HCOM_LIST_SLEEP=8 HCOM_IGNORE_TERM=1
+SECONDS=0
+notify omp-runtime inform "build finished"
+ROSTER_TERM_SECONDS=$SECONDS
+unset HCOM_TIMEOUT HCOM_LIST_SLEEP HCOM_IGNORE_TERM
+[[ $CODE -eq 0 ]] || fail "a roster read that ignores TERM returned $CODE: $ERR"
+[[ -z $ERR ]] || fail "a roster read that ignores TERM was not silent: $ERR"
+[[ $(count_calls_with "$HCOM_LOG" r) -eq 0 ]] || fail "a roster read that ignores TERM still attempted a wake"
+[[ $(call_text_with "$HCOM_LOG" send) == "send --as-system omp-runtime @midi --intent inform -- build finished" ]] \
+  || fail "a roster read that ignores TERM changed the delivery argv: $(call_text_with "$HCOM_LOG" send)"
+if command -v timeout >/dev/null 2>&1; then
+  [[ $ROSTER_TERM_SECONDS -lt 6 ]] \
+    || fail "a roster read that ignores TERM took ${ROSTER_TERM_SECONDS}s, the kill-after grace did not end it"
+fi
+
+# The resume is the third bounded call and takes the same treatment, so the
+# bound cannot mean one thing for a roster read and another for the wake that
+# follows it. A resume that ignores TERM is killed 2s after its 1s bound, its
+# failure stays best effort, and the delivery is still made.
+start_case resume-ignores-term "$LEAD_OK" "$ROSTER_STOPPED"
+export HCOM_TIMEOUT=1 HCOM_R_SLEEP=8 HCOM_IGNORE_TERM=1
+SECONDS=0
+notify omp-runtime inform "build finished"
+RESUME_TERM_SECONDS=$SECONDS
+unset HCOM_TIMEOUT HCOM_R_SLEEP HCOM_IGNORE_TERM
+[[ $CODE -eq 0 ]] || fail "a resume that ignores TERM returned $CODE: $ERR"
+[[ -z $ERR ]] || fail "a resume that ignores TERM was not silent: $ERR"
+[[ $(count_calls_with "$HCOM_LOG" r) -eq 1 ]] || fail "a resume that ignores TERM was not attempted exactly once"
+[[ $(call_text_with "$HCOM_LOG" send) == "send --as-system omp-runtime @midi --intent inform -- build finished" ]] \
+  || fail "a resume that ignores TERM changed the delivery argv: $(call_text_with "$HCOM_LOG" send)"
+if command -v timeout >/dev/null 2>&1; then
+  [[ $RESUME_TERM_SECONDS -lt 6 ]] \
+    || fail "a resume that ignores TERM took ${RESUME_TERM_SECONDS}s, the kill-after grace did not end it"
+fi
+
 # A hung delivery is bounded by HCOM_SEND_TIMEOUT, which is a knob of its own
 # with a larger default than HCOM_TIMEOUT because a legitimate send can take
 # longer than a roster read. A killed send is a delivery failure, not a silent
-# retry: the seam returns the timeout status and stderr names the timeout and
-# the recipient, so a caller can tell a timeout from an hcom error. HCOM may
-# already have accepted a message whose send is killed, which is what a bound
-# costs here.
+# retry: the seam returns the status it saw and stderr names the bound and the
+# recipient, so a caller can tell a killed call from an hcom error. 124 is the
+# status `timeout` reports for a call it killed at the bound, and the seam
+# reports no more than that, because an hcom that exits 124 on its own reports
+# the same value (the case below). HCOM may already have accepted a message
+# whose send is killed, which is what a bound costs here.
 start_case send-hang "$LEAD_OK" "$ROSTER_LIVE"
 export HCOM_SEND_TIMEOUT=1 HCOM_SEND_SLEEP=10
 SECONDS=0
@@ -567,13 +613,66 @@ SEND_HANG_SECONDS=$SECONDS
 unset HCOM_SEND_TIMEOUT HCOM_SEND_SLEEP
 [[ $CODE -eq 124 ]] || fail "hung send returned $CODE, want 124: $ERR"
 [[ $ERR == *"@midi"* ]] || fail "hung send did not name the recipient: $ERR"
-[[ $ERR == *"timed out"* ]] || fail "hung send did not report a timeout: $ERR"
-[[ $ERR == *"1s"* ]] || fail "hung send did not name the timeout: $ERR"
+[[ $ERR == *"124"* ]] || fail "hung send did not report the status it saw: $ERR"
+[[ $ERR == *"1s"* ]] || fail "hung send did not name the bound: $ERR"
 [[ $(call_count "$HCOM_LOG") -eq 2 ]] || fail "hung send made $(call_count "$HCOM_LOG") hcom calls"
 [[ $(count_calls_with "$HCOM_LOG" send) -eq 1 ]] || fail "hung send was not attempted exactly once"
 if command -v timeout >/dev/null 2>&1; then
   [[ $SEND_HANG_SECONDS -lt 6 ]] || fail "hung send took ${SEND_HANG_SECONDS}s, HCOM_SEND_TIMEOUT did not bound it"
 fi
+
+# A bound is only real if a call that traps TERM still dies at its bound.
+# `timeout` sends TERM at the bound and then waits for the child, so a call
+# that ignores TERM outlives its bound by as long as it likes: with the 8s
+# sleep below and no kill-after, the send ended when its own sleep did. The
+# grace ends it 2s after the bound. The elapsed check is skipped where
+# `timeout` is unavailable, because there the bound is not applied at all. The
+# kill is a signal, so the shell that waits for the call adds its own job line
+# to stderr, which is why this case checks that the seam's message names the
+# recipient rather than that stderr holds nothing else.
+start_case send-ignores-term "$LEAD_OK" "$ROSTER_LIVE"
+export HCOM_SEND_TIMEOUT=1 HCOM_SEND_SLEEP=8 HCOM_IGNORE_TERM=1
+SECONDS=0
+notify omp-runtime inform "build finished"
+SEND_TERM_SECONDS=$SECONDS
+unset HCOM_SEND_TIMEOUT HCOM_SEND_SLEEP HCOM_IGNORE_TERM
+[[ $CODE -ne 0 ]] || fail "a send that ignores TERM returned $CODE, want nonzero: $ERR"
+[[ $ERR == *"@midi"* ]] || fail "a send that ignores TERM did not name the recipient: $ERR"
+[[ $(count_calls_with "$HCOM_LOG" send) -eq 1 ]] || fail "a send that ignores TERM was retried"
+if command -v timeout >/dev/null 2>&1; then
+  [[ $SEND_TERM_SECONDS -lt 6 ]] \
+    || fail "a send that ignores TERM took ${SEND_TERM_SECONDS}s, the kill-after grace did not end it"
+fi
+
+# 124 is not proof of a timeout: the seam cannot tell a call it killed at the
+# bound from a call that chose 124, so it reports the status it saw instead of
+# a cause. It stays a delivery failure: nonzero, no retry, recipient named.
+start_case send-exit-124 "$LEAD_OK" "$ROSTER_LIVE"
+export HCOM_SEND_TIMEOUT=30 HCOM_EXIT=124
+notify omp-runtime inform "build finished"
+unset HCOM_SEND_TIMEOUT HCOM_EXIT
+[[ $CODE -eq 124 ]] || fail "a send that exits 124 returned $CODE, want 124: $ERR"
+[[ $ERR == *"@midi"* ]] || fail "a send that exits 124 did not name the recipient: $ERR"
+[[ $ERR == *"124"* ]] || fail "a send that exits 124 did not report the status it saw: $ERR"
+[[ $ERR != *"timed out"* ]] || fail "a send that exits 124 was reported as a timeout: $ERR"
+[[ $(count_calls_with "$HCOM_LOG" send) -eq 1 ]] || fail "a send that exits 124 was retried"
+
+# 125 is `timeout`'s own failure status, so it is not reported as an hcom
+# status: that wording is what pointed a diagnostician at hcom for a local
+# misconfiguration. The bound check keeps an unparsable interval out of this
+# path, and `timeout` reports a call it cannot run as 126 or 127, so the branch
+# covers any other way the bound itself fails. The status below reaches the
+# seam from the fake hcom precisely because the seam cannot tell the two apart,
+# which is why the message does not name hcom as the failing process.
+start_case send-status-125 "$LEAD_OK" "$ROSTER_LIVE"
+export HCOM_EXIT=125
+notify omp-runtime inform "build finished"
+unset HCOM_EXIT
+[[ $CODE -eq 125 ]] || fail "status 125 returned $CODE, want 125: $ERR"
+[[ $ERR == *"@midi"* ]] || fail "status 125 did not name the recipient: $ERR"
+[[ $ERR == *"125"* ]] || fail "status 125 did not report the status it saw: $ERR"
+[[ $ERR != *"failed with status 125"* ]] || fail "status 125 was reported as an hcom failure: $ERR"
+[[ $(count_calls_with "$HCOM_LOG" send) -eq 1 ]] || fail "status 125 was retried"
 
 # A send that finishes inside its bound is delivered as before, with the same
 # argv, so the bound does not interfere with an ordinary notification.
@@ -585,6 +684,71 @@ unset HCOM_SEND_TIMEOUT
 [[ -z $ERR ]] || fail "fast send under HCOM_SEND_TIMEOUT=1 wrote to stderr: $ERR"
 [[ $(call_text_with "$HCOM_LOG" send) == "send --as-system omp-runtime @midi --intent inform -- build finished" ]] \
   || fail "fast send argv under HCOM_SEND_TIMEOUT=1: $(call_text_with "$HCOM_LOG" send)"
+
+# A bound is a whole number of seconds greater than zero, and anything else is
+# refused with status 2 before any hcom call. `timeout 0` is not a zero length
+# bound: it is no bound at all, which is the unbounded watcher the bound exists
+# to prevent, and a value `timeout` cannot parse makes it fail with a status of
+# its own (125) that says nothing about hcom. The refusal names the knob and
+# the value it read, so the misconfiguration is local and obvious, and it
+# covers both knobs.
+start_case bound-send-zero "$LEAD_OK" "$ROSTER_LIVE"
+export HCOM_SEND_TIMEOUT=0
+notify omp-runtime inform "build finished"
+unset HCOM_SEND_TIMEOUT
+[[ $CODE -eq 2 ]] || fail "HCOM_SEND_TIMEOUT=0 returned $CODE, want 2: $ERR"
+[[ $ERR == *"HCOM_SEND_TIMEOUT"* ]] || fail "HCOM_SEND_TIMEOUT=0 did not name the knob: $ERR"
+[[ $ERR == *"0"* ]] || fail "HCOM_SEND_TIMEOUT=0 did not name the value: $ERR"
+[[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "HCOM_SEND_TIMEOUT=0 reached hcom"
+
+start_case bound-send-noninteger "$LEAD_OK" "$ROSTER_LIVE"
+export HCOM_SEND_TIMEOUT=abc
+notify omp-runtime inform "build finished"
+unset HCOM_SEND_TIMEOUT
+[[ $CODE -eq 2 ]] || fail "HCOM_SEND_TIMEOUT=abc returned $CODE, want 2: $ERR"
+[[ $ERR == *"HCOM_SEND_TIMEOUT"* ]] || fail "HCOM_SEND_TIMEOUT=abc did not name the knob: $ERR"
+[[ $ERR == *"abc"* ]] || fail "HCOM_SEND_TIMEOUT=abc did not name the value: $ERR"
+[[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "HCOM_SEND_TIMEOUT=abc reached hcom"
+
+start_case bound-timeout-zero "$LEAD_OK" "$ROSTER_LIVE"
+export HCOM_TIMEOUT=0
+notify omp-runtime inform "build finished"
+unset HCOM_TIMEOUT
+[[ $CODE -eq 2 ]] || fail "HCOM_TIMEOUT=0 returned $CODE, want 2: $ERR"
+[[ $ERR == *"HCOM_TIMEOUT"* ]] || fail "HCOM_TIMEOUT=0 did not name the knob: $ERR"
+[[ $ERR == *"0"* ]] || fail "HCOM_TIMEOUT=0 did not name the value: $ERR"
+[[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "HCOM_TIMEOUT=0 reached hcom"
+
+start_case bound-timeout-noninteger "$LEAD_OK" "$ROSTER_LIVE"
+export HCOM_TIMEOUT=abc
+notify omp-runtime inform "build finished"
+unset HCOM_TIMEOUT
+[[ $CODE -eq 2 ]] || fail "HCOM_TIMEOUT=abc returned $CODE, want 2: $ERR"
+[[ $ERR == *"HCOM_TIMEOUT"* ]] || fail "HCOM_TIMEOUT=abc did not name the knob: $ERR"
+[[ $ERR == *"abc"* ]] || fail "HCOM_TIMEOUT=abc did not name the value: $ERR"
+[[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "HCOM_TIMEOUT=abc reached hcom"
+
+# A whole number of seconds greater than zero still bounds the call, with the
+# delivery argv untouched, and an unset or empty knob still takes the default
+# the header documents rather than being read as a bound of zero.
+start_case bound-send-valid "$LEAD_OK" "$ROSTER_LIVE"
+export HCOM_SEND_TIMEOUT=2
+notify omp-runtime inform "build finished"
+[[ $CODE -eq 0 ]] || fail "HCOM_SEND_TIMEOUT=2 returned $CODE: $ERR"
+[[ $(call_text_with "$HCOM_LOG" send) == "send --as-system omp-runtime @midi --intent inform -- build finished" ]] \
+  || fail "HCOM_SEND_TIMEOUT=2 delivery argv: $(call_text_with "$HCOM_LOG" send)"
+export HCOM_SEND_TIMEOUT=
+notify omp-runtime inform "build finished"
+unset HCOM_SEND_TIMEOUT
+[[ $CODE -eq 0 ]] || fail "an empty HCOM_SEND_TIMEOUT returned $CODE: $ERR"
+
+start_case bound-timeout-valid "$LEAD_OK" "$ROSTER_LIVE"
+export HCOM_TIMEOUT=2
+notify omp-runtime inform "build finished"
+unset HCOM_TIMEOUT
+[[ $CODE -eq 0 ]] || fail "HCOM_TIMEOUT=2 returned $CODE: $ERR"
+[[ $(call_text "$HCOM_LOG" 1) == "list --all --json" ]] || fail "HCOM_TIMEOUT=2 roster argv: $(call_text "$HCOM_LOG" 1)"
+[[ $(count_calls_with "$HCOM_LOG" send) -eq 1 ]] || fail "HCOM_TIMEOUT=2 blocked delivery"
 
 # The two bounds are independent. A slow roster read is cut short by
 # HCOM_TIMEOUT while the send keeps its own, larger budget, and a slow send is

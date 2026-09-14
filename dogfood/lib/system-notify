@@ -7,10 +7,12 @@
 # scope's coordination.lead, so it can never become a broadcast. The reserved
 # source id `overseer` is refused.
 #
-# Returns 0 after delivery, 2 when the notification is refused or the lead
-# cannot be resolved, hcom's own status when hcom fails, and the timeout status
-# (124) when the delivery send is killed at its bound. Nothing is sent before
-# the source id, the intent, and coordination.lead all validate. A source id is
+# Returns 0 after delivery, 2 when the notification is refused, the lead cannot
+# be resolved, or a bound is not a whole number of seconds greater than zero,
+# and the status of the bounded delivery call when it fails: 124 when the bound
+# ended it, 137 when the bound had to kill it, 125 when the bound itself
+# failed, and hcom's own status otherwise. Nothing is sent before the source
+# id, the intent, coordination.lead, and both bounds validate. A source id is
 # 1 to 50 characters of [a-z0-9] followed by [a-z0-9_:-]. That is
 # a strict subset of HCOM's [A-Za-z0-9_-:] charset, and the narrowing is
 # deliberate: no uppercase, and a first character that has to be alphanumeric,
@@ -30,32 +32,76 @@
 # killed and treated as a failure (default 5), and HCOM_SEND_TIMEOUT for the
 # seconds the delivery send may take before it is killed and reported as a
 # failed delivery (default 30). The send bound is the larger one because a
-# delivery can legitimately take longer than a roster read. They are read at
-# call time, so sourcing this file has no effect at all.
+# delivery can legitimately take longer than a roster read. Each bound is a
+# whole number of seconds greater than zero, and any other value refuses the
+# notification with status 2 and a message naming the knob and the value it
+# read, before any hcom call: `timeout 0` is not a zero length bound but no
+# bound at all (the timeout(1) manual: a duration of 0 disables the associated
+# timeout), so a 0 read as a duration would leave the unbounded watcher this
+# bound exists to prevent, while a value `timeout` cannot parse fails the call
+# with a status of its own that says nothing about hcom. An unset or empty knob
+# takes its default. Both are read at call time, so sourcing this file makes no
+# call and reads no environment.
 #
 # The roster read and the resume are bounded by HCOM_TIMEOUT, the delivery send
-# by HCOM_SEND_TIMEOUT. A send timeout is reported rather than swallowed: the
-# seam returns the timeout status and writes the timeout and the recipient to
-# stderr, so a caller can tell a timeout from an hcom error. A killed send may
-# still have been accepted by HCOM, so a caller that retries a timed-out send
-# can duplicate a notification. A bound cannot make a hung transport deliver;
-# it converts a permanent hang into a failure. The watcher unit is Type=oneshot
-# with TimeoutStartUSec=infinity, so a send that never returned would leave the
-# watcher alive and notifying nothing.
+# by HCOM_SEND_TIMEOUT. A bound sends TERM when it expires and then waits for
+# the call to end, so a call that ignores TERM is killed with KILL
+# SYSTEM_NOTIFY_KILL_GRACE seconds later. That grace is a constant of this file
+# and not a knob: it is not a wait a healthy call is allowed, and a caller has
+# no reason to choose it. No bounded call outlives its bound by more than the
+# grace. A send the bound ended is reported rather than swallowed, with the
+# bound, the status seen, and the recipient on stderr. The status is evidence
+# and not a diagnosis: 124 is the status `timeout` reports for a call it killed
+# at the bound, and 137 (128 plus SIGKILL) the one it reports when the KILL
+# signal reaches the call or `timeout` itself, so a forced kill also leaves the
+# shell's own job line on stderr; an hcom that exits 124 on its own, or is
+# killed by SIGKILL on its own, reports the same values, and the seam cannot
+# tell them apart. 125 is `timeout`'s own failure status, which the bound check
+# above keeps out of the knob path, so it points at the bound rather than at
+# hcom. A killed send may still have been accepted by HCOM, so a caller that
+# retries a killed send can duplicate a notification. A bound cannot make a hung
+# transport deliver; it converts a permanent hang into a failure. The watcher
+# unit is Type=oneshot with TimeoutStartUSec=infinity, so a send that never
+# returned would leave the watcher alive and notifying nothing.
 
-# Bounds one hcom call. $1 is the seconds the call may take before it is killed
-# and treated like any other failure; each caller reads its own bound,
-# HCOM_TIMEOUT or HCOM_SEND_TIMEOUT, at call time. Where `timeout` is not
-# available the call is made unbounded rather than skipped, so the seam keeps
-# working.
+# The grace, in seconds, between the TERM a bound sends and the KILL that ends
+# a call which ignored it. A bound is only real if a call that traps TERM still
+# dies at its bound: `timeout` sends TERM when the bound expires and then waits
+# for the child, so without this grace a call that ignores TERM outlives its
+# bound for as long as it likes. The grace is a constant rather than a knob: it
+# is not a wait a healthy call is allowed, and a caller has no reason to choose
+# it, so it is not a third value that can be misconfigured.
+SYSTEM_NOTIFY_KILL_GRACE=2
+
+# Bounds one hcom call. $1 is a whole number of seconds greater than zero, read
+# and checked by the caller, that the call may take before it is killed and
+# treated like any other failure; a call that ignores the TERM is killed
+# outright SYSTEM_NOTIFY_KILL_GRACE seconds later. Each caller reads its own
+# bound, HCOM_TIMEOUT or HCOM_SEND_TIMEOUT, at call time. Where `timeout` is
+# not available the call is made unbounded rather than skipped, so the seam
+# keeps working.
 system_notify_hcom_call() {
   local hcom_timeout=$1
   shift
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$hcom_timeout" "$@"
+    timeout -k "$SYSTEM_NOTIFY_KILL_GRACE" "$hcom_timeout" "$@"
   else
     "$@"
   fi
+}
+
+# A bound is a whole number of seconds greater than zero. Digits are spelled
+# out one at a time for the same reason as the charset check in system_notify:
+# a range is expanded through the collation in force. Any other value is
+# refused rather than handed to `timeout`, which reads 0 as no bound at all and
+# fails on a value it cannot parse with a status of its own, so neither a zero
+# nor a non-number can quietly escape the duration the header documents.
+system_notify_bound_ok() {
+  case $1 in
+    '' | *[!0123456789]*) return 1 ;;
+    *[123456789]*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Resumes a lead that is not live, once, with the HCOM bus resume. The roster
@@ -65,12 +111,13 @@ system_notify_hcom_call() {
 # roster, or read from a roster that cannot be parsed is left alone, and a row
 # whose name is null, missing, or not a string is skipped rather than aborting
 # the match. Both calls are best effort: their output is discarded, their
-# status is ignored, each is bounded by HCOM_TIMEOUT, and no failure or hang
-# here can stop the notification.
+# status is ignored, each is bounded by the HCOM_TIMEOUT value in $2, which the
+# caller has read and checked, and no failure or hang here can stop the
+# notification.
 system_notify_wake_lead() {
   local name=$1
+  local hcom_timeout=$2
   local hcom_bin=${HCOM_BIN:-/home/sf/.local/bin/hcom}
-  local hcom_timeout=${HCOM_TIMEOUT:-5}
   local roster lead_row lead_status
 
   roster=$(system_notify_hcom_call "$hcom_timeout" "$hcom_bin" list --all --json 2>/dev/null || true)
@@ -103,6 +150,7 @@ system_notify() {
   local scope_root=${SYSTEMD_OPS_SCOPE_ROOT:-${SCOPE_ROOT:-/home/sf/workspace/oh-my-pi}}
   local systemd_ops_bin=${SYSTEMD_OPS_BIN:-/home/sf/.local/bin/systemd-ops}
   local hcom_bin=${HCOM_BIN:-/home/sf/.local/bin/hcom}
+  local hcom_timeout=${HCOM_TIMEOUT:-5}
   local hcom_send_timeout=${HCOM_SEND_TIMEOUT:-30}
   local scope_json lead_handle lead_name rc
   # The accepted charset, spelled out one character at a time. A range such as
@@ -147,19 +195,44 @@ system_notify() {
   fi
   lead_name=${lead_handle#hcom:}
 
-  system_notify_wake_lead "$lead_name"
+  # Both bounds are read and checked here, before the first hcom call, so a
+  # knob that is not a whole number of seconds greater than zero refuses the
+  # notification and names the knob and the value it read. The check sits after
+  # the source id, the intent, and the lead so the order of the existing
+  # refusals is unchanged.
+  if ! system_notify_bound_ok "$hcom_timeout"; then
+    echo "system_notify: HCOM_TIMEOUT='$hcom_timeout' is not a whole number of seconds greater than zero" >&2
+    return 2
+  fi
+  if ! system_notify_bound_ok "$hcom_send_timeout"; then
+    echo "system_notify: HCOM_SEND_TIMEOUT='$hcom_send_timeout' is not a whole number of seconds greater than zero" >&2
+    return 2
+  fi
+
+  system_notify_wake_lead "$lead_name" "$hcom_timeout"
 
   rc=0
   system_notify_hcom_call "$hcom_send_timeout" "$hcom_bin" send --as-system "$source_id" "@$lead_name" --intent "$intent" -- "$message" || rc=$?
   if (( rc != 0 )); then
-    # `timeout` reports a call it killed as 124. This is a delivery failure
-    # like any other: it is not retried, and HCOM may already have accepted the
-    # message.
-    if (( rc == 124 )); then
-      echo "system_notify: hcom send as $source_id to @$lead_name timed out after ${hcom_send_timeout}s" >&2
-    else
-      echo "system_notify: hcom send as $source_id to @$lead_name failed with status $rc" >&2
-    fi
+    # This is a delivery failure like any other: it is not retried, and HCOM
+    # may already have accepted the message. The status is reported as what was
+    # seen, not as a cause, because the seam cannot separate a call the bound
+    # ended from an hcom that exited with the same value, and 125 belongs to
+    # `timeout` rather than to the call it runs.
+    case $rc in
+      124)
+        echo "system_notify: hcom send as $source_id to @$lead_name was killed at the ${hcom_send_timeout}s bound or exited with the timeout status 124" >&2
+        ;;
+      137)
+        echo "system_notify: hcom send as $source_id to @$lead_name was sent KILL ${SYSTEM_NOTIFY_KILL_GRACE}s after the ${hcom_send_timeout}s bound, status 137" >&2
+        ;;
+      125)
+        echo "system_notify: hcom send as $source_id to @$lead_name ended with status 125, the status timeout reports for its own failure rather than for hcom" >&2
+        ;;
+      *)
+        echo "system_notify: hcom send as $source_id to @$lead_name failed with status $rc" >&2
+        ;;
+    esac
     return "$rc"
   fi
   return 0
