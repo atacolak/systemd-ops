@@ -101,6 +101,7 @@ ROSTER_STOPPED='[{"name":"midi","base_name":"midi","status":"stopped"}]'
 ROSTER_EXITED='[{"name":"midi","base_name":"midi","status":"exited"}]'
 ROSTER_NO_LEAD='[{"name":"gina","base_name":"gina","status":"listening"}]'
 ROSTER_NULL_NAME='[{"name":null,"base_name":"gina","status":"stopped"},{"name":"midi","base_name":"midi","status":"stopped"}]'
+ROSTER_NUMERIC_NAME='[{"name":123,"base_name":"gina","status":"stopped"},{"name":"midi","base_name":"midi","status":"stopped"}]'
 
 CASE=
 SCOPE_SHOW=
@@ -142,6 +143,25 @@ notify_args() {
 
 notify() {
   notify_args "$1" "$2" "$3"
+}
+
+# Runs the notify call in a fresh shell under exactly the locale in $1, so a
+# guard that quietly depends on the ambient collation cannot look correct here.
+# A fresh shell also leaves the suite's own locale variables untouched.
+notify_under_locale() {
+  local locale=$1
+  shift
+  set +e
+  env LC_ALL="$locale" bash -c '
+    source "$1" || exit 3
+    shift
+    declare -F system_notify >/dev/null || exit 3
+    system_notify "$@"
+  ' _ "$LIB" "$@" >"$TMP/stdout" 2>"$TMP/stderr"
+  CODE=$?
+  set -e
+  OUT=$(cat "$TMP/stdout")
+  ERR=$(cat "$TMP/stderr")
 }
 
 # Argument count: exactly three arguments are required, and an argv refusal
@@ -253,6 +273,50 @@ notify "$source_id" inform "generation published"
 [[ $ERR == *"1-50"* ]] || fail "51-character source id stderr does not name the length cap: $ERR"
 [[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "51-character source id reached hcom"
 
+# Every shape the operation-stem convention uses is still accepted, so the
+# charset is not narrowed by accident while it is made collation-independent.
+accepted_index=0
+for accepted_id in omp-runtime systemd-ops:runtime-run a9-b_c:d 9z a a_b overseer2; do
+  accepted_index=$((accepted_index + 1))
+  start_case "source-accepted-$accepted_index" "$LEAD_OK" "$ROSTER_LIVE"
+  notify "$accepted_id" inform "generation published"
+  [[ $CODE -eq 0 ]] || fail "source id '$accepted_id' returned $CODE, want 0: $ERR"
+  [[ $(call_text_with "$HCOM_LOG" send) == "send --as-system $accepted_id @midi --intent inform -- generation published" ]] \
+    || fail "unexpected argv for source id '$accepted_id': $(call_text_with "$HCOM_LOG" send)"
+done
+
+# A non-ASCII source id is refused before any hcom call, because HCOM's
+# charset is [A-Za-z0-9_-:] and does not accept it. The case runs under three
+# collations on purpose: the ambient one, a UTF-8 locale pinned through LC_ALL,
+# and C. A [a-z] range is not a fixed charset: under a UTF-8 collation it also
+# matches accented lowercase letters, so only a check that ignores the
+# collation at all passes all three.
+start_case source-non-ascii "$LEAD_OK" "$ROSTER_LIVE"
+non_ascii_source=$'omp\u00e9'
+notify "$non_ascii_source" inform "generation published"
+[[ $CODE -eq 2 ]] || fail "non-ASCII source id under the ambient locale returned $CODE, want 2: $ERR"
+[[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "non-ASCII source id under the ambient locale reached hcom"
+
+UTF8_LOCALE=
+for candidate in en_US.UTF-8 en_US.utf8; do
+  if locale -a 2>/dev/null | grep -qxF "$candidate"; then
+    UTF8_LOCALE=$candidate
+    break
+  fi
+done
+
+if [[ -n $UTF8_LOCALE ]]; then
+  notify_under_locale "$UTF8_LOCALE" "$non_ascii_source" inform "generation published"
+  [[ $CODE -eq 2 ]] || fail "non-ASCII source id under LC_ALL=$UTF8_LOCALE returned $CODE, want 2: $ERR"
+  [[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "non-ASCII source id under LC_ALL=$UTF8_LOCALE reached hcom"
+else
+  echo "note: no en_US.UTF-8 locale on this host; the non-ASCII source id ran under the ambient and C collations" >&2
+fi
+
+notify_under_locale C "$non_ascii_source" inform "generation published"
+[[ $CODE -eq 2 ]] || fail "non-ASCII source id under LC_ALL=C returned $CODE, want 2: $ERR"
+[[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "non-ASCII source id under LC_ALL=C reached hcom"
+
 # Unresolvable lead: refused, and specifically not broadcast.
 start_case lead-missing '{"ok":true,"data":{"coordination":{}}}' "$ROSTER_LIVE"
 notify omp-runtime inform "build finished"
@@ -275,6 +339,24 @@ start_case lead-not-hcom '{"ok":true,"data":{"coordination":{"lead":"midi"}}}' "
 notify omp-runtime inform "build finished"
 [[ $CODE -ne 0 ]] || fail "non-hcom lead handle was accepted"
 [[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "non-hcom lead handle reached hcom"
+
+# The lead handle is checked with the same care as the source id: a handle
+# whose fourth character is accented is not an hcom handle and never reaches
+# hcom. jq decodes the \u00e9 escape, so the case is written in plain ASCII.
+start_case lead-non-ascii '{"ok":true,"data":{"coordination":{"lead":"hcom:mid\u00e9"}}}' "$ROSTER_LIVE"
+notify omp-runtime inform "build finished"
+[[ $CODE -eq 2 ]] || fail "non-ASCII lead handle under the ambient locale returned $CODE, want 2: $ERR"
+[[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "non-ASCII lead handle under the ambient locale reached hcom"
+
+if [[ -n $UTF8_LOCALE ]]; then
+  notify_under_locale "$UTF8_LOCALE" omp-runtime inform "build finished"
+  [[ $CODE -eq 2 ]] || fail "non-ASCII lead handle under LC_ALL=$UTF8_LOCALE returned $CODE, want 2: $ERR"
+  [[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "non-ASCII lead handle under LC_ALL=$UTF8_LOCALE reached hcom"
+fi
+
+notify_under_locale C omp-runtime inform "build finished"
+[[ $CODE -eq 2 ]] || fail "non-ASCII lead handle under LC_ALL=C returned $CODE, want 2: $ERR"
+[[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "non-ASCII lead handle under LC_ALL=C reached hcom"
 
 # A failed delivery is reported as a failure.
 start_case send-failure "$LEAD_OK" "$ROSTER_LIVE"
@@ -337,6 +419,16 @@ notify omp-runtime inform "build finished"
 [[ $(call_text "$HCOM_LOG" 2) == "r midi --go" ]] || fail "null roster name wake call: $(call_text "$HCOM_LOG" 2)"
 [[ $(call_text_with "$HCOM_LOG" send) == "send --as-system omp-runtime @midi --intent inform -- build finished" ]] \
   || fail "null roster name delivery argv: $(call_text_with "$HCOM_LOG" send)"
+
+# A name of an unexpected type is skipped the same way: the match must not
+# abort on it and lose the later row that does name the lead.
+start_case wake-numeric-row-name "$LEAD_OK" "$ROSTER_NUMERIC_NAME"
+notify omp-runtime inform "build finished"
+[[ $CODE -eq 0 ]] || fail "non-string roster name returned $CODE: $ERR"
+[[ $(count_calls_with "$HCOM_LOG" r) -eq 1 ]] || fail "non-string roster name masked the wake"
+[[ $(call_text "$HCOM_LOG" 2) == "r midi --go" ]] || fail "non-string roster name wake call: $(call_text "$HCOM_LOG" 2)"
+[[ $(call_text_with "$HCOM_LOG" send) == "send --as-system omp-runtime @midi --intent inform -- build finished" ]] \
+  || fail "non-string roster name delivery argv: $(call_text_with "$HCOM_LOG" send)"
 
 # A failed resume is not a failed notification.
 start_case wake-resume-failure "$LEAD_OK" "$ROSTER_STOPPED"

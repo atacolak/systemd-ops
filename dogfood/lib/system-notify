@@ -10,8 +10,17 @@
 # Returns 0 after delivery, 2 when the notification is refused or the lead
 # cannot be resolved, and hcom's own status when hcom fails. Nothing is sent
 # before the source id, the intent, and coordination.lead all validate. A
-# source id is 1 to 50 characters of [a-z0-9] followed by [a-z0-9_:-], the same
-# charset HCOM accepts, so an id can never pass here and fail at HCOM.
+# source id is 1 to 50 characters of [a-z0-9] followed by [a-z0-9_:-]. That is
+# a strict subset of HCOM's [A-Za-z0-9_-:] charset, and the narrowing is
+# deliberate: no uppercase, and a first character that has to be alphanumeric,
+# so a leading _, : or - is refused here even though it is inside HCOM's
+# charset. An id that passes this check therefore cannot fail at HCOM's own
+# charset check.
+#
+# Both charset checks name their characters one at a time rather than through
+# [a-z] ranges, because a range is expanded through the collation in force and
+# under a UTF-8 locale also matches accented lowercase letters, which HCOM then
+# refuses.
 #
 # Binaries, the scope root, and the hcom call bound come from the environment
 # the same way the rest of the wrapper library takes them: HCOM_BIN,
@@ -19,6 +28,10 @@
 # for the seconds the roster read and the resume may each take before they are
 # killed and treated as a failure (default 5). They are read at call time, so
 # sourcing this file has no effect at all.
+#
+# The bound covers the roster read and the resume only. The delivery `hcom
+# send` is not bounded: a bound cannot make a hung transport deliver, so a
+# timeout there would only misreport a notification the bus may have taken.
 
 # Bounds one best-effort hcom call. HCOM_TIMEOUT, read at call time with the
 # other binaries, is how many seconds the call may take before it is killed and
@@ -38,10 +51,10 @@ system_notify_hcom_call() {
 # lead named there with an empty, stopped, idle, exited, or dead status is
 # resumed with `hcom r <name> --go`. A lead that is live, absent from the
 # roster, or read from a roster that cannot be parsed is left alone, and a row
-# whose name is null or missing is skipped rather than aborting the match. Both
-# calls are best effort: their output is discarded, their status is ignored,
-# each is bounded by HCOM_TIMEOUT, and no failure or hang here can stop the
-# notification.
+# whose name is null, missing, or not a string is skipped rather than aborting
+# the match. Both calls are best effort: their output is discarded, their
+# status is ignored, each is bounded by HCOM_TIMEOUT, and no failure or hang
+# here can stop the notification.
 system_notify_wake_lead() {
   local name=$1
   local hcom_bin=${HCOM_BIN:-/home/sf/.local/bin/hcom}
@@ -50,7 +63,7 @@ system_notify_wake_lead() {
   roster=$(system_notify_hcom_call "$hcom_bin" list --all --json 2>/dev/null || true)
   lead_row=$(jq -c --arg n "$name" '
     if type == "array" then . else [] end
-    | map(select((.base_name == $n) or (.name // "" | test("(^|-)" + $n + "$"))))
+    | map(select((.base_name == $n) or (.name // "" | tostring | test("(^|-)" + $n + "$"))))
     | .[0] // empty
   ' <<<"$roster" 2>/dev/null || true)
   if [[ -z $lead_row ]]; then
@@ -78,8 +91,15 @@ system_notify() {
   local systemd_ops_bin=${SYSTEMD_OPS_BIN:-/home/sf/.local/bin/systemd-ops}
   local hcom_bin=${HCOM_BIN:-/home/sf/.local/bin/hcom}
   local scope_json lead_handle lead_name rc
+  # The accepted charset, spelled out one character at a time. A range such as
+  # [a-z] is expanded through the ambient collation, and under a UTF-8 locale
+  # it also matches accented lowercase letters such as U+00E9, so the range
+  # would accept an id that HCOM, whose charset is [A-Za-z0-9_-:], then
+  # refuses. These lists are the charset in every locale.
+  local ascii_lower='abcdefghijklmnopqrstuvwxyz'
+  local ascii_digit='0123456789'
 
-  if [[ ! $source_id =~ ^[a-z0-9][a-z0-9_:-]*$ || ${#source_id} -gt 50 ]]; then
+  if [[ ! $source_id =~ ^[$ascii_digit$ascii_lower][$ascii_digit${ascii_lower}_:-]*$ || ${#source_id} -gt 50 ]]; then
     echo "system_notify: source id '$source_id' is not 1-50 characters of [a-z0-9] followed by [a-z0-9_:-]" >&2
     return 2
   fi
@@ -105,7 +125,9 @@ system_notify() {
     echo "no coordination.lead bound in $scope_root" >&2
     return 2
   fi
-  if [[ ! $lead_handle =~ ^hcom:[a-z]{4}$ ]]; then
+  # The same charset care as the source id: [a-z] here would also match an
+  # accented letter under a UTF-8 collation.
+  if [[ ! $lead_handle =~ ^hcom:[$ascii_lower]{4}$ ]]; then
     echo "system_notify: coordination.lead is not an hcom:<four letters> handle: $lead_handle" >&2
     return 2
   fi
