@@ -45,8 +45,12 @@ source "$SCOPE_ROOT/.systemd-ops/lib/pr-review-state"
 # Condition 3 is what stops a tree that merely has the right branch name, or one
 # that descends from some other generation, from self-reporting READY: a tree
 # missing the target ancestor is NOT a no-op, it is unready and must keep
-# failing. Condition 4 covers the diverged case, where the merge base is older
-# than the target and the merge is not empty. Read-only, no side effects.
+# failing. Condition 3 holding means `git merge-base HEAD <target>` IS the
+# target, so condition 4 calls the three-argument merge-tree with the base and
+# the third tree identical and prints nothing for every input: condition 4 is
+# currently implied by condition 3 and can never change the decision. It is kept
+# because it is the runtime owner's specified no-op command, not because it can
+# fire. Read-only, no side effects.
 capability_pass_is_verified_noop() {
   local pass_exit=$1
   local generation=$2
@@ -181,14 +185,31 @@ PR children are publication/review streams, not semaphores. Maintain the local c
   if [[ $omp_code -eq 0 ]] \
     && capability_pass_awaiting_report \
     && capability_pass_is_verified_noop "$omp_code" "$upstream_generation" "$WORKTREE"; then
-    noop_headline="$BRANCH already correct for ${upstream_generation:0:8}; verified no-op"
+    # automation report rejects a headline over 80 characters
+    # (MAX_AUTOMATION_HEADLINE), and a rejected report would park the run, so
+    # the branch field gets the budget left by the fixed tail instead of an
+    # assumed length: a branch that does not fit is elided to the budget.
+    noop_tail=" already correct for ${upstream_generation:0:8}; verified no-op"
+    noop_headline_budget=$((80 - ${#noop_tail}))
+    noop_branch=$BRANCH
+    if (( ${#noop_branch} > noop_headline_budget )); then
+      noop_branch="${noop_branch:0:noop_headline_budget-3}..."
+    fi
+    noop_headline="$noop_branch$noop_tail"
     noop_summary=$(jq -cn '[
       "capability pass exited 0 without an automation_report",
       "worktree clean: git status --porcelain is empty",
       "target generation is an ancestor of HEAD: git merge-base --is-ancestor holds",
-      "no capability-local delta: git merge-tree from the merge base is empty"
+      "merge-tree from the merge base is empty"
     ]')
-    ops_bound automation report --headline "$noop_headline" --summary "$noop_summary" --outcome ready >/dev/null 2>&1 || true
+    # A rejected report must not park silently. The output is kept and echoed to
+    # stderr, and the pass still falls through to the contract-failure path
+    # below, which is unchanged.
+    noop_report=$(ops_bound automation report --headline "$noop_headline" \
+      --summary "$noop_summary" --outcome ready 2>&1) || {
+      echo "verified no-op self-report was rejected:" >&2
+      printf '%s\n' "$noop_report" >&2
+    }
   fi
 
   finish_json=$(finish_iteration "$omp_code")

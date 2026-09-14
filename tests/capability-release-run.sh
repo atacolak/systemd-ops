@@ -62,6 +62,7 @@ EOF
 }
 
 make_scope() {
+  CAPABILITY_BRANCH=cap/hindsight
   rm -rf "$SCOPE"
   mkdir -p "$SCOPE/.systemd-ops/operations/$CAP/state" "$SCOPE/.systemd-ops/drivers" "$SCOPE/.systemd-ops/lib" "$SCOPE/worktree" "$SCOPE/agents/.omp/agents" "$SCOPE/.systemd-ops/operations/managed-omp-release-watch/state" "$SCOPE/fork.git"
   git -C "$SCOPE/fork.git" init -q --bare
@@ -120,7 +121,7 @@ EOF
   cat >"$SCOPE/.systemd-ops/operations/$CAP/run" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-exec "\${SYSTEMD_OPS_SCOPE_ROOT}/.systemd-ops/drivers/capability-run" cap/hindsight $CAP "\${WORKTREE}"
+exec "\${SYSTEMD_OPS_SCOPE_ROOT}/.systemd-ops/drivers/capability-run" "\${CAPABILITY_BRANCH:-cap/hindsight}" $CAP "\${WORKTREE}"
 EOF
   chmod +x "$SCOPE/.systemd-ops/operations/$CAP/run"
   install_unit "$CAP"
@@ -148,6 +149,10 @@ if [[ "\$joined" == *" automation observe "* ]]; then
   jq -n --arg fp "\${PROOF_FINGERPRINT:-fp-cap}" --arg gen "\${UPSTREAM_GENERATION:-generation-G2}" \
     '{ok:true,data:{observation:{input_fingerprint:\$fp,generation:\$gen}}}'
   exit 0
+fi
+if [[ -n "\${PROOF_REJECT_REPORT:-}" && "\$joined" == *" automation report "* ]]; then
+  echo "proof-forced report rejection" >&2
+  exit 1
 fi
 exec "\$real" "\${args[@]}"
 EOF
@@ -207,6 +212,8 @@ run_cap() {
   OMP_BIN="$SCOPE/fake-omp" \
   AGENT_CWD="$SCOPE/agents" \
   UPSTREAM_GENERATION="$generation" \
+  CAPABILITY_BRANCH="${CAPABILITY_BRANCH:-cap/hindsight}" \
+  PROOF_REJECT_REPORT="${PROOF_REJECT_REPORT:-}" \
   PR_SETTLE_QUIET_SECONDS=300 \
   PR_SETTLE_NOW="$now" \
   "$SCOPE/.systemd-ops/operations/$CAP/run"
@@ -405,5 +412,62 @@ code=$(run_cap_code 1000 "$target" "$TMP/cap-unchanged.out")
 [[ ! -e $SCOPE/agent-calls ]] || fail "unchanged blocked input relaunched the agent"
 [[ ! -e $CAP_STATE/operator.json ]] || fail "unchanged blocked input started an iteration"
 jq -e '.outcome == "blocked"' "$CAP_STATE/processed.json" >/dev/null || fail "unchanged blocked input rewrote processed state"
+
+# Long capability branch: automation report rejects a headline over 80
+# characters, so a branch that does not fit must not degrade the verified no-op
+# into a park. The driver must still self-report, reconsolidate, and record a
+# headline inside the limit.
+make_scope
+long_branch="cap/hindsight-$(printf 'x%.0s' {1..31})"
+[[ ${#long_branch} -eq 45 ]] || fail "long branch fixture is not 45 characters"
+git -C "$SCOPE/worktree" branch -m "$long_branch"
+git -C "$SCOPE/worktree" push -q fork "$long_branch"
+CAPABILITY_BRANCH=$long_branch
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+write_fake_omp ''
+code=$(run_cap_code 1000 "$target" "$TMP/cap-long-branch.out")
+[[ $code -eq 0 ]] || fail "long branch no-op exited $code: $(cat "$TMP/cap-long-branch.out")"
+grep -q "automation_report is required" "$TMP/cap-long-branch.out" && fail "long branch no-op took the contract-failure path"
+jq -e '.iterations[0].reconsolidated == true' "$CAP_STATE/operator.json" >/dev/null \
+  || fail "long branch no-op did not reconsolidate"
+jq -e '.outcome == "ready"' "$CAP_STATE/processed.json" >/dev/null \
+  || fail "long branch no-op did not process the input as ready"
+[[ ! -e $CAP_STATE/failure-budget.json ]] || fail "long branch no-op created a failure budget"
+long_headline=$(sed -n 's/^.*--headline \(.*\) --summary .*$/\1/p' "$SCOPE/ops-argv.log")
+[[ -n $long_headline ]] || fail "long branch no-op did not record a headline"
+[[ ${#long_headline} -le 80 ]] || fail "long branch headline is ${#long_headline} characters: $long_headline"
+[[ $long_headline == *"verified no-op"* ]] || fail "long branch headline lost the verified no-op meaning: $long_headline"
+[[ $long_headline == *"${target:0:8}"* ]] || fail "long branch headline does not name the target generation: $long_headline"
+
+# Rejected self-report: a driver-emitted report the operator surface refuses
+# must not park silently. The run still takes the existing contract-failure
+# path, and the rejection is diagnosable on stderr.
+make_scope
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+write_fake_omp ''
+set +e
+PROOF_REJECT_REPORT=1 run_cap 1000 "$target" >"$TMP/cap-reject.out" 2>"$TMP/cap-reject.err"
+code=$?
+set -e
+[[ $code -eq 3 ]] || fail "rejected self-report exited $code, want 3: $(cat "$TMP/cap-reject.err")"
+grep -q "automation_report is required" "$TMP/cap-reject.err" || fail "rejected self-report did not hit the contract failure"
+[[ $(grep -c "already correct for" "$SCOPE/ops-argv.log" || true) -eq 1 ]] || fail "rejected self-report did not attempt the driver report"
+grep -q "verified no-op self-report was rejected" "$TMP/cap-reject.err" \
+  || fail "rejected self-report did not name the failure on stderr: $(cat "$TMP/cap-reject.err")"
+grep -q "proof-forced report rejection" "$TMP/cap-reject.err" \
+  || fail "rejected self-report did not echo the operator error to stderr: $(cat "$TMP/cap-reject.err")"
+grep -q "proof-forced report rejection" "$TMP/cap-reject.out" \
+  && fail "rejected self-report wrote the operator error to stdout"
+jq -e '.iterations[0].reconsolidated == false' "$CAP_STATE/operator.json" >/dev/null \
+  || fail "rejected self-report reconsolidated"
+jq -e '.failures == 1' "$CAP_STATE/failure-budget.json" >/dev/null \
+  || fail "rejected self-report did not record the contract failure"
+[[ ! -e $CAP_STATE/processed.json ]] || fail "rejected self-report advanced processed state"
 
 echo "capability-release-run ok"
