@@ -4,6 +4,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 LIB=${NOTIFY_LIB:-$ROOT/dogfood/lib/system-notify}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -30,7 +31,10 @@ case ${1:-} in
     if [[ ${HCOM_LIST_EXIT:-0} -eq 0 && -r $ROSTER_FILE ]]; then cat "$ROSTER_FILE"; fi
     exit "${HCOM_LIST_EXIT:-0}"
     ;;
-  send) exit "${HCOM_EXIT:-0}" ;;
+  send)
+    sleep "${HCOM_SEND_SLEEP:-0}"
+    exit "${HCOM_EXIT:-0}"
+    ;;
   r)
     sleep "${HCOM_R_SLEEP:-0}"
     exit "${HCOM_R_EXIT:-0}"
@@ -121,7 +125,7 @@ start_case() {
   export HCOM_BIN=$BIN_DIR/hcom
   export SYSTEMD_OPS_BIN=$BIN_DIR/systemd-ops
   export SYSTEMD_OPS_SCOPE_ROOT=$CASE
-  unset HCOM_EXIT HCOM_LIST_EXIT HCOM_R_EXIT HCOM_LIST_SLEEP HCOM_R_SLEEP OPS_EXIT HCOM_TIMEOUT
+  unset HCOM_EXIT HCOM_LIST_EXIT HCOM_R_EXIT HCOM_LIST_SLEEP HCOM_R_SLEEP HCOM_SEND_SLEEP OPS_EXIT HCOM_TIMEOUT HCOM_SEND_TIMEOUT
   SCOPE_SHOW=$scope_show
 }
 
@@ -143,6 +147,23 @@ notify_args() {
 
 notify() {
   notify_args "$1" "$2" "$3"
+}
+
+# Runs the notify call in a fresh shell whose PATH holds only the binaries in
+# $NO_TIMEOUT_BIN, which does not include `timeout`, so the seam cannot use a
+# timeout binary that the host has. The call itself is the same as notify.
+notify_without_timeout() {
+  set +e
+  env PATH="$NO_TIMEOUT_BIN" bash -c '
+    source "$1" || exit 3
+    shift
+    declare -F system_notify >/dev/null || exit 3
+    system_notify "$@"
+  ' _ "$LIB" "$@" >"$TMP/stdout" 2>"$TMP/stderr"
+  CODE=$?
+  set -e
+  OUT=$(cat "$TMP/stdout")
+  ERR=$(cat "$TMP/stderr")
 }
 
 # Runs the notify call in a fresh shell under exactly the locale in $1, so a
@@ -290,9 +311,12 @@ done
 # collations on purpose: the ambient one, a UTF-8 locale pinned through LC_ALL,
 # and C. A [a-z] range is not a fixed charset: under a UTF-8 collation it also
 # matches accented lowercase letters, so only a check that ignores the
-# collation at all passes all three.
+# collation at all passes all three. The payload is written as byte escapes
+# rather than as \u00e9: bash resolves \u through the ambient locale, so an
+# exported LC_ALL=C turns that escape into the ASCII text omp\u00E9 and every
+# collation below receives a string that is not accented at all.
 start_case source-non-ascii "$LEAD_OK" "$ROSTER_LIVE"
-non_ascii_source=$'omp\u00e9'
+non_ascii_source=$'omp\xc3\xa9'
 notify "$non_ascii_source" inform "generation published"
 [[ $CODE -eq 2 ]] || fail "non-ASCII source id under the ambient locale returned $CODE, want 2: $ERR"
 [[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "non-ASCII source id under the ambient locale reached hcom"
@@ -316,6 +340,37 @@ fi
 notify_under_locale C "$non_ascii_source" inform "generation published"
 [[ $CODE -eq 2 ]] || fail "non-ASCII source id under LC_ALL=C returned $CODE, want 2: $ERR"
 [[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "non-ASCII source id under LC_ALL=C reached hcom"
+
+# The control for that case. A bracket expression is expanded through the
+# collation in force, so a library whose charset is a bracket range accepts the
+# accented id wherever the collation is UTF-8, and the case above then stops
+# refusing it. That regression is visible only when the non-ASCII payload
+# reaches the call as its real bytes: with the case written as $'\u00e9', an
+# exported LC_ALL=C degraded the escape to the ASCII text omp\u00E9 and the run
+# stayed green against a bracket-range library. The scratch copy is patched in
+# $TMP and the tracked library is not touched. The nested run is marked so it
+# does not recurse into this control.
+if [[ -n ${NOTIFY_PROVENANCE_SCRATCH_LIB:-} ]]; then
+  : # nested control run: the library under test is already the scratch copy
+elif [[ -n $UTF8_LOCALE ]]; then
+  SCRATCH_LIB=$TMP/bracket-charset-system-notify
+  sed -e "s/local ascii_lower='[a-z]*'/local ascii_lower='a-z'/" \
+    -e "s/local ascii_digit='[0-9]*'/local ascii_digit='0-9'/" "$LIB" >"$SCRATCH_LIB"
+  grep -q "local ascii_lower='a-z'" "$SCRATCH_LIB" || fail "the scratch library did not take the bracket-range charset"
+  grep -q "local ascii_digit='0-9'" "$SCRATCH_LIB" || fail "the scratch library did not take the bracket-range digits"
+  set +e
+  env LC_ALL=C NOTIFY_LIB="$SCRATCH_LIB" NOTIFY_PROVENANCE_SCRATCH_LIB=1 \
+    bash "$SELF" >"$TMP/control-stdout" 2>"$TMP/control-stderr"
+  control_code=$?
+  set -e
+  [[ $control_code -ne 0 ]] \
+    || fail "the suite passed against a bracket-range charset library under LC_ALL=C"
+  grep -q "non-ASCII source id" "$TMP/control-stderr" \
+    || fail "the bracket-range control failed, but not on the non-ASCII source id: $(cat "$TMP/control-stderr")"
+  echo "note: the bracket-range control failed under LC_ALL=C on the non-ASCII source id, as required" >&2
+else
+  echo "note: no UTF-8 locale on this host; the bracket-range control was not run" >&2
+fi
 
 # Unresolvable lead: refused, and specifically not broadcast.
 start_case lead-missing '{"ok":true,"data":{"coordination":{}}}' "$ROSTER_LIVE"
@@ -496,5 +551,94 @@ unset HCOM_TIMEOUT HCOM_R_SLEEP
 if command -v timeout >/dev/null 2>&1; then
   [[ $RESUME_HANG_SECONDS -lt 6 ]] || fail "hung resume took ${RESUME_HANG_SECONDS}s, HCOM_TIMEOUT did not bound it"
 fi
+
+# A hung delivery is bounded by HCOM_SEND_TIMEOUT, which is a knob of its own
+# with a larger default than HCOM_TIMEOUT because a legitimate send can take
+# longer than a roster read. A killed send is a delivery failure, not a silent
+# retry: the seam returns the timeout status and stderr names the timeout and
+# the recipient, so a caller can tell a timeout from an hcom error. HCOM may
+# already have accepted a message whose send is killed, which is what a bound
+# costs here.
+start_case send-hang "$LEAD_OK" "$ROSTER_LIVE"
+export HCOM_SEND_TIMEOUT=1 HCOM_SEND_SLEEP=10
+SECONDS=0
+notify omp-runtime inform "build finished"
+SEND_HANG_SECONDS=$SECONDS
+unset HCOM_SEND_TIMEOUT HCOM_SEND_SLEEP
+[[ $CODE -eq 124 ]] || fail "hung send returned $CODE, want 124: $ERR"
+[[ $ERR == *"@midi"* ]] || fail "hung send did not name the recipient: $ERR"
+[[ $ERR == *"timed out"* ]] || fail "hung send did not report a timeout: $ERR"
+[[ $ERR == *"1s"* ]] || fail "hung send did not name the timeout: $ERR"
+[[ $(call_count "$HCOM_LOG") -eq 2 ]] || fail "hung send made $(call_count "$HCOM_LOG") hcom calls"
+[[ $(count_calls_with "$HCOM_LOG" send) -eq 1 ]] || fail "hung send was not attempted exactly once"
+if command -v timeout >/dev/null 2>&1; then
+  [[ $SEND_HANG_SECONDS -lt 6 ]] || fail "hung send took ${SEND_HANG_SECONDS}s, HCOM_SEND_TIMEOUT did not bound it"
+fi
+
+# A send that finishes inside its bound is delivered as before, with the same
+# argv, so the bound does not interfere with an ordinary notification.
+start_case send-fast "$LEAD_OK" "$ROSTER_LIVE"
+export HCOM_SEND_TIMEOUT=1
+notify omp-runtime inform "build finished"
+unset HCOM_SEND_TIMEOUT
+[[ $CODE -eq 0 ]] || fail "fast send under HCOM_SEND_TIMEOUT=1 returned $CODE: $ERR"
+[[ -z $ERR ]] || fail "fast send under HCOM_SEND_TIMEOUT=1 wrote to stderr: $ERR"
+[[ $(call_text_with "$HCOM_LOG" send) == "send --as-system omp-runtime @midi --intent inform -- build finished" ]] \
+  || fail "fast send argv under HCOM_SEND_TIMEOUT=1: $(call_text_with "$HCOM_LOG" send)"
+
+# The two bounds are independent. A slow roster read is cut short by
+# HCOM_TIMEOUT while the send keeps its own, larger budget, and a slow send is
+# cut short by HCOM_SEND_TIMEOUT while the roster read keeps HCOM_TIMEOUT.
+start_case bounds-roster-slow "$LEAD_OK" "$ROSTER_LIVE"
+export HCOM_TIMEOUT=1 HCOM_LIST_SLEEP=10 HCOM_SEND_TIMEOUT=30
+SECONDS=0
+notify omp-runtime inform "build finished"
+BOUNDS_ROSTER_SECONDS=$SECONDS
+unset HCOM_TIMEOUT HCOM_LIST_SLEEP HCOM_SEND_TIMEOUT
+[[ $CODE -eq 0 ]] || fail "slow roster read under two bounds returned $CODE: $ERR"
+[[ $(call_count "$HCOM_LOG") -eq 2 ]] || fail "slow roster read under two bounds made $(call_count "$HCOM_LOG") hcom calls"
+[[ $(call_text_with "$HCOM_LOG" send) == "send --as-system omp-runtime @midi --intent inform -- build finished" ]] \
+  || fail "slow roster read under two bounds changed the delivery argv: $(call_text_with "$HCOM_LOG" send)"
+if command -v timeout >/dev/null 2>&1; then
+  [[ $BOUNDS_ROSTER_SECONDS -lt 6 ]] || fail "slow roster read took ${BOUNDS_ROSTER_SECONDS}s, HCOM_TIMEOUT=1 did not bound it"
+fi
+
+start_case bounds-send-slow "$LEAD_OK" "$ROSTER_LIVE"
+export HCOM_TIMEOUT=30 HCOM_SEND_TIMEOUT=1 HCOM_SEND_SLEEP=10
+SECONDS=0
+notify omp-runtime inform "build finished"
+BOUNDS_SEND_SECONDS=$SECONDS
+unset HCOM_TIMEOUT HCOM_SEND_TIMEOUT HCOM_SEND_SLEEP
+[[ $CODE -eq 124 ]] || fail "slow send under a large HCOM_TIMEOUT returned $CODE, want 124: $ERR"
+[[ $(call_count "$HCOM_LOG") -eq 2 ]] || fail "slow send under a large HCOM_TIMEOUT made $(call_count "$HCOM_LOG") hcom calls"
+[[ $(call_text "$HCOM_LOG" 1) == "list --all --json" ]] || fail "slow send under a large HCOM_TIMEOUT skipped the roster read: $(call_text "$HCOM_LOG" 1)"
+if command -v timeout >/dev/null 2>&1; then
+  [[ $BOUNDS_SEND_SECONDS -lt 6 ]] || fail "slow send took ${BOUNDS_SEND_SECONDS}s, HCOM_SEND_TIMEOUT=1 did not bound it"
+fi
+
+# Where no `timeout` binary is on PATH the seam keeps the unbounded call rather
+# than skipping it. The roster read below sleeps past its HCOM_TIMEOUT and is
+# still allowed to finish: the call is made, and nothing kills it.
+NO_TIMEOUT_BIN=$TMP/no-timeout-bin
+mkdir -p "$NO_TIMEOUT_BIN"
+for tool in bash env sleep cat jq; do
+  tool_path=$(command -v "$tool") || fail "missing $tool for the no-timeout PATH"
+  ln -s "$tool_path" "$NO_TIMEOUT_BIN/$tool"
+done
+[[ ! -e $NO_TIMEOUT_BIN/timeout ]] || fail "the no-timeout PATH still holds a timeout binary"
+
+start_case no-timeout-fallback "$LEAD_OK" "$ROSTER_LIVE"
+export HCOM_TIMEOUT=1 HCOM_LIST_SLEEP=2
+SECONDS=0
+notify_without_timeout omp-runtime inform "build finished"
+NO_TIMEOUT_SECONDS=$SECONDS
+unset HCOM_TIMEOUT HCOM_LIST_SLEEP
+[[ $CODE -eq 0 ]] || fail "the unbounded fallback returned $CODE: $ERR"
+[[ -z $ERR ]] || fail "the unbounded fallback wrote to stderr: $ERR"
+[[ $NO_TIMEOUT_SECONDS -ge 2 ]] \
+  || fail "the roster read stopped after ${NO_TIMEOUT_SECONDS}s with no timeout binary on PATH"
+[[ $(call_text "$HCOM_LOG" 1) == "list --all --json" ]] || fail "the unbounded fallback skipped the roster read: $(call_text "$HCOM_LOG" 1)"
+[[ $(call_text_with "$HCOM_LOG" send) == "send --as-system omp-runtime @midi --intent inform -- build finished" ]] \
+  || fail "the unbounded fallback delivery argv: $(call_text_with "$HCOM_LOG" send)"
 
 echo "notify-provenance ok"
