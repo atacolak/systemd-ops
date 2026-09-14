@@ -191,14 +191,15 @@ installed docs matching README, and cheap complete of already-MERGED PRs
 before a model pass. `managed-omp-pr-10922` uses the scope project-root
 cwd. Crate, tag, and GitHub publication are not part of this commit.
 
-Automation notifications go through one shared seam,
+Automation notifications gain one shared seam,
 `dogfood/lib/system-notify`. It sends as `sender_kind=system` with a stable
 source id (`omp-runtime`, `omp-capability`, `cpa-upstream-watch`, or
 `systemd-ops:<operation-stem>`), resolves the recipient from the bound
 scope's `coordination.lead`, and wakes a lead that is not live. An
 unaddressed send and the reserved source id `overseer` are refused, so the
-borrowed-sender nudge cannot come back through this seam. Migrating the
-watchers to it is pending the HCOM `--as-system` flag.
+borrowed-sender nudge cannot come back through this seam. No watcher sources
+it yet: the live path is still the worlds bridge, and migration is pending the
+HCOM `--as-system` flag.
 
 
 

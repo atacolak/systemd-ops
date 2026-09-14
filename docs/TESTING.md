@@ -34,7 +34,9 @@ bash tests/pr-attempt.sh
 bash tests/capability-release-run.sh
 ```
 
-`make check` runs all of them. Scope discovery, `editable_spec`
+CI runs all of these in the Dogfood proofs step. `make check` runs the Rust
+gates (`cargo test`, clippy, fmt) plus `tests/docs.sh`; it does not run the
+dogfood proofs. Scope discovery, `editable_spec`
 round-trip, provenance warnings, and ScopeView aggregation are unit
 tests under `src/scope.rs` and `src/operations.rs`.
 
