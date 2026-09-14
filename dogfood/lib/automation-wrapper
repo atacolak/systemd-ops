@@ -347,6 +347,10 @@ recover_worktree() {
     return 1
   fi
   ops automation clear-blocker >/dev/null 2>&1 || true
+  # The park sidecar is the other half of the blocker just cleared. The park
+  # covered an unchanged observation; the worktree is clean again, so leaving
+  # the fingerprint behind would make every later tick skip with no work.
+  rm -f "$(operational_park_file)"
   echo "rebound $OPERATION_STEM to clean worktree $new" >&2
 
 }
@@ -536,10 +540,16 @@ operational_park_file() {
 }
 
 operational_park_fingerprint() {
-  local f
+  local f parked
   f=$(operational_park_file)
   [[ -r "$f" ]] || return 0
-  jq -r '.input_fingerprint // empty' "$f"
+  # An unreadable record is the wrapper's to report, not jq's to leak. It means
+  # there is no park to honour, so the tick runs instead of skipping.
+  if ! parked=$(jq -r '.input_fingerprint // empty' "$f" 2>/dev/null); then
+    echo "unreadable operational park record at $f; treating the input as unparked" >&2
+    return 0
+  fi
+  printf '%s\n' "$parked"
 }
 
 # True when this observation is the input an operational park already covered.

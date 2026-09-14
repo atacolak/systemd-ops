@@ -526,14 +526,33 @@ code=$(run_cap_code 1000 "$target" "$TMP/cap-park-next.out")
 jq -e '.input_fingerprint == "fp-cap"' "$CAP_STATE/operational-park.json" >/dev/null \
   || fail "a failed attempt rewrote the park record"
 
-# A new input that reaches READY still runs, and clearing the budget clears the
-# stale park record with it: a recovered input is not shadowed.
+# The later fingerprint is still exported from the case above, so this tick is a
+# new input. Its READY report is what clears the stale park record, and the
+# budget with it: a recovered input is not shadowed by the park it replaced.
 write_fake_omp ''
 code=$(run_cap_code 1000 "$target" "$TMP/cap-park-recovered.out")
-unset PROOF_FINGERPRINT
 [[ $code -eq 0 ]] || fail "recovered input exited $code: $(cat "$TMP/cap-park-recovered.out")"
 jq -e '.outcome == "ready"' "$CAP_STATE/processed.json" >/dev/null || fail "recovered input did not process as ready"
 [[ ! -e $CAP_STATE/operational-park.json ]] || fail "recovered input left the stale park record"
 [[ ! -e $CAP_STATE/failure-budget.json ]] || fail "recovered input left the stale failure budget"
+
+# A corrupt park record is not a park. The wrapper reports it and the tick runs
+# normally instead of skipping on an unreadable bound.
+make_scope
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+write_fake_omp ''
+printf 'not json\n' >"$CAP_STATE/operational-park.json"
+code=$(run_cap_code 1000 "$target" "$TMP/cap-corrupt-park.out")
+[[ $code -eq 0 ]] || fail "corrupt park record exited $code: $(cat "$TMP/cap-corrupt-park.out")"
+[[ -f $SCOPE/agent-calls ]] || fail "a corrupt park record skipped the tick"
+jq -e '.outcome == "ready"' "$CAP_STATE/processed.json" >/dev/null \
+  || fail "a corrupt park record did not let the input run to READY"
+grep -q 'unreadable operational park record' "$TMP/cap-corrupt-park.out" \
+  || fail "a corrupt park record was not reported: $(cat "$TMP/cap-corrupt-park.out")"
+grep -q 'jq: ' "$TMP/cap-corrupt-park.out" && fail "a corrupt park record leaked jq's error"
+[[ ! -e $CAP_STATE/operational-park.json ]] || fail "a READY report left the corrupt park record"
 
 echo "capability-release-run ok"

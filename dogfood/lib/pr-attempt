@@ -88,10 +88,19 @@ dispose_pr_attempt() {
   ATTEMPT_WORKTREE=""
 }
 
+# Park an input whose operational failures exhausted the budget. This park is
+# operational, not semantic: the input stays unprocessed so the next tick
+# retries it, and the failure-budget entry plus the blocker are the durable
+# record. Marking the input processed here is what certified it forever and left
+# the PR unable to converge. The blocker carries the real kind of the failures
+# that caused it, iteration-failed; semantic-blocked is reserved for a genuine
+# semantic blocked report. The sidecar records the fingerprint this park
+# covered, which bounds the retry without certifying the input.
 park_pr_input() {
   local input=$1
   local kind=$2
-  local summary="PR parked after ${PR_FAILURE_BUDGET} identical $kind failures"
-  mark_processed "$input" blocked || true
-  record_blocker semantic-blocked 0 "$summary" "${iteration_id:-}" parent "$input" || true
+  local n=${3:-$PR_FAILURE_BUDGET}
+  local summary="PR parked after ${n} identical $kind failures on unchanged input"
+  record_blocker iteration-failed 0 "$summary" "${iteration_id:-}" parent "$input" || true
+  record_operational_park "$input" "$kind" || true
 }

@@ -34,6 +34,13 @@ current_input=$(observe_input) || exit $?
 if input_is_processed "$current_input"; then
   exit 0
 fi
+# An operational park bounds the retry instead of certifying the input: while
+# the observation still matches the parked fingerprint this tick does no work.
+# The skip reports nothing, writes no processed state and clears no blocker or
+# budget; it only declines to burn an attempt.
+if input_matches_operational_park "$current_input"; then
+  exit 0
+fi
 wake_input=$current_input
 
 mkdir -p "$STATE_DIR"
@@ -45,6 +52,10 @@ if ! flock -n 9; then
 fi
 current_input=$(observe_input) || exit $?
 if input_is_processed "$current_input"; then
+  exit 0
+fi
+# Same bound as the pre-lock check: an unchanged parked input does no work.
+if input_matches_operational_park "$current_input"; then
   exit 0
 fi
 wake_input=$current_input
@@ -110,7 +121,7 @@ handle_hard_failure() {
   n=$(record_attempt_failure "$wake_input" "$kind")
   record_blocker iteration-failed "$code" "PR attempt $kind with exit $code" "$iteration_id" parent "$wake_input" || true
   if [[ "$n" -ge "${PR_FAILURE_BUDGET}" ]]; then
-    park_pr_input "$wake_input" "$kind"
+    park_pr_input "$wake_input" "$kind" "$n"
     echo "PR parked after $n identical $kind failures on unchanged input" >&2
     exit 0
   fi
@@ -144,7 +155,7 @@ if [[ "$dirty_n" -gt 0 ]]; then
   record_blocker contract-failure 3 "dirty attempt at $outcome exit" "$iteration_id" parent "$wake_input" || true
   n=$(record_attempt_failure "$wake_input" dirty-at-exit)
   if [[ "$n" -ge "${PR_FAILURE_BUDGET}" ]]; then
-    park_pr_input "$wake_input" dirty-at-exit
+    park_pr_input "$wake_input" dirty-at-exit "$n"
     exit 0
   fi
   exit 3

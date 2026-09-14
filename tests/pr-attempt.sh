@@ -168,6 +168,25 @@ set -e
 [[ ! -e $scope/.systemd-ops/operations/$STEM/state/processed.json ]] || fail "dirty BLOCKED marked processed"
 grep -q bar.ts /tmp/pr-attempt-dblock.err || fail "dirty BLOCKED did not log dirty files"
 
+# --- clean BLOCKED: a semantic outcome, so it certifies the input ---
+# Contrast for the park case below, and the replacement for the assertion that a
+# park wrote a blocked outcome: a genuine semantic blocked report DOES certify
+# the input, records semantic-blocked, and writes no park sidecar.
+scope=$(make_scope blocked-clean)
+write_omp "$scope/fake-omp" '"$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "clean blocked" --summary '\''["blocked"]'\'' --outcome blocked --route parent >/dev/null'
+run_pr "$scope" >/tmp/pr-attempt-blocked.out 2>/tmp/pr-attempt-blocked.err \
+  || fail "clean BLOCKED failed: $(cat /tmp/pr-attempt-blocked.err)"
+[[ -f $scope/user-worktree/user-dirty.txt ]] || fail "clean BLOCKED destroyed user worktree"
+jq -e '.outcome=="blocked"' "$scope/.systemd-ops/operations/$STEM/state/processed.json" >/dev/null \
+  || fail "clean BLOCKED did not process the input"
+jq -e '.kind=="semantic-blocked"' "$scope/.systemd-ops/operations/$STEM/state/blocker.json" >/dev/null \
+  || fail "clean BLOCKED did not record semantic-blocked: $(cat "$scope/.systemd-ops/operations/$STEM/state/blocker.json")"
+[[ ! -e $scope/.systemd-ops/operations/$STEM/state/operational-park.json ]] \
+  || fail "a semantic blocked outcome wrote the park sidecar"
+write_omp "$scope/fake-omp" 'echo called >>"${SYSTEMD_OPS_SCOPE_ROOT}/agent-calls"'
+run_pr "$scope" >/dev/null 2>&1 || true
+[[ ! -e $scope/agent-calls ]] || fail "an unchanged semantically blocked input relaunched OMP"
+
 # --- timeout: log, dispose, user preserved, retry from A ---
 scope=$(make_scope timeout)
 head_a=$(git -C "$scope/user-worktree" rev-parse HEAD)
@@ -200,21 +219,66 @@ set -e
 [[ $t1 != "$(cat "$scope/timeout2-cwd")" ]] || fail "retry reused attempt path"
 jq -e '.failures==2' "$scope/.systemd-ops/operations/$STEM/state/failure-budget.json" >/dev/null \
   || fail "second timeout did not park budget at 2"
-jq -e '.outcome=="blocked"' "$scope/.systemd-ops/operations/$STEM/state/processed.json" >/dev/null \
-  || fail "second timeout did not park processed"
+# An operational park does not certify the input: the blocker and the failure
+# budget are the record, and the input stays unprocessed so the tick can retry.
+# Marking it processed here is what made every later tick skip the PR forever.
+[[ ! -e $scope/.systemd-ops/operations/$STEM/state/processed.json ]] \
+  || fail "PR park certified the input as processed"
 [[ ! -e $scope/.systemd-ops/operations/$STEM/state/checkpoint.json ]] || fail "parking wrote a READY checkpoint"
+jq -e '.kind=="iteration-failed"
+    and (.summary|contains("parked after 2 identical timeout failures"))' \
+  "$scope/.systemd-ops/operations/$STEM/state/blocker.json" >/dev/null \
+  || fail "PR park did not record the blocker as iteration-failed: $(cat "$scope/.systemd-ops/operations/$STEM/state/blocker.json")"
+jq -e 'select(.kind=="semantic-blocked")' "$scope/.systemd-ops/operations/$STEM/state/blocker.json" >/dev/null \
+  && fail "PR park claimed a semantic block"
+parked_fp=$(jq -er '.input_fingerprint // empty' "$scope/.systemd-ops/operations/$STEM/state/operational-park.json") \
+  || fail "PR park did not record the parked fingerprint"
+observed_fp=$(SYSTEMD_OPS_SCOPE_ROOT="$scope" SYSTEMD_OPS_OPERATION=$STEM "$BIN" --json --manager user \
+  --cwd "$scope/user-worktree" automation observe | jq -er '.data.observation.input_fingerprint')
+[[ $parked_fp == "$observed_fp" ]] \
+  || fail "PR park recorded $parked_fp, not the observation fingerprint $observed_fp"
 
+# The retry is therefore possible: nothing certified this input, so with the
+# bound gone the same unchanged input runs again. Only the sidecar held it back.
+rm -f "$scope/.systemd-ops/operations/$STEM/state/operational-park.json"
 write_omp "$scope/fake-omp" 'echo called >>"${SYSTEMD_OPS_SCOPE_ROOT}/agent-calls"'
-for _ in 1 2 3; do
-  run_pr "$scope" >/dev/null 2>&1 || true
-done
-[[ ! -e $scope/agent-calls ]] || fail "parked identical input relaunched OMP"
+set +e
+run_pr "$scope" >/tmp/pr-attempt-retry.out 2>/tmp/pr-attempt-retry.err
+code=$?
+set -e
+[[ $code -eq 0 ]] || fail "retry of an unbounded input exited $code: $(cat /tmp/pr-attempt-retry.err)"
+[[ $(wc -l <"$scope/agent-calls") -eq 1 ]] || fail "retry of an unbounded input did not run exactly one pass"
+jq -e '.failures==3' "$scope/.systemd-ops/operations/$STEM/state/failure-budget.json" >/dev/null \
+  || fail "the retry did not record its own attempt"
 
+# An unchanged parked input burns no attempt: the bound is the sidecar, and the
+# skip writes no processed state and rewrites neither the budget nor the blocker.
+cp "$scope/.systemd-ops/operations/$STEM/state/failure-budget.json" /tmp/pr-attempt-budget.json
+cp "$scope/.systemd-ops/operations/$STEM/state/blocker.json" /tmp/pr-attempt-blocker.json
+for _ in 1 2 3; do
+  run_pr "$scope" >/tmp/pr-attempt-skip.out 2>/tmp/pr-attempt-skip.err || true
+done
+[[ $(wc -l <"$scope/agent-calls") -eq 1 ]] || fail "parked identical input burned an attempt"
+[[ ! -s /tmp/pr-attempt-skip.out && ! -s /tmp/pr-attempt-skip.err ]] \
+  || fail "the park skip reported something: $(cat /tmp/pr-attempt-skip.out /tmp/pr-attempt-skip.err)"
+[[ ! -e $scope/.systemd-ops/operations/$STEM/state/processed.json ]] \
+  || fail "the park skip certified the input as processed"
+cmp -s /tmp/pr-attempt-budget.json "$scope/.systemd-ops/operations/$STEM/state/failure-budget.json" \
+  || fail "the park skip rewrote the failure budget"
+cmp -s /tmp/pr-attempt-blocker.json "$scope/.systemd-ops/operations/$STEM/state/blocker.json" \
+  || fail "the park skip rewrote the blocker"
+
+# A different observation is a different input, so it runs while the bound is in
+# place. Its READY report is what clears the stale park record.
 printf y >"$scope/world"
 write_omp "$scope/fake-omp" 'echo called-y >>"${SYSTEMD_OPS_SCOPE_ROOT}/agent-calls-y"
 "$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "new world" --summary '\''["ok"]'\'' --outcome ready >/dev/null'
 run_pr "$scope" >/tmp/pr-attempt-y.out 2>/tmp/pr-attempt-y.err || fail "new world did not unpark: $(cat /tmp/pr-attempt-y.err)"
 [[ -f $scope/agent-calls-y ]] || fail "new world did not invoke OMP"
+[[ ! -e $scope/.systemd-ops/operations/$STEM/state/operational-park.json ]] \
+  || fail "a READY report left the stale park record"
+[[ ! -e $scope/.systemd-ops/operations/$STEM/state/failure-budget.json ]] \
+  || fail "a READY report left the stale failure budget"
 
 # --- pushed commit is durable ---
 scope=$(make_scope push-then-die)

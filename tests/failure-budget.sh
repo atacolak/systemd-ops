@@ -31,10 +31,12 @@ source "$LIB"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 STATE_DIR="$TMP/state"
+OPS_LOG="$TMP/ops-argv.log"
 mkdir -p "$STATE_DIR"
 
 ops() {
   mkdir -p "$STATE_DIR"
+  printf '%s\n' "$*" >>"$OPS_LOG"
   local kind="" fp="" outcome="" blocker_kind="" summary="" route="" code="" context=0
   local i=0 args=("$@")
   while (( i < ${#args[@]} )); do
@@ -48,6 +50,8 @@ ops() {
       blocker) kind=blocker ;;
       process) kind=process ;;
       context) context=1 ;;
+      inspect) kind=inspect ;;
+      author) kind=author ;;
     esac
     i=$((i+1))
   done
@@ -62,6 +66,16 @@ ops() {
         '{input_fingerprint:$fp,kind:$k,summary:$s,route:$r,code:$c}' \
         >>"$STATE_DIR/blockers.jsonl"
       echo '{"ok":true,"data":{"changed":true}}'
+      ;;
+    inspect)
+      echo '{"ok":true,"data":{"editable_spec":{"cwd":"cwd-unset","exec":{"argv":["cwd-unset"]}}}}'
+      ;;
+    author)
+      if [[ "$*" == *plan-update* ]]; then
+        echo '{"ok":true,"data":{"plan_token":"plan-token-proof"}}'
+      else
+        echo '{"ok":true}'
+      fi
       ;;
     *)
       if (( context )); then
@@ -142,5 +156,48 @@ jq -e 'select(.input_fingerprint=="fp-sem2" and .kind=="semantic-blocked")' \
   || fail "semantic blocked outcome did not record semantic-blocked"
 [[ ! -e $STATE_DIR/operational-park.json ]] || fail "semantic blocked outcome wrote the park sidecar"
 input_matches_operational_park fp-sem2 && fail "semantic blocked input matched a park sidecar"
+
+# An unreadable park record is reported by the wrapper, not leaked as jq's own
+# error text, and it is never a skip: with no readable park there is nothing to
+# honour, so the input stays live and the tick runs normally.
+printf 'not json\n' >"$STATE_DIR/operational-park.json"
+park_err=$(operational_park_fingerprint 2>&1 >/dev/null || true)
+[[ $park_err != *"jq:"* ]] || fail "corrupt park sidecar leaked jq's error: $park_err"
+[[ $park_err == *"operational park record"* ]] \
+  || fail "corrupt park sidecar was not reported by the wrapper: $park_err"
+input_matches_operational_park fp-a && fail "a corrupt park sidecar skipped the input"
+rm -f "$STATE_DIR/operational-park.json"
+absent_err=$(operational_park_fingerprint 2>&1 >/dev/null || true)
+[[ -z $absent_err ]] || fail "an absent park sidecar was reported: $absent_err"
+
+# A recovery that repairs a dirty worktree clears the park sidecar alongside the
+# blocker it already clears. Otherwise a later tick whose observation is
+# unchanged still matches the parked fingerprint and skips with no work, with
+# the blocker that justified the park already gone.
+rec=$TMP/recovery
+mkdir -p "$rec/worktree" "$rec/fork.git"
+git -C "$rec/fork.git" init -q --bare
+git -C "$rec/worktree" init -q
+git -C "$rec/worktree" config user.email proof@example.invalid
+git -C "$rec/worktree" config user.name proof
+git -C "$rec/worktree" checkout -q -b cap/recover
+touch "$rec/worktree/keep.txt"
+git -C "$rec/worktree" add keep.txt
+git -C "$rec/worktree" commit -qm base
+git -C "$rec/worktree" remote add fork "$rec/fork.git"
+git -C "$rec/worktree" push -q fork cap/recover
+git -C "$rec/worktree" fetch -q fork
+: >"$OPS_LOG"
+WORKTREE=$rec/worktree
+GIT_BASE=$rec/worktree
+SCOPE_ROOT=$rec
+OPERATION_STEM=managed-omp-cap-recover
+record_operational_park fp-rec crash
+input_matches_operational_park fp-rec || fail "recovery fixture did not record a park"
+recover_worktree cap/recover worktree-dirty "dedicated worktree is dirty: $WORKTREE" \
+  || fail "recover_worktree failed"
+[[ ! -e $STATE_DIR/operational-park.json ]] || fail "recover_worktree left the park sidecar"
+input_matches_operational_park fp-rec && fail "a recovered input still matched the park sidecar"
+grep -q 'automation clear-blocker' "$OPS_LOG" || fail "recover_worktree did not clear the blocker"
 
 echo "failure-budget ok"
