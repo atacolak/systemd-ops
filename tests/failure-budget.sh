@@ -31,14 +31,19 @@ mkdir -p "$STATE_DIR"
 
 ops() {
   mkdir -p "$STATE_DIR"
-  local kind="" fp="" outcome=""
+  local kind="" fp="" outcome="" blocker_kind="" summary="" route="" code="" context=0
   local i=0 args=("$@")
   while (( i < ${#args[@]} )); do
     case ${args[$i]} in
       --input-fingerprint) fp=${args[$((i+1))]} ;;
       --outcome) outcome=${args[$((i+1))]} ;;
+      --kind) blocker_kind=${args[$((i+1))]} ;;
+      --summary) summary=${args[$((i+1))]} ;;
+      --route) route=${args[$((i+1))]} ;;
+      --code) code=${args[$((i+1))]} ;;
       blocker) kind=blocker ;;
       process) kind=process ;;
+      context) context=1 ;;
     esac
     i=$((i+1))
   done
@@ -48,10 +53,25 @@ ops() {
       echo '{"ok":true}'
       ;;
     blocker)
+      jq -nc --arg fp "$fp" --arg k "$blocker_kind" --arg s "$summary" \
+        --arg r "$route" --arg c "$code" \
+        '{input_fingerprint:$fp,kind:$k,summary:$s,route:$r,code:$c}' \
+        >>"$STATE_DIR/blockers.jsonl"
       echo '{"ok":true,"data":{"changed":true}}'
       ;;
     *)
-      echo '{"ok":true}'
+      if (( context )); then
+        # The context mirrors durable processed state, so input_is_processed
+        # answers from what automation process actually wrote.
+        local processed=""
+        if [[ -r $STATE_DIR/processed.json ]]; then
+          processed=$(jq -r '.input_fingerprint // empty' "$STATE_DIR/processed.json")
+        fi
+        jq -nc --arg fp "$processed" \
+          '{ok:true,data:{automation:{processed:{input_fingerprint:$fp}}}}'
+      else
+        echo '{"ok":true}'
+      fi
       ;;
   esac
 }
@@ -63,10 +83,27 @@ jq -e '.failures==1 and .input_fingerprint=="fp-a"' "$STATE_DIR/failure-budget.j
 [[ -e $STATE_DIR/processed.json ]] && fail "first failure marked processed"
 
 operational_failure_maybe_park fp-a crash 2 || fail "second identical failure did not park"
-jq -e '.outcome=="blocked" and .input_fingerprint=="fp-a"' "$STATE_DIR/processed.json" >/dev/null \
-  || fail "parked input was not processed blocked"
+# An operational park (crash, timeout, contract-failure) must not certify the
+# input as processed: that is what made every later tick skip the input and left
+# the unit unable to retry. The blocker and the failure budget are the record.
+[[ ! -e $STATE_DIR/processed.json ]] || fail "operational park marked the input processed"
 jq -e '.failures==2 and .input_fingerprint=="fp-a"' "$STATE_DIR/failure-budget.json" >/dev/null \
   || fail "budget sidecar was not 2 on fp-a"
+jq -e 'select(.input_fingerprint=="fp-a" and .kind=="semantic-blocked"
+      and (.summary|contains("parked after 2 identical crash failures")))' \
+  "$STATE_DIR/blockers.jsonl" >/dev/null \
+  || fail "operational park did not record the blocker"
+jq -e 'select(.input_fingerprint=="fp-a" and .kind=="iteration-failed")' \
+  "$STATE_DIR/blockers.jsonl" >/dev/null \
+  || fail "operational park did not record the failure blocker"
+# The retry is real: the same fingerprint still reads as unprocessed next tick.
+input_is_processed fp-a && fail "operationally parked input still reads as processed"
+
+# Contrast, and a guard against a vacuous negative above: a semantic blocked
+# input is still processed, so the driver keeps skipping it. The end-to-end
+# version of this contrast is the blocked-repeat case in wrapper-contract.sh.
+mark_processed fp-sem blocked
+input_is_processed fp-sem || fail "semantic blocked input did not read as processed"
 
 n=$(record_attempt_failure fp-b crash)
 [[ $n -eq 1 ]] || fail "new fingerprint did not reset budget, got $n"
