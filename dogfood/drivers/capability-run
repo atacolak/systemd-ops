@@ -31,6 +31,49 @@ source "$SCOPE_ROOT/.systemd-ops/lib/pr-settlement"
 # shellcheck source=../lib/pr-review-state
 source "$SCOPE_ROOT/.systemd-ops/lib/pr-review-state"
 
+# A capability pass that exits 0 without calling automation_report is normally a
+# contract failure, and the run parks on it. When the driver can machine-verify
+# that there was nothing to change, that dead end is a false alarm. A pass is a
+# VERIFIED NO-OP only when all four of these hold:
+#   1. the pass exited 0
+#   2. the bound worktree is clean: plain `git status --porcelain` prints nothing,
+#      so tracked modifications and new untracked files both disqualify (ignored
+#      files are not shown by plain porcelain and are fine)
+#   3. the target generation is an ancestor of HEAD
+#   4. there is no capability-local unpublished delta: merging HEAD and the target
+#      from their merge base prints nothing
+# Condition 3 is what stops a tree that merely has the right branch name, or one
+# that descends from some other generation, from self-reporting READY: a tree
+# missing the target ancestor is NOT a no-op, it is unready and must keep
+# failing. Condition 4 covers the diverged case, where the merge base is older
+# than the target and the merge is not empty. Read-only, no side effects.
+capability_pass_is_verified_noop() {
+  local pass_exit=$1
+  local generation=$2
+  local worktree=$3
+  local dirty base delta
+  [[ $pass_exit -eq 0 ]] || return 1
+  [[ -n "$generation" ]] || return 1
+  dirty=$(git -C "$worktree" status --porcelain) || return 1
+  [[ -z "$dirty" ]] || return 1
+  git -C "$worktree" merge-base --is-ancestor "$generation" HEAD || return 1
+  base=$(git -C "$worktree" merge-base HEAD "$generation") || return 1
+  [[ -n "$base" ]] || return 1
+  delta=$(git -C "$worktree" merge-tree "$base" HEAD "$generation") || return 1
+  [[ -z "$delta" ]] || return 1
+  return 0
+}
+
+# True only when the pass's own iteration is still open and carries no report.
+# Anything else, including an unreadable operator surface, keeps the existing
+# behaviour: the driver never overrides a report the agent already made.
+capability_pass_awaiting_report() {
+  local view
+  view=$(ops_bound operator show --unit "$OPERATION_STEM") || return 1
+  jq -e '(.data.operator.active_iteration != null)
+    and (.data.operator.active_iteration.reported_at == null)' <<<"$view" >/dev/null
+}
+
 ensure_clean_worktree "$BRANCH" || exit $?
 git -C "$WORKTREE" fetch --quiet fork main || true
 upstream_generation=$(resolve_target_generation) || exit $?
@@ -127,6 +170,26 @@ BLOCKED reports require route=self|parent.
 PR children are publication/review streams, not semaphores. Maintain the local capability against the target generation even if a child PR is BLOCKED. Only BLOCKED if the LOCAL capability cannot be made correct. $extra_prompt Perform exactly one capability maintenance pass, then exit."
 
   omp_code=$?
+
+  # A verified no-op pass that never called automation_report would otherwise
+  # burn a contract-failure park, so the driver emits that READY report itself
+  # instead of depending on agent compliance. Ordering is load bearing:
+  # automation report needs a live iteration and iteration-finish consumes it,
+  # so the report is written before the finish below. The agent's own report
+  # always wins: when the pass reported, this iteration already carries it, the
+  # driver stays silent, and nothing new happens.
+  if [[ $omp_code -eq 0 ]] \
+    && capability_pass_awaiting_report \
+    && capability_pass_is_verified_noop "$omp_code" "$upstream_generation" "$WORKTREE"; then
+    noop_headline="$BRANCH already correct for ${upstream_generation:0:8}; verified no-op"
+    noop_summary=$(jq -cn '[
+      "capability pass exited 0 without an automation_report",
+      "worktree clean: git status --porcelain is empty",
+      "target generation is an ancestor of HEAD: git merge-base --is-ancestor holds",
+      "no capability-local delta: git merge-tree from the merge base is empty"
+    ]')
+    ops_bound automation report --headline "$noop_headline" --summary "$noop_summary" --outcome ready >/dev/null 2>&1 || true
+  fi
 
   finish_json=$(finish_iteration "$omp_code")
   finish_code=$?

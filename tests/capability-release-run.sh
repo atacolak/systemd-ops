@@ -139,6 +139,7 @@ set -euo pipefail
 real="$BIN"
 args=("\$@")
 joined=" \${args[*]} "
+printf '%s\n' "\${args[*]}" >>"$SCOPE/ops-argv.log"
 if [[ "\$joined" == *" automation context "* ]]; then
   cat "$SCOPE/context.json"
   exit 0
@@ -185,12 +186,18 @@ for unit in os.environ["CHILD_UNITS"].split():
         "checkpoint": {"present": True, "kind": "structured", "generation": obs.get("generation"), "output_revision": "rev"},
         "blocker": None,
     })
-print(json.dumps({"ok": True, "data": {"relations": {"children": children, "parent": None}}}))
+automation = {}
+cap_proc = scope / ".systemd-ops/operations" / cap / "state/processed.json"
+if cap_proc.exists():
+    proc = json.loads(cap_proc.read_text())
+    automation["processed"] = {"input_fingerprint": proc.get("input_fingerprint"), "outcome": proc.get("outcome")}
+print(json.dumps({"ok": True, "data": {"relations": {"children": children, "parent": None}, "automation": automation}}))
 PY
 }
 
 run_cap() {
   local now=$1
+  local generation=${2:-$G2}
   export SCOPE CAP
   export CHILD_UNITS="$PRA $PRB"
   write_context >"$SCOPE/context.json"
@@ -199,10 +206,41 @@ run_cap() {
   SYSTEMD_OPS_BIN="$SCOPE/fake-ops" \
   OMP_BIN="$SCOPE/fake-omp" \
   AGENT_CWD="$SCOPE/agents" \
-  UPSTREAM_GENERATION="$G2" \
+  UPSTREAM_GENERATION="$generation" \
   PR_SETTLE_QUIET_SECONDS=300 \
   PR_SETTLE_NOW="$now" \
   "$SCOPE/.systemd-ops/operations/$CAP/run"
+}
+
+# Pin the target generation to the worktree's own checkpoint so the release
+# gate launches immediately: the no-op decision, not the quiet window, is what
+# these cases exercise.
+set_target() {
+  jq -n --arg fp "old-fp" --arg gen "$1" --arg rev "$(git -C "$SCOPE/worktree" rev-parse HEAD)" \
+    '{version:2,input_fingerprint:$fp,generation:$gen,output_revision:$rev,checkpointed_at:"2026-09-01T00:00:00.000000Z"}' \
+    >"$SCOPE/.systemd-ops/operations/$CAP/state/checkpoint.json"
+}
+
+# Replace the agent stub. $1 is a verbatim body line, empty for a silent exit.
+write_fake_omp() {
+  local body=$1
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' \
+      'echo called >>"${SYSTEMD_OPS_SCOPE_ROOT}/agent-calls"'
+    [[ -n $body ]] && printf '%s\n' "$body"
+  } >"$SCOPE/fake-omp"
+  chmod +x "$SCOPE/fake-omp"
+}
+
+run_cap_code() {
+  local now=$1
+  local generation=${2:-$G2}
+  local log=$3
+  set +e
+  run_cap "$now" "$generation" >"$log" 2>&1
+  local code=$?
+  set -e
+  printf '%s\n' "$code"
 }
 make_scope
 write_child "$PRA" true obs-a "$G2" obs-a ready "2026-09-01T00:00:00Z"
@@ -233,5 +271,139 @@ run_cap 1499 >/dev/null 2>&1 || true
 [[ ! -e $SCOPE/agent-calls ]] || fail "reset +299 invoked OMP"
 run_cap 1500 >/tmp/cap-reset-go.out 2>&1 || true
 [[ -f $SCOPE/agent-calls ]] || fail "reset +300 did not invoke OMP: $(cat /tmp/cap-reset-go.out)"
+
+CAP_STATE=$SCOPE/.systemd-ops/operations/$CAP/state
+
+# Verified no-op: the pass exits 0 without reporting, and the driver can prove
+# the worktree already carries the target with no local delta. The driver must
+# emit the READY report itself on the pass's own iteration, reconsolidate, and
+# reach the checkpoint path instead of parking on the contract failure.
+make_scope
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+write_fake_omp ''
+code=$(run_cap_code 1000 "$target" "$TMP/cap-noop.out")
+[[ $code -eq 0 ]] || fail "verified no-op exited $code: $(cat "$TMP/cap-noop.out")"
+grep -q "automation_report is required" "$TMP/cap-noop.out" && fail "verified no-op took the contract-failure path"
+jq -e '.iterations[0].reconsolidated == true' "$CAP_STATE/operator.json" >/dev/null \
+  || fail "verified no-op did not reconsolidate"
+jq -e '.outcome == "ready"' "$CAP_STATE/processed.json" >/dev/null \
+  || fail "verified no-op did not process the input as ready"
+[[ ! -e $CAP_STATE/failure-budget.json ]] || fail "verified no-op created a failure budget"
+jq -e --arg gen "$target" '.version == 2 and .generation == $gen and (.output_revision | length == 40)' \
+  "$CAP_STATE/checkpoint.json" >/dev/null || fail "verified no-op did not checkpoint the target generation"
+[[ $(wc -l <"$SCOPE/agent-calls") -eq 1 ]] || fail "verified no-op did not run exactly one pass"
+grep -c "already correct for" "$SCOPE/ops-argv.log" | grep -qx 1 || fail "driver did not emit exactly one no-op report"
+grep "already correct for" "$SCOPE/ops-argv.log" | grep -q "${target:0:8}" \
+  || fail "no-op report does not name the target generation"
+[[ $(awk '/operator iteration-start/{s++} /automation report/{r++} /operator iteration-finish/{f++} END{print s" "r" "f}' "$SCOPE/ops-argv.log") == "1 1 1" ]] \
+  || fail "self-report reused or duplicated an iteration: $(awk '/operator iteration-start|automation report|operator iteration-finish/{print}' "$SCOPE/ops-argv.log")"
+[[ $(awk '/operator iteration-start/{printf "start "} /automation report/{printf "report "} /operator iteration-finish/{printf "finish "}' "$SCOPE/ops-argv.log") == "start report finish " ]] \
+  || fail "self-report did not precede the pass's own iteration-finish"
+
+# Missing ancestor: the target generation is real but is not an ancestor of
+# HEAD, so the tree is unready rather than unchanged. It must not self-report.
+make_scope
+git -C "$SCOPE/worktree" commit --allow-empty -qm ahead
+absent=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+git -C "$SCOPE/worktree" reset -q --hard HEAD~1
+set_target "$absent"
+write_child "$PRA" false obs-a "$absent" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$absent" obs-b ready "2026-09-01T00:01:00Z"
+write_fake_omp ''
+code=$(run_cap_code 1000 "$absent" "$TMP/cap-absent.out")
+[[ $code -eq 3 ]] || fail "missing ancestor exited $code, want 3: $(cat "$TMP/cap-absent.out")"
+grep -q "automation_report is required" "$TMP/cap-absent.out" || fail "missing ancestor did not hit the contract failure"
+[[ $(grep -c "already correct for" "$SCOPE/ops-argv.log" || true) -eq 0 ]] || fail "missing ancestor self-reported READY"
+jq -e '.iterations[0].reconsolidated == false' "$CAP_STATE/operator.json" >/dev/null \
+  || fail "missing ancestor reconsolidated"
+jq -e '.failures == 1' "$CAP_STATE/failure-budget.json" >/dev/null \
+  || fail "missing ancestor did not record the contract failure"
+[[ ! -e $CAP_STATE/processed.json ]] || fail "missing ancestor advanced processed state"
+
+# Dirty worktree: the pass leaves an uncommitted product delta behind. The tree
+# is not unchanged, so the driver must not close the pass itself.
+make_scope
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+write_fake_omp "printf 'local delta\n' >\"\$WORKTREE/cap-local-delta\""
+code=$(run_cap_code 1000 "$target" "$TMP/cap-dirty.out")
+[[ -e $SCOPE/worktree/cap-local-delta ]] || fail "dirty case did not stage a product delta"
+[[ $code -eq 3 ]] || fail "dirty worktree exited $code, want 3: $(cat "$TMP/cap-dirty.out")"
+grep -q "automation_report is required" "$TMP/cap-dirty.out" || fail "dirty worktree did not hit the contract failure"
+[[ $(grep -c "already correct for" "$SCOPE/ops-argv.log" || true) -eq 0 ]] || fail "dirty worktree self-reported READY"
+jq -e '.iterations[0].reconsolidated == false' "$CAP_STATE/operator.json" >/dev/null \
+  || fail "dirty worktree reconsolidated"
+jq -e '.failures == 1' "$CAP_STATE/failure-budget.json" >/dev/null \
+  || fail "dirty worktree did not record the contract failure"
+[[ ! -e $CAP_STATE/processed.json ]] || fail "dirty worktree advanced processed state"
+
+# Divergent delta: HEAD and the target changed the same file from a common
+# base, so a merge from the merge base is not empty. Not a no-op.
+make_scope
+printf 'base\n' >"$SCOPE/worktree/shared.txt"
+git -C "$SCOPE/worktree" add shared.txt
+git -C "$SCOPE/worktree" commit -qm base
+git -C "$SCOPE/worktree" checkout -q -b proof/target
+printf 'target\n' >"$SCOPE/worktree/shared.txt"
+git -C "$SCOPE/worktree" commit -qam target
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+git -C "$SCOPE/worktree" checkout -q cap/hindsight
+printf 'cap\n' >"$SCOPE/worktree/shared.txt"
+git -C "$SCOPE/worktree" commit -qam cap
+git -C "$SCOPE/worktree" push -q fork cap/hindsight:cap/hindsight
+git -C "$SCOPE/worktree" push -q fork proof/target:proof/target
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+write_fake_omp ''
+merge_base=$(git -C "$SCOPE/worktree" merge-base HEAD "$target")
+[[ -n $(git -C "$SCOPE/worktree" merge-tree "$merge_base" HEAD "$target") ]] \
+  || fail "divergent fixture is not divergent"
+code=$(run_cap_code 1000 "$target" "$TMP/cap-divergent.out")
+[[ $code -eq 3 ]] || fail "divergent delta exited $code, want 3: $(cat "$TMP/cap-divergent.out")"
+grep -q "automation_report is required" "$TMP/cap-divergent.out" || fail "divergent delta did not hit the contract failure"
+[[ $(grep -c "already correct for" "$SCOPE/ops-argv.log" || true) -eq 0 ]] || fail "divergent delta self-reported READY"
+jq -e '.iterations[0].reconsolidated == false' "$CAP_STATE/operator.json" >/dev/null \
+  || fail "divergent delta reconsolidated"
+jq -e '.failures == 1' "$CAP_STATE/failure-budget.json" >/dev/null \
+  || fail "divergent delta did not record the contract failure"
+[[ ! -e $CAP_STATE/processed.json ]] || fail "divergent delta advanced processed state"
+
+# The agent's own report always wins: the pass reports blocked on a tree that
+# would otherwise verify as a no-op. The driver must leave that report alone.
+make_scope
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+write_fake_omp "\"\$SYSTEMD_OPS_BIN\" --json --manager user automation report --headline cap-blocked --summary '[\"blocked\"]' --outcome blocked --route self >/dev/null"
+code=$(run_cap_code 1000 "$target" "$TMP/cap-agent-report.out")
+[[ $code -eq 0 ]] || fail "agent blocked report exited $code: $(cat "$TMP/cap-agent-report.out")"
+[[ $(grep -c "already correct for" "$SCOPE/ops-argv.log" || true) -eq 0 ]] || fail "driver overrode the agent's own report"
+jq -e '.iterations[0].reconsolidated == true and .iterations[0].outcome == "blocked"' "$CAP_STATE/operator.json" >/dev/null \
+  || fail "agent blocked report was not reconsolidated as blocked"
+jq -e '.outcome == "blocked"' "$CAP_STATE/processed.json" >/dev/null || fail "agent blocked report did not process the input"
+[[ ! -e $CAP_STATE/failure-budget.json ]] || fail "agent blocked report created a failure budget"
+
+# Regression: an unchanged semantic blocked input is already processed, so the
+# driver exits without starting an iteration or relaunching the agent.
+make_scope
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+jq -n '{version:1,input_fingerprint:"fp-cap",outcome:"blocked",processed_at:"2026-09-01T00:00:00.000000Z"}' \
+  >"$CAP_STATE/processed.json"
+write_fake_omp ''
+code=$(run_cap_code 1000 "$target" "$TMP/cap-unchanged.out")
+[[ $code -eq 0 ]] || fail "unchanged blocked input exited $code: $(cat "$TMP/cap-unchanged.out")"
+[[ ! -e $SCOPE/agent-calls ]] || fail "unchanged blocked input relaunched the agent"
+[[ ! -e $CAP_STATE/operator.json ]] || fail "unchanged blocked input started an iteration"
+jq -e '.outcome == "blocked"' "$CAP_STATE/processed.json" >/dev/null || fail "unchanged blocked input rewrote processed state"
 
 echo "capability-release-run ok"
