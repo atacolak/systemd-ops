@@ -233,7 +233,8 @@ write_fake_omp() {
   local body=$1
   {
     printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' \
-      'echo called >>"${SYSTEMD_OPS_SCOPE_ROOT}/agent-calls"'
+      'echo called >>"${SYSTEMD_OPS_SCOPE_ROOT}/agent-calls"' \
+      'printf "%s\n" "$@" >>"${SYSTEMD_OPS_SCOPE_ROOT}/agent-argv.log"'
     [[ -n $body ]] && printf '%s\n' "$body"
   } >"$SCOPE/fake-omp"
   chmod +x "$SCOPE/fake-omp"
@@ -302,6 +303,12 @@ jq -e '.outcome == "ready"' "$CAP_STATE/processed.json" >/dev/null \
 jq -e --arg gen "$target" '.version == 2 and .generation == $gen and (.output_revision | length == 40)' \
   "$CAP_STATE/checkpoint.json" >/dev/null || fail "verified no-op did not checkpoint the target generation"
 [[ $(wc -l <"$SCOPE/agent-calls") -eq 1 ]] || fail "verified no-op did not run exactly one pass"
+# The maintainer pass carries the raised capability time limit. A pass that must
+# merge, verify, commit and report does not fit the old 20m bound, and a silent
+# regression to a shorter limit kills the pass as an operational timeout.
+agent_argv=$(tr '\n' ' ' <"$SCOPE/agent-argv.log")
+[[ $agent_argv == *"--max-time 60m"* ]] \
+  || fail "maintainer pass does not carry --max-time 60m: $agent_argv"
 grep -c "already correct for" "$SCOPE/ops-argv.log" | grep -qx 1 || fail "driver did not emit exactly one no-op report"
 grep "already correct for" "$SCOPE/ops-argv.log" | grep -q "${target:0:8}" \
   || fail "no-op report does not name the target generation"

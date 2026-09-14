@@ -173,7 +173,7 @@ while (( passes < MAX_INTELLIGENT_PASSES )); do
   fi
 
   "$OMP_BIN" -p --agent capability-maintainer --agent-cwd "$AGENT_CWD" \
-    --cwd "$WORKTREE" --approval-mode yolo --max-time 20m \
+    --cwd "$WORKTREE" --approval-mode yolo --max-time 60m \
     "Repository: atacolak/oh-my-pi
 Capability branch: $BRANCH
 Operation stem: $OPERATION_STEM
