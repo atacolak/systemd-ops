@@ -87,6 +87,13 @@ current_input=$(observe_input) || exit $?
 if input_is_processed "$current_input"; then
   exit 0
 fi
+# An operational park bounds the retry instead of certifying the input: while
+# the observation still matches the parked fingerprint this tick does no work.
+# The skip reports nothing, writes no processed state and clears no blocker or
+# budget; it only declines to burn a pass.
+if input_matches_operational_park "$current_input"; then
+  exit 0
+fi
 wake_input=$current_input
 
 
@@ -106,6 +113,10 @@ while (( passes < MAX_INTELLIGENT_PASSES )); do
   context=$(automation_context_json) || exit $?
   current_input=$(observe_input) || exit $?
   if input_is_processed "$current_input"; then
+    exit 0
+  fi
+  # Same bound as the pre-lock check: an unchanged parked input does no work.
+  if input_matches_operational_park "$current_input"; then
     exit 0
   fi
   wake_input=$current_input

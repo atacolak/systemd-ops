@@ -528,6 +528,29 @@ failure_budget_file() {
   printf '%s\n' "$STATE_DIR/failure-budget.json"
 }
 
+# The fingerprint the last operational park covered. This is the bound on the
+# retry: while the observation still matches it, the tick has nothing to do. It
+# is not processed state, and nothing on the processed path reads this file.
+operational_park_file() {
+  printf '%s\n' "$STATE_DIR/operational-park.json"
+}
+
+operational_park_fingerprint() {
+  local f
+  f=$(operational_park_file)
+  [[ -r "$f" ]] || return 0
+  jq -r '.input_fingerprint // empty' "$f"
+}
+
+# True when this observation is the input an operational park already covered.
+# A different fingerprint never matches, so a later input runs normally.
+input_matches_operational_park() {
+  local input=$1
+  local parked
+  parked=$(operational_park_fingerprint) || return 1
+  [[ -n "$parked" && "$parked" == "$input" ]]
+}
+
 failure_budget_count() {
   local input=$1
   local f
@@ -553,20 +576,36 @@ record_attempt_failure() {
 }
 
 clear_failure_budget() {
-  rm -f "$(failure_budget_file)"
+  # A recovered input must not stay shadowed by a stale park record.
+  rm -f "$(failure_budget_file)" "$(operational_park_file)"
+}
+
+# Record the fingerprint an operational park covered. This is written only from
+# park_identical_input, so a semantic blocked outcome never writes it.
+record_operational_park() {
+  local input=$1
+  local kind=$2
+  local f
+  f=$(operational_park_file)
+  mkdir -p "$STATE_DIR"
+  jq -nc --arg fp "$input" --arg kind "$kind" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{version:1,input_fingerprint:$fp,last_kind:$kind,parked_at:$at}' >"$f"
 }
 
 # Park an input whose operational failures exhausted the budget. This park is
 # operational, not semantic: the input stays unprocessed so the next tick
 # retries it, and the failure-budget entry plus the blocker are the durable
 # record. Marking the input processed here is what made every later tick skip it
-# and left the unit unable to converge.
+# and left the unit unable to converge. The blocker carries the real kind of the
+# failures that caused it, iteration-failed; semantic-blocked is reserved for a
+# genuine semantic blocked outcome.
 park_identical_input() {
   local input=$1
   local kind=$2
   local n=${3:-$FAILURE_BUDGET}
   local summary="parked after ${n} identical $kind failures on unchanged input"
-  record_blocker semantic-blocked 0 "$summary" "${iteration_id:-}" parent "$input" || true
+  record_blocker iteration-failed 0 "$summary" "${iteration_id:-}" parent "$input" || true
+  record_operational_park "$input" "$kind" || true
 }
 
 # Return 0 if parked (caller exits 0). Return 1 if budget remains (caller

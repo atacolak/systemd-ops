@@ -396,6 +396,11 @@ jq -e '.iterations[0].reconsolidated == true and .iterations[0].outcome == "bloc
   || fail "agent blocked report was not reconsolidated as blocked"
 jq -e '.outcome == "blocked"' "$CAP_STATE/processed.json" >/dev/null || fail "agent blocked report did not process the input"
 [[ ! -e $CAP_STATE/failure-budget.json ]] || fail "agent blocked report created a failure budget"
+# A genuine semantic blocked outcome is not an operational park: it records
+# semantic-blocked and writes no park record.
+jq -e '.kind == "semantic-blocked"' "$CAP_STATE/blocker.json" >/dev/null \
+  || fail "semantic blocked outcome did not record semantic-blocked: $(cat "$CAP_STATE/blocker.json")"
+[[ ! -e $CAP_STATE/operational-park.json ]] || fail "semantic blocked outcome wrote the park sidecar"
 
 # Regression: an unchanged semantic blocked input is already processed, so the
 # driver exits without starting an iteration or relaunching the agent.
@@ -469,5 +474,66 @@ jq -e '.iterations[0].reconsolidated == false' "$CAP_STATE/operator.json" >/dev/
 jq -e '.failures == 1' "$CAP_STATE/failure-budget.json" >/dev/null \
   || fail "rejected self-report did not record the contract failure"
 [[ ! -e $CAP_STATE/processed.json ]] || fail "rejected self-report advanced processed state"
+
+# Operational park: an operational failure does not certify the input (commit
+# d2673ad), so the retry is bounded by a sidecar holding the fingerprint the
+# park covered. The first failure is retried, the second parks, and a later tick
+# with the same unchanged input burns no pass, writes no processed state and
+# clears nothing. A different fingerprint is a new input and runs normally.
+make_scope
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+write_fake_omp 'exit 7'
+code=$(run_cap_code 1000 "$target" "$TMP/cap-park-first.out")
+[[ $code -eq 7 ]] || fail "first operational failure exited $code, want 7: $(cat "$TMP/cap-park-first.out")"
+[[ ! -e $CAP_STATE/operational-park.json ]] || fail "first operational failure wrote the park sidecar"
+[[ ! -e $CAP_STATE/processed.json ]] || fail "first operational failure certified the input"
+code=$(run_cap_code 1000 "$target" "$TMP/cap-park-parked.out")
+[[ $code -eq 0 ]] || fail "exhausted budget exited $code, want the park: $(cat "$TMP/cap-park-parked.out")"
+jq -e '.input_fingerprint == "fp-cap"' "$CAP_STATE/operational-park.json" >/dev/null \
+  || fail "park did not record the parked fingerprint"
+jq -e '.failures == 2 and .input_fingerprint == "fp-cap"' "$CAP_STATE/failure-budget.json" >/dev/null \
+  || fail "park did not leave the budget on the parked input"
+jq -e '.kind == "iteration-failed"
+    and (.summary | contains("parked after 2 identical crash failures"))' \
+  "$CAP_STATE/blocker.json" >/dev/null \
+  || fail "park did not record the blocker as iteration-failed: $(cat "$CAP_STATE/blocker.json")"
+
+starts_before=$(grep -c 'operator iteration-start' "$SCOPE/ops-argv.log" || true)
+cp "$CAP_STATE/failure-budget.json" "$TMP/cap-park-budget.json"
+cp "$CAP_STATE/blocker.json" "$TMP/cap-park-blocker.json"
+code=$(run_cap_code 1000 "$target" "$TMP/cap-park-skip.out")
+[[ $code -eq 0 ]] || fail "unchanged parked input exited $code: $(cat "$TMP/cap-park-skip.out")"
+[[ $(grep -c 'operator iteration-start' "$SCOPE/ops-argv.log" || true) -eq "$starts_before" ]] \
+  || fail "unchanged parked input started an iteration"
+[[ $(grep -c called "$SCOPE/agent-calls" || true) -eq 2 ]] || fail "unchanged parked input burned a pass"
+[[ ! -e $CAP_STATE/processed.json ]] || fail "the park skip certified the input as processed"
+cmp -s "$TMP/cap-park-budget.json" "$CAP_STATE/failure-budget.json" \
+  || fail "the park skip rewrote the failure budget"
+cmp -s "$TMP/cap-park-blocker.json" "$CAP_STATE/blocker.json" \
+  || fail "the park skip rewrote the blocker"
+[[ $(grep -c "already correct for" "$SCOPE/ops-argv.log" || true) -eq 0 ]] \
+  || fail "the park skip self-reported READY"
+
+# A different fingerprint is a new input, so it runs. A failure that is not a
+# park leaves the park record alone.
+export PROOF_FINGERPRINT=fp-cap-later
+code=$(run_cap_code 1000 "$target" "$TMP/cap-park-next.out")
+[[ $code -eq 7 ]] || fail "changed input exited $code, want a fresh pass failure: $(cat "$TMP/cap-park-next.out")"
+[[ $(grep -c called "$SCOPE/agent-calls" || true) -eq 3 ]] || fail "changed input did not run a pass"
+jq -e '.input_fingerprint == "fp-cap"' "$CAP_STATE/operational-park.json" >/dev/null \
+  || fail "a failed attempt rewrote the park record"
+
+# A new input that reaches READY still runs, and clearing the budget clears the
+# stale park record with it: a recovered input is not shadowed.
+write_fake_omp ''
+code=$(run_cap_code 1000 "$target" "$TMP/cap-park-recovered.out")
+unset PROOF_FINGERPRINT
+[[ $code -eq 0 ]] || fail "recovered input exited $code: $(cat "$TMP/cap-park-recovered.out")"
+jq -e '.outcome == "ready"' "$CAP_STATE/processed.json" >/dev/null || fail "recovered input did not process as ready"
+[[ ! -e $CAP_STATE/operational-park.json ]] || fail "recovered input left the stale park record"
+[[ ! -e $CAP_STATE/failure-budget.json ]] || fail "recovered input left the stale failure budget"
 
 echo "capability-release-run ok"

@@ -14,6 +14,10 @@ grep -q 'operational_failure_maybe_park' "$DOGFOOD_ROOT/drivers/runtime-run" \
   || fail "runtime-run does not park identical operational failures"
 grep -q 'operational_failure_maybe_park' "$DOGFOOD_ROOT/drivers/capability-run" \
   || fail "capability-run does not park identical operational failures"
+grep -q 'input_matches_operational_park' "$DOGFOOD_ROOT/drivers/runtime-run" \
+  || fail "runtime-run does not skip an unchanged parked input"
+grep -q 'input_matches_operational_park' "$DOGFOOD_ROOT/drivers/capability-run" \
+  || fail "capability-run does not skip an unchanged parked input"
 grep -q 'Current local OMP release pin (informational)' "$DOGFOOD_ROOT/drivers/pr-run" \
   || fail "pr-run still mandates Required target generation"
 grep -q 'P2 is not automatically fixable' "$DOGFOOD_ROOT/drivers/pr-run" \
@@ -89,15 +93,30 @@ operational_failure_maybe_park fp-a crash 2 || fail "second identical failure di
 [[ ! -e $STATE_DIR/processed.json ]] || fail "operational park marked the input processed"
 jq -e '.failures==2 and .input_fingerprint=="fp-a"' "$STATE_DIR/failure-budget.json" >/dev/null \
   || fail "budget sidecar was not 2 on fp-a"
-jq -e 'select(.input_fingerprint=="fp-a" and .kind=="semantic-blocked"
+# The park records a real kind. crash, timeout and contract-failure are
+# iteration failures, not semantic outcomes, so a parked input must not claim
+# semantic-blocked. The summary wording is the park's own.
+jq -e 'select(.input_fingerprint=="fp-a" and .kind=="iteration-failed"
       and (.summary|contains("parked after 2 identical crash failures")))' \
   "$STATE_DIR/blockers.jsonl" >/dev/null \
-  || fail "operational park did not record the blocker"
-jq -e 'select(.input_fingerprint=="fp-a" and .kind=="iteration-failed")' \
+  || fail "operational park did not record the blocker as iteration-failed"
+jq -e 'select(.input_fingerprint=="fp-a" and .kind=="iteration-failed"
+      and (.summary|contains("crash with exit 2")))' \
   "$STATE_DIR/blockers.jsonl" >/dev/null \
   || fail "operational park did not record the failure blocker"
+jq -e 'select(.kind=="semantic-blocked")' "$STATE_DIR/blockers.jsonl" >/dev/null \
+  && fail "operational park claimed a semantic block"
 # The retry is real: the same fingerprint still reads as unprocessed next tick.
 input_is_processed fp-a && fail "operationally parked input still reads as processed"
+
+# The retry is bounded by a sidecar next to the failure budget: it holds the
+# fingerprint the last operational park covered. While the observation still
+# matches it a tick has nothing to retry. This is not processed state and
+# nothing on the processed path reads it.
+jq -e '.input_fingerprint=="fp-a"' "$STATE_DIR/operational-park.json" >/dev/null \
+  || fail "operational park did not record the parked fingerprint in the sidecar"
+input_matches_operational_park fp-a || fail "parked input did not match the park sidecar"
+input_matches_operational_park fp-later && fail "a different input matched the park sidecar"
 
 # Contrast, and a guard against a vacuous negative above: a semantic blocked
 # input is still processed, so the driver keeps skipping it. The end-to-end
@@ -110,5 +129,18 @@ n=$(record_attempt_failure fp-b crash)
 
 clear_failure_budget
 [[ ! -e $STATE_DIR/failure-budget.json ]] || fail "clear_failure_budget left sidecar"
+# A recovered input must not stay shadowed by a stale park record.
+[[ ! -e $STATE_DIR/operational-park.json ]] || fail "clear_failure_budget left the park sidecar"
+
+# A genuine semantic blocked outcome is not an operational park: it stays
+# processed and records semantic-blocked, and it writes no park sidecar.
+mark_processed fp-sem2 blocked
+input_is_processed fp-sem2 || fail "semantic blocked input did not read as processed"
+record_blocker semantic-blocked 0 "the local capability cannot be made correct" "" self fp-sem2
+jq -e 'select(.input_fingerprint=="fp-sem2" and .kind=="semantic-blocked")' \
+  "$STATE_DIR/blockers.jsonl" >/dev/null \
+  || fail "semantic blocked outcome did not record semantic-blocked"
+[[ ! -e $STATE_DIR/operational-park.json ]] || fail "semantic blocked outcome wrote the park sidecar"
+input_matches_operational_park fp-sem2 && fail "semantic blocked input matched a park sidecar"
 
 echo "failure-budget ok"
