@@ -32,16 +32,17 @@
 # killed and treated as a failure (default 5), and HCOM_SEND_TIMEOUT for the
 # seconds the delivery send may take before it is killed and reported as a
 # failed delivery (default 30). The send bound is the larger one because a
-# delivery can legitimately take longer than a roster read. Each bound is a
-# whole number of seconds greater than zero, and any other value refuses the
-# notification with status 2 and a message naming the knob and the value it
-# read, before any hcom call: `timeout 0` is not a zero length bound but no
-# bound at all (the timeout(1) manual: a duration of 0 disables the associated
-# timeout), so a 0 read as a duration would leave the unbounded watcher this
-# bound exists to prevent, while a value `timeout` cannot parse fails the call
-# with a status of its own that says nothing about hcom. An unset or empty knob
-# takes its default. Both are read at call time, so sourcing this file makes no
-# call and reads no environment.
+# delivery can legitimately take longer than a roster read. A bound is a
+# positive whole number of seconds: an unset or empty knob takes its default,
+# 5 for HCOM_TIMEOUT and 30 for HCOM_SEND_TIMEOUT, and any other value, a
+# literal 0 included, is refused with status 2 and a message naming the knob
+# and the value it read, before any hcom call. A 0 is refused because
+# `timeout 0` is not a zero length bound but no bound at all (the timeout(1)
+# manual: a duration of 0 disables the associated timeout), so a 0 read as a
+# duration would leave the unbounded watcher this bound exists to prevent,
+# while a value `timeout` cannot parse fails the call with a status of its own
+# that says nothing about hcom. Both are read at call time, so sourcing this
+# file makes no call and reads no environment.
 #
 # The roster read and the resume are bounded by HCOM_TIMEOUT, the delivery send
 # by HCOM_SEND_TIMEOUT. A bound sends TERM when it expires and then waits for
@@ -224,7 +225,7 @@ system_notify() {
         echo "system_notify: hcom send as $source_id to @$lead_name was killed at the ${hcom_send_timeout}s bound or exited with the timeout status 124" >&2
         ;;
       137)
-        echo "system_notify: hcom send as $source_id to @$lead_name was sent KILL ${SYSTEM_NOTIFY_KILL_GRACE}s after the ${hcom_send_timeout}s bound, status 137" >&2
+        echo "system_notify: hcom send as $source_id to @$lead_name did not finish within the ${hcom_send_timeout}s bound and was killed, status 137" >&2
         ;;
       125)
         echo "system_notify: hcom send as $source_id to @$lead_name ended with status 125, the status timeout reports for its own failure rather than for hcom" >&2

@@ -644,6 +644,29 @@ if command -v timeout >/dev/null 2>&1; then
     || fail "a send that ignores TERM took ${SEND_TERM_SECONDS}s, the kill-after grace did not end it"
 fi
 
+# The case above pins that the grace ends a call which ignores TERM; this one
+# pins what the 137 branch then reports. It reports what the seam observed, not
+# a cause it cannot know: the call did not finish inside its bound and was
+# killed. An hcom or a `timeout` killed by SIGKILL from anywhere else reports
+# the same 137, so a report that the seam sent the KILL, or that the call
+# ignored the TERM, would name a cause the status cannot establish. The report
+# is read from the seam's own line, because the shell that waits for the call
+# prints a job line of its own for the signal death.
+start_case send-killed-137 "$LEAD_OK" "$ROSTER_LIVE"
+export HCOM_SEND_TIMEOUT=1 HCOM_SEND_SLEEP=8 HCOM_IGNORE_TERM=1
+notify omp-runtime inform "build finished"
+unset HCOM_SEND_TIMEOUT HCOM_SEND_SLEEP HCOM_IGNORE_TERM
+[[ $CODE -eq 137 ]] || fail "a send the kill-after ended returned $CODE, want 137: $ERR"
+[[ $(call_count "$HCOM_LOG") -eq 2 ]] || fail "a send the kill-after ended made $(call_count "$HCOM_LOG") hcom calls"
+[[ $(count_calls_with "$HCOM_LOG" send) -eq 1 ]] || fail "a send the kill-after ended was retried"
+SEND_KILLED_REPORT=$(printf '%s\n' "$ERR" | grep '^system_notify: ' || true)
+[[ $SEND_KILLED_REPORT == *"@midi"* ]] || fail "status 137 did not name the recipient: $ERR"
+[[ $SEND_KILLED_REPORT == *"137"* ]] || fail "status 137 did not report the status it saw: $ERR"
+[[ $SEND_KILLED_REPORT == *"1s"* ]] || fail "status 137 did not name the bound: $ERR"
+[[ $SEND_KILLED_REPORT == *"killed"* ]] || fail "status 137 did not report that the call was killed: $ERR"
+[[ $SEND_KILLED_REPORT != *"KILL"* ]] || fail "status 137 named the KILL as the seam's own act: $ERR"
+[[ $SEND_KILLED_REPORT != *"TERM"* ]] || fail "status 137 asserted the call ignored TERM: $ERR"
+
 # 124 is not proof of a timeout: the seam cannot tell a call it killed at the
 # bound from a call that chose 124, so it reports the status it saw instead of
 # a cause. It stays a delivery failure: nonzero, no retry, recipient named.
@@ -749,6 +772,13 @@ unset HCOM_TIMEOUT
 [[ $CODE -eq 0 ]] || fail "HCOM_TIMEOUT=2 returned $CODE: $ERR"
 [[ $(call_text "$HCOM_LOG" 1) == "list --all --json" ]] || fail "HCOM_TIMEOUT=2 roster argv: $(call_text "$HCOM_LOG" 1)"
 [[ $(count_calls_with "$HCOM_LOG" send) -eq 1 ]] || fail "HCOM_TIMEOUT=2 blocked delivery"
+export HCOM_TIMEOUT=
+notify omp-runtime inform "build finished"
+unset HCOM_TIMEOUT
+[[ $CODE -eq 0 ]] || fail "an empty HCOM_TIMEOUT returned $CODE: $ERR"
+[[ $(count_calls_with "$HCOM_LOG" send) -eq 2 ]] || fail "an empty HCOM_TIMEOUT blocked delivery"
+[[ $(call_text_with "$HCOM_LOG" send) == "send --as-system omp-runtime @midi --intent inform -- build finished" ]] \
+  || fail "an empty HCOM_TIMEOUT delivery argv: $(call_text_with "$HCOM_LOG" send)"
 
 # The two bounds are independent. A slow roster read is cut short by
 # HCOM_TIMEOUT while the send keeps its own, larger budget, and a slow send is
