@@ -9,29 +9,48 @@
 #
 # Returns 0 after delivery, 2 when the notification is refused or the lead
 # cannot be resolved, and hcom's own status when hcom fails. Nothing is sent
-# before the source id, the intent, and coordination.lead all validate.
+# before the source id, the intent, and coordination.lead all validate. A
+# source id is 1 to 50 characters of [a-z0-9] followed by [a-z0-9_:-], the same
+# charset HCOM accepts, so an id can never pass here and fail at HCOM.
 #
-# Binaries and the scope root come from the environment the same way the rest
-# of the wrapper library takes them: HCOM_BIN, SYSTEMD_OPS_BIN,
-# SYSTEMD_OPS_SCOPE_ROOT, then SCOPE_ROOT. They are read at call time, so
+# Binaries, the scope root, and the hcom call bound come from the environment
+# the same way the rest of the wrapper library takes them: HCOM_BIN,
+# SYSTEMD_OPS_BIN, SYSTEMD_OPS_SCOPE_ROOT, then SCOPE_ROOT, and HCOM_TIMEOUT
+# for the seconds the roster read and the resume may each take before they are
+# killed and treated as a failure (default 5). They are read at call time, so
 # sourcing this file has no effect at all.
+
+# Bounds one best-effort hcom call. HCOM_TIMEOUT, read at call time with the
+# other binaries, is how many seconds the call may take before it is killed and
+# treated like any other failure. Where `timeout` is not available the call is
+# made unbounded rather than skipped, so the seam keeps working.
+system_notify_hcom_call() {
+  local hcom_timeout=${HCOM_TIMEOUT:-5}
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$hcom_timeout" "$@"
+  else
+    "$@"
+  fi
+}
 
 # Resumes a lead that is not live, once, with the HCOM bus resume. The roster
 # from `hcom list --all --json` is the only source of truth about liveness: a
 # lead named there with an empty, stopped, idle, exited, or dead status is
 # resumed with `hcom r <name> --go`. A lead that is live, absent from the
-# roster, or read from a roster that cannot be parsed is left alone. Both calls
-# are best effort: their output is discarded, their status is ignored, and no
-# failure here can stop the notification.
+# roster, or read from a roster that cannot be parsed is left alone, and a row
+# whose name is null or missing is skipped rather than aborting the match. Both
+# calls are best effort: their output is discarded, their status is ignored,
+# each is bounded by HCOM_TIMEOUT, and no failure or hang here can stop the
+# notification.
 system_notify_wake_lead() {
   local name=$1
   local hcom_bin=${HCOM_BIN:-/home/sf/.local/bin/hcom}
   local roster lead_row lead_status
 
-  roster=$("$hcom_bin" list --all --json 2>/dev/null || true)
+  roster=$(system_notify_hcom_call "$hcom_bin" list --all --json 2>/dev/null || true)
   lead_row=$(jq -c --arg n "$name" '
     if type == "array" then . else [] end
-    | map(select((.base_name == $n) or (.name | test("(^|-)" + $n + "$"))))
+    | map(select((.base_name == $n) or (.name // "" | test("(^|-)" + $n + "$"))))
     | .[0] // empty
   ' <<<"$roster" 2>/dev/null || true)
   if [[ -z $lead_row ]]; then
@@ -40,7 +59,7 @@ system_notify_wake_lead() {
   lead_status=$(jq -r '.status // empty' <<<"$lead_row" 2>/dev/null || true)
   case $lead_status in
     stopped|idle|exited|dead|"")
-      "$hcom_bin" r "$name" --go >/dev/null 2>&1 || true
+      system_notify_hcom_call "$hcom_bin" r "$name" --go >/dev/null 2>&1 || true
       ;;
   esac
   return 0
@@ -60,8 +79,8 @@ system_notify() {
   local hcom_bin=${HCOM_BIN:-/home/sf/.local/bin/hcom}
   local scope_json lead_handle lead_name rc
 
-  if [[ ! $source_id =~ ^[a-z0-9][a-z0-9._:-]*$ ]]; then
-    echo "system_notify: source id '$source_id' is not [a-z0-9][a-z0-9._:-]*" >&2
+  if [[ ! $source_id =~ ^[a-z0-9][a-z0-9_:-]*$ || ${#source_id} -gt 50 ]]; then
+    echo "system_notify: source id '$source_id' is not 1-50 characters of [a-z0-9] followed by [a-z0-9_:-]" >&2
     return 2
   fi
   if [[ $source_id == overseer ]]; then

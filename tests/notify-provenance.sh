@@ -17,19 +17,24 @@ mkdir -p "$BIN_DIR"
 
 # Each fake appends its argv one argument per line and closes the call with
 # @@end-call, so a literal "--" argument stays readable as an argument.
-# Fake hcom serves send, the roster read, and the bus resume, each with its
-# own exit knob, so one failing subcommand cannot mask another.
+# Fake hcom serves send, the roster read, and the bus resume, each with its own
+# exit and sleep knob, so one failing or hung subcommand cannot mask another.
+# Fake systemd-ops serves `scope show` with an exit knob of its own.
 cat >"$BIN_DIR/hcom" <<'EOF'
 #!/usr/bin/env bash
 for arg in "$@"; do printf '%s\n' "$arg" >>"$HCOM_LOG"; done
 printf '%s\n' '@@end-call' >>"$HCOM_LOG"
 case ${1:-} in
   list)
+    sleep "${HCOM_LIST_SLEEP:-0}"
     if [[ ${HCOM_LIST_EXIT:-0} -eq 0 && -r $ROSTER_FILE ]]; then cat "$ROSTER_FILE"; fi
     exit "${HCOM_LIST_EXIT:-0}"
     ;;
   send) exit "${HCOM_EXIT:-0}" ;;
-  r) exit "${HCOM_R_EXIT:-0}" ;;
+  r)
+    sleep "${HCOM_R_SLEEP:-0}"
+    exit "${HCOM_R_EXIT:-0}"
+    ;;
   *) exit 0 ;;
 esac
 EOF
@@ -37,6 +42,7 @@ cat >"$BIN_DIR/systemd-ops" <<'EOF'
 #!/usr/bin/env bash
 for arg in "$@"; do printf '%s\n' "$arg" >>"$OPS_LOG"; done
 printf '%s\n' '@@end-call' >>"$OPS_LOG"
+if [[ ${OPS_EXIT:-0} -ne 0 ]]; then exit "${OPS_EXIT:-0}"; fi
 cat "$SCOPE_SHOW_FILE"
 EOF
 chmod +x "$BIN_DIR/hcom" "$BIN_DIR/systemd-ops"
@@ -94,6 +100,7 @@ ROSTER_LIVE='[{"name":"midi","base_name":"midi","status":"listening"}]'
 ROSTER_STOPPED='[{"name":"midi","base_name":"midi","status":"stopped"}]'
 ROSTER_EXITED='[{"name":"midi","base_name":"midi","status":"exited"}]'
 ROSTER_NO_LEAD='[{"name":"gina","base_name":"gina","status":"listening"}]'
+ROSTER_NULL_NAME='[{"name":null,"base_name":"gina","status":"stopped"},{"name":"midi","base_name":"midi","status":"stopped"}]'
 
 CASE=
 SCOPE_SHOW=
@@ -113,7 +120,7 @@ start_case() {
   export HCOM_BIN=$BIN_DIR/hcom
   export SYSTEMD_OPS_BIN=$BIN_DIR/systemd-ops
   export SYSTEMD_OPS_SCOPE_ROOT=$CASE
-  unset HCOM_EXIT HCOM_LIST_EXIT HCOM_R_EXIT
+  unset HCOM_EXIT HCOM_LIST_EXIT HCOM_R_EXIT HCOM_LIST_SLEEP HCOM_R_SLEEP OPS_EXIT HCOM_TIMEOUT
   SCOPE_SHOW=$scope_show
 }
 
@@ -124,14 +131,35 @@ source "$LIB"
 [[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "sourcing the library sent a notification"
 [[ $(call_count "$OPS_LOG") -eq 0 ]] || fail "sourcing the library resolved a scope"
 
-notify() {
+notify_args() {
   set +e
-  system_notify "$1" "$2" "$3" >"$TMP/stdout" 2>"$TMP/stderr"
+  system_notify "$@" >"$TMP/stdout" 2>"$TMP/stderr"
   CODE=$?
   set -e
   OUT=$(cat "$TMP/stdout")
   ERR=$(cat "$TMP/stderr")
 }
+
+notify() {
+  notify_args "$1" "$2" "$3"
+}
+
+# Argument count: exactly three arguments are required, and an argv refusal
+# makes no hcom call at all.
+start_case argc-zero "$LEAD_OK" "$ROSTER_LIVE"
+notify_args
+[[ $CODE -eq 2 ]] || fail "empty argv returned $CODE, want 2"
+[[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "empty argv reached hcom"
+
+start_case argc-two "$LEAD_OK" "$ROSTER_LIVE"
+notify_args omp-runtime inform
+[[ $CODE -eq 2 ]] || fail "two-argument call returned $CODE, want 2"
+[[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "two-argument call reached hcom"
+
+start_case argc-four "$LEAD_OK" "$ROSTER_LIVE"
+notify_args omp-runtime inform "build finished" extra
+[[ $CODE -eq 2 ]] || fail "four-argument call returned $CODE, want 2"
+[[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "four-argument call reached hcom"
 
 # Happy path: the roster is read, the live lead is left alone, and the exact
 # delivery argv is addressed with no borrowed sender. The roster read precedes
@@ -160,6 +188,16 @@ notify omp-runtime inform "build finished"
 [[ $CODE -eq 0 ]] || fail "SCOPE_ROOT fallback returned $CODE: $ERR"
 [[ $(call_text "$OPS_LOG" 1) == "--json --manager user --scope-root $CASE --cwd $CASE scope show" ]] \
   || fail "SCOPE_ROOT fallback argv: $(call_text "$OPS_LOG" 1)"
+
+# A failed scope resolution is refused, names the scope root it tried, and
+# reaches no hcom call.
+start_case scope-show-failure "$LEAD_OK" "$ROSTER_LIVE"
+export OPS_EXIT=1
+notify omp-runtime inform "build finished"
+unset OPS_EXIT
+[[ $CODE -eq 2 ]] || fail "failed scope show returned $CODE, want 2"
+[[ $ERR == *"$CASE"* ]] || fail "failed scope show did not name the scope root: $ERR"
+[[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "failed scope show reached hcom"
 
 # Intent vocabulary: ack passes through, notice is refused.
 start_case intent-ack "$LEAD_OK" "$ROSTER_LIVE"
@@ -190,6 +228,30 @@ start_case source-charset "$LEAD_OK" "$ROSTER_LIVE"
 notify "Omp Runtime" inform "generation published"
 [[ $CODE -ne 0 ]] || fail "out-of-charset source id was accepted"
 [[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "out-of-charset source id reached hcom"
+
+# The seam accepts only what HCOM accepts: no dot, and at most 50 characters.
+# A refused id never reaches hcom.
+start_case source-dot "$LEAD_OK" "$ROSTER_LIVE"
+notify omp.runtime inform "generation published"
+[[ $CODE -eq 2 ]] || fail "dotted source id returned $CODE, want 2"
+[[ $ERR == *"[a-z0-9_:-]"* ]] || fail "dotted source id stderr: $ERR"
+[[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "dotted source id reached hcom"
+
+start_case source-length-max "$LEAD_OK" "$ROSTER_LIVE"
+printf -v source_id '%*s' 50 ""
+source_id=${source_id// /a}
+notify "$source_id" inform "generation published"
+[[ $CODE -eq 0 ]] || fail "50-character source id returned $CODE: $ERR"
+[[ $(call_text_with "$HCOM_LOG" send) == "send --as-system $source_id @midi --intent inform -- generation published" ]] \
+  || fail "unexpected 50-character argv: $(call_text_with "$HCOM_LOG" send)"
+
+start_case source-length-over "$LEAD_OK" "$ROSTER_LIVE"
+printf -v source_id '%*s' 51 ""
+source_id=${source_id// /a}
+notify "$source_id" inform "generation published"
+[[ $CODE -eq 2 ]] || fail "51-character source id returned $CODE, want 2"
+[[ $ERR == *"1-50"* ]] || fail "51-character source id stderr does not name the length cap: $ERR"
+[[ $(call_count "$HCOM_LOG") -eq 0 ]] || fail "51-character source id reached hcom"
 
 # Unresolvable lead: refused, and specifically not broadcast.
 start_case lead-missing '{"ok":true,"data":{"coordination":{}}}' "$ROSTER_LIVE"
@@ -266,6 +328,16 @@ notify omp-runtime inform "build finished"
 [[ $CODE -eq 0 ]] || fail "empty roster status returned $CODE: $ERR"
 [[ $(call_text "$HCOM_LOG" 2) == "r midi --go" ]] || fail "empty roster status wake call: $(call_text "$HCOM_LOG" 2)"
 
+# One odd row cannot mask a later matching one: a row whose name is null is
+# skipped, not an abort of the whole roster match.
+start_case wake-null-row "$LEAD_OK" "$ROSTER_NULL_NAME"
+notify omp-runtime inform "build finished"
+[[ $CODE -eq 0 ]] || fail "null roster name returned $CODE: $ERR"
+[[ $(count_calls_with "$HCOM_LOG" r) -eq 1 ]] || fail "null roster name masked the wake"
+[[ $(call_text "$HCOM_LOG" 2) == "r midi --go" ]] || fail "null roster name wake call: $(call_text "$HCOM_LOG" 2)"
+[[ $(call_text_with "$HCOM_LOG" send) == "send --as-system omp-runtime @midi --intent inform -- build finished" ]] \
+  || fail "null roster name delivery argv: $(call_text_with "$HCOM_LOG" send)"
+
 # A failed resume is not a failed notification.
 start_case wake-resume-failure "$LEAD_OK" "$ROSTER_STOPPED"
 export HCOM_R_EXIT=3
@@ -299,5 +371,38 @@ notify omp-runtime inform "build finished"
 [[ -z $ERR ]] || fail "unparsable roster was not silent: $ERR"
 [[ $(count_calls_with "$HCOM_LOG" r) -eq 0 ]] || fail "unparsable roster still attempted a wake"
 [[ $(count_calls_with "$HCOM_LOG" send) -eq 1 ]] || fail "unparsable roster blocked delivery"
+
+# A hung hcom cannot withhold the notification: the roster read is bounded by
+# HCOM_TIMEOUT, and a timeout counts as a failure like any other. The elapsed
+# check is skipped exactly where `timeout` is unavailable, which is where the
+# seam deliberately falls back to the unbounded call.
+start_case wake-roster-hang "$LEAD_OK" "$ROSTER_STOPPED"
+export HCOM_TIMEOUT=1 HCOM_LIST_SLEEP=10
+SECONDS=0
+notify omp-runtime inform "build finished"
+ROSTER_HANG_SECONDS=$SECONDS
+unset HCOM_TIMEOUT HCOM_LIST_SLEEP
+[[ $CODE -eq 0 ]] || fail "hung roster read returned $CODE: $ERR"
+[[ -z $ERR ]] || fail "hung roster read was not silent: $ERR"
+[[ $(count_calls_with "$HCOM_LOG" r) -eq 0 ]] || fail "hung roster read still attempted a wake"
+[[ $(count_calls_with "$HCOM_LOG" send) -eq 1 ]] || fail "hung roster read blocked delivery"
+if command -v timeout >/dev/null 2>&1; then
+  [[ $ROSTER_HANG_SECONDS -lt 6 ]] || fail "hung roster read took ${ROSTER_HANG_SECONDS}s, HCOM_TIMEOUT did not bound it"
+fi
+
+# A hung resume is bounded the same way, and it cannot block delivery either.
+start_case wake-resume-hang "$LEAD_OK" "$ROSTER_STOPPED"
+export HCOM_TIMEOUT=1 HCOM_R_SLEEP=10
+SECONDS=0
+notify omp-runtime inform "build finished"
+RESUME_HANG_SECONDS=$SECONDS
+unset HCOM_TIMEOUT HCOM_R_SLEEP
+[[ $CODE -eq 0 ]] || fail "hung resume returned $CODE: $ERR"
+[[ -z $ERR ]] || fail "hung resume was not silent: $ERR"
+[[ $(count_calls_with "$HCOM_LOG" r) -eq 1 ]] || fail "hung resume was not attempted"
+[[ $(count_calls_with "$HCOM_LOG" send) -eq 1 ]] || fail "hung resume blocked delivery"
+if command -v timeout >/dev/null 2>&1; then
+  [[ $RESUME_HANG_SECONDS -lt 6 ]] || fail "hung resume took ${RESUME_HANG_SECONDS}s, HCOM_TIMEOUT did not bound it"
+fi
 
 echo "notify-provenance ok"
