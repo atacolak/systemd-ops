@@ -3,7 +3,7 @@
 #
 # system_notify <source-id> <intent> <message> sends one automation
 # notification as sender_kind=system: HCOM records the durable source id
-# instead of a borrowed actor identity. The send is always addressed to the
+# instead of a borrowed identity. The send is always addressed to the
 # scope's coordination.lead, so it can never become a broadcast. The reserved
 # source id `overseer` is refused.
 #
@@ -12,35 +12,37 @@
 # before the source id, the intent, and coordination.lead all validate.
 #
 # Binaries and the scope root come from the environment the same way the rest
-# of the wrapper library takes them: HCOM_BIN, ACTOR_BIN, SYSTEMD_OPS_BIN,
+# of the wrapper library takes them: HCOM_BIN, SYSTEMD_OPS_BIN,
 # SYSTEMD_OPS_SCOPE_ROOT, then SCOPE_ROOT. They are read at call time, so
 # sourcing this file has no effect at all.
 
-# Wakes a lead that is not live, once. `$ACTOR_BIN status` is the only source
-# of truth about liveness. Wake failures are ignored: the notification is what
-# matters, and a missing actor binary skips this step silently.
+# Resumes a lead that is not live, once, with the HCOM bus resume. The roster
+# from `hcom list --all --json` is the only source of truth about liveness: a
+# lead named there with an empty, stopped, idle, exited, or dead status is
+# resumed with `hcom r <name> --go`. A lead that is live, absent from the
+# roster, or read from a roster that cannot be parsed is left alone. Both calls
+# are best effort: their output is discarded, their status is ignored, and no
+# failure here can stop the notification.
 system_notify_wake_lead() {
   local name=$1
-  local actor_bin=${ACTOR_BIN:-/home/sf/.local/bin/actor}
-  local out lifecycle
+  local hcom_bin=${HCOM_BIN:-/home/sf/.local/bin/hcom}
+  local roster lead_row lead_status
 
-  if [[ ! -x $actor_bin ]]; then
+  roster=$("$hcom_bin" list --all --json 2>/dev/null || true)
+  lead_row=$(jq -c --arg n "$name" '
+    if type == "array" then . else [] end
+    | map(select((.base_name == $n) or (.name | test("(^|-)" + $n + "$"))))
+    | .[0] // empty
+  ' <<<"$roster" 2>/dev/null || true)
+  if [[ -z $lead_row ]]; then
     return 0
   fi
-  out=$("$actor_bin" status "$name" 2>&1) || true
-  lifecycle=$(sed -n 's/.*"lifecycle"[[:space:]]*:[[:space:]]*"\([a-zA-Z_]*\)".*/\1/p' <<<"$out" | head -n 1)
-  if [[ -n $lifecycle ]]; then
-    case $lifecycle in
-      stopped|idle|exited|dead) ;;
-      *) return 0 ;;
-    esac
-  else
-    case $out in
-      *stopped*|*idle*|*exited*|*dead*) ;;
-      *) return 0 ;;
-    esac
-  fi
-  "$actor_bin" r "$name" >/dev/null 2>&1 || true
+  lead_status=$(jq -r '.status // empty' <<<"$lead_row" 2>/dev/null || true)
+  case $lead_status in
+    stopped|idle|exited|dead|"")
+      "$hcom_bin" r "$name" --go >/dev/null 2>&1 || true
+      ;;
+  esac
   return 0
 }
 
