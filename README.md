@@ -143,7 +143,15 @@ optional same-scope `parent`, explicit `brain_paths`, optional
 canonical metadata, the exact resolved agent file, and only those listed
 paths. `automation observe` writes `state/observation.json`;
 `automation process` writes `state/processed.json`; new checkpoints are
-version 2 and bind that input. Semantic state is derived, never persisted.
+version 2 and bind that input. An operational park
+(`state/operational-park.json`) bounds retries of an input whose identical
+operational failures exhausted the budget. A `crash` park stops binding
+`PARK_CRASH_COOLDOWN_SECONDS` (default 1800) after `parked_at`; `timeout`,
+`contract-failure`, and `dirty-at-exit` parks are fingerprint-terminal.
+`automation release-park --unit STEM` releases any park: it removes the
+sidecar and the park's own blocker, keeps the failure budget (one attempt,
+then re-park on failure), and records the release in operator activity.
+Semantic state is derived, never persisted.
 Systemd remains canonical for execution, cwd, schedule, restart, and
 enablement. `automation plan-create`, `plan-update`, `plan-retire`, and
 `plan-complete` compose the existing sealed author path; `automation complete`

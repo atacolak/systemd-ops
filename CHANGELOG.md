@@ -201,6 +201,21 @@ borrowed-sender nudge cannot come back through this seam. No watcher sources
 it yet: the live path is still the worlds bridge, and migration is pending the
 HCOM `--as-system` flag.
 
+Crash parks are time-bounded. `input_matches_operational_park` releases a
+crash park `PARK_CRASH_COOLDOWN_SECONDS` (default 1800) after the sidecar's
+`parked_at`, so a model outage no longer pins a unit on an unchanged input.
+The failure budget already stands at the budget when a park exists, so the
+retried input gets one attempt and re-parks with a fresh `parked_at` on
+failure. `timeout`, `contract-failure`, and `dirty-at-exit` parks stay
+fingerprint-terminal. `automation release-park --unit STEM` is the documented
+operator release path for every park kind: it removes the
+`operational-park.json` sidecar and the park's own `iteration-failed`
+blocker, records the release in operator activity, and deliberately keeps
+`failure-budget.json`, processed state, and checkpoints. It is gated by scope
+ownership like every operation-state write and mutates no systemd unit. A
+crash park whose `parked_at` cannot be read is treated as expired and says so
+on stderr, so the cooldown is not a guarantee for a corrupt sidecar.
+
 
 
 ## 0.6.0, 2026-08-12
