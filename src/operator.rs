@@ -1147,6 +1147,11 @@ fn park_owns_blocker(blocker: &crate::automation::Blocker, park_fingerprint: Opt
 /// deliberately kept: it already stands at the budget, so the next failure
 /// re-parks. Processed state, checkpoints, units, and worktrees are untouched.
 ///
+/// Every refusal is decided before the first unlink and the park sidecar is
+/// removed last, so a release that cannot run leaves the park in place for a
+/// retry instead of half-released: with no park the retry is a no-op that would
+/// never clear a leftover blocker.
+///
 /// The write-prefix guard is not consulted: it gates systemd unit mutations,
 /// and this verb only touches automation state under the operation home.
 pub fn release_park(
@@ -1180,18 +1185,20 @@ pub fn release_park(
     let fingerprint = field("input_fingerprint");
     let kind = field("last_kind");
     let parked_at = field("parked_at");
-    fs::remove_file(&park_path)
-        .map_err(|e| BackendError(format!("remove {}: {e}", park_path.display())))?;
-    let mut blocker_cleared = false;
-    if let Some(blocker) = crate::automation::load_blocker(&manifest.root, stem)? {
-        if park_owns_blocker(&blocker, fingerprint.as_deref()) {
-            let path = state.join("blocker.json");
-            refuse_symlink(&path)?;
-            fs::remove_file(&path)
-                .map_err(|e| BackendError(format!("remove {}: {e}", path.display())))?;
-            blocker_cleared = true;
+    // Every step that can refuse or fail runs before the first unlink. A release
+    // that refused halfway would leave a partial mutation no retry could finish:
+    // with no park sidecar the retry takes the idempotent no-park path, so a
+    // blocker left behind would never be cleared and the over-long text would
+    // leave no audit of the release.
+    let blocker = crate::automation::load_blocker(&manifest.root, stem)?;
+    let blocker_path = state.join("blocker.json");
+    let clears_blocker = match &blocker {
+        Some(blocker) if park_owns_blocker(blocker, fingerprint.as_deref()) => {
+            refuse_symlink(&blocker_path)?;
+            true
         }
-    }
+        _ => false,
+    };
     let text = bound(
         "activity.text",
         &format!(
@@ -1212,6 +1219,16 @@ pub fn release_park(
             )))
         }
     };
+    // The park goes last. It is the only state a retry acts on, so a removal
+    // that fails leaves the release retryable instead of half-released.
+    let mut blocker_cleared = false;
+    if clears_blocker {
+        fs::remove_file(&blocker_path)
+            .map_err(|e| BackendError(format!("remove {}: {e}", blocker_path.display())))?;
+        blocker_cleared = true;
+    }
+    fs::remove_file(&park_path)
+        .map_err(|e| BackendError(format!("remove {}: {e}", park_path.display())))?;
     surface.activity.push(OperatorActivity {
         at: now_stamp(),
         text,
@@ -1802,6 +1819,15 @@ mod tests {
         assert!(park_owns_blocker(&blocker, Some("fp-1")));
         assert!(!park_owns_blocker(&blocker, Some("fp-other")));
         assert!(!park_owns_blocker(&blocker, None));
+        // An unbound blocker is not the park's record either, and it must not
+        // become owned by an unbound park: two absent fingerprints are not a
+        // match.
+        let unbound = crate::automation::Blocker {
+            input_fingerprint: None,
+            ..blocker.clone()
+        };
+        assert!(!park_owns_blocker(&unbound, None));
+        assert!(!park_owns_blocker(&unbound, Some("fp-1")));
         let semantic = crate::automation::Blocker {
             kind: "semantic-blocked".into(),
             ..blocker
@@ -1936,6 +1962,58 @@ mod tests {
 
         assert!(err.0.contains("symlink"), "got: {}", err.0);
         assert!(real.exists(), "the symlink target must survive");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_park_refuses_a_symlinked_blocker_and_keeps_the_park() {
+        let root = scoped_root();
+        let stem = "managed-personal-park";
+        let state = park_state(&root, stem);
+        plant_park(&root, stem, "fp-1", "crash");
+        let real = root.join("real-blocker.json");
+        fs::write(
+            &real,
+            serde_json::to_vec(&json!({
+                "version": 2,
+                "id": "blk-proof",
+                "input_fingerprint": "fp-1",
+                "kind": "iteration-failed",
+                "route": "parent",
+                "at": "2026-09-15T05:51:30Z",
+                "code": 0,
+                "summary": "parked after 2 identical crash failures on unchanged input",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real, state.join("blocker.json")).unwrap();
+
+        let err = release_park(Some(root.to_str().unwrap()), None, stem).unwrap_err();
+
+        assert!(err.0.contains("symlink"), "got: {}", err.0);
+        assert!(
+            state.join("operational-park.json").exists(),
+            "a refused release must leave the park in place for a retry"
+        );
+        assert!(real.exists(), "the symlink target must survive");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_park_refuses_an_over_long_activity_text_and_keeps_the_park() {
+        let root = scoped_root();
+        let stem = "managed-personal-park";
+        let state = park_state(&root, stem);
+        plant_park(&root, stem, &"f".repeat(MAX_ACTIVITY_TEXT + 1), "crash");
+
+        let err = release_park(Some(root.to_str().unwrap()), None, stem).unwrap_err();
+
+        assert!(err.0.contains("activity.text"), "got: {}", err.0);
+        assert!(
+            state.join("operational-park.json").exists(),
+            "a refused release must leave the park in place for a retry"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -208,6 +208,20 @@ record_operational_park fp-crash crash
 # A fresh crash park still binds inside the cooldown.
 ( PARK_CRASH_COOLDOWN_SECONDS=999999; input_matches_operational_park fp-crash ) \
   || fail "fresh crash park did not skip the input"
+# The approved default is 1800 s and nothing else pins it: every case in this
+# file either overrides the variable or never reads it. A crash park 300 s old
+# still binds the input with PARK_CRASH_COOLDOWN_SECONDS unset, which holds only
+# while the default exceeds 300 s. The re-source is what makes "unset" real: the
+# library reads the default at source time.
+jq -nc --arg at "$(date -u -d "@$(( $(date -u +%s) - 300 ))" +%Y-%m-%dT%H:%M:%SZ)" \
+  '{version:1,input_fingerprint:"fp-window",last_kind:"crash",parked_at:$at}' \
+  >"$STATE_DIR/operational-park.json"
+(
+  unset PARK_CRASH_COOLDOWN_SECONDS
+  # shellcheck source=/dev/null
+  source "$LIB"
+  input_matches_operational_park fp-window
+) || fail "an unset PARK_CRASH_COOLDOWN_SECONDS did not bind a 300 s old crash park"
 # A crash park with no readable parked_at fails open, like a corrupt record,
 # and the wrapper says so on stderr.
 jq -nc '{version:1,input_fingerprint:"fp-nodate",last_kind:"crash"}' \

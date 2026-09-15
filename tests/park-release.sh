@@ -78,6 +78,40 @@ jq -e '.data.released == true and .data.blocker_cleared == false' <<<"$out" >/de
 jq -e '.kind == "semantic-blocked"' "$STATE/blocker.json" >/dev/null \
   || fail "release cleared a semantic blocker"
 
+# A symlinked blocker is refused before the park is removed: the refusal leaves
+# the park sidecar in place so the release can be retried, and the CLI exits
+# non-zero.
+plant_park
+rm -f "$STATE/blocker.json"
+real_blocker=$TMP/real-blocker.json
+jq -nc '{version:2,id:"b3",input_fingerprint:"fp-1",kind:"iteration-failed",route:"parent",at:"2026-09-15T05:51:30Z",code:0,summary:"parked after 2 identical crash failures on unchanged input"}' \
+  >"$real_blocker"
+ln -s "$real_blocker" "$STATE/blocker.json"
+code=0
+out=$(json automation release-park --unit "$STEM") || code=$?
+[[ $code -ne 0 ]] || fail "a symlinked blocker release exited 0"
+rejected "$out"
+jq -e '.error.message | contains("symlink")' <<<"$out" >/dev/null \
+  || fail "symlinked blocker release: $out"
+[[ -e $STATE/operational-park.json ]] || fail "a refused release removed the park sidecar"
+[[ -L $STATE/blocker.json ]] || fail "a refused release removed the blocker symlink"
+rm -f "$STATE/blocker.json"
+
+# A park fingerprint longer than the activity-text bound cannot be audited, so
+# the release is refused before the park is removed and the CLI exits non-zero.
+long_fp=$(printf 'f%.0s' {1..1001})
+[[ ${#long_fp} -eq 1001 ]] || fail "long fingerprint fixture is ${#long_fp} chars"
+jq -nc --arg fp "$long_fp" \
+  '{version:1,input_fingerprint:$fp,last_kind:"crash",parked_at:"2026-09-15T05:51:30Z"}' \
+  >"$STATE/operational-park.json"
+code=0
+out=$(json automation release-park --unit "$STEM") || code=$?
+[[ $code -ne 0 ]] || fail "an over-long park fingerprint release exited 0"
+rejected "$out"
+jq -e '.error.message | contains("activity.text")' <<<"$out" >/dev/null \
+  || fail "over-long park fingerprint release: $out"
+[[ -e $STATE/operational-park.json ]] || fail "a refused release removed the park sidecar"
+
 # Guards: an unowned stem and a missing --unit are refused.
 out=$(json automation release-park --unit managed-cpa-farm-cliproxy-watch || true)
 rejected "$out"

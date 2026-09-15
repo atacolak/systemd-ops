@@ -577,9 +577,11 @@ input_matches_operational_park() {
   kind=$(jq -r '.last_kind // empty' "$f" 2>/dev/null)
   [[ $kind == crash ]] || return 0
   parked_at=$(jq -r '.parked_at // empty' "$f" 2>/dev/null)
-  # An absent parked_at is not a date: GNU date reads an empty operand as now,
-  # which would bind the park for the whole cooldown. A park that cannot be
-  # timed is no bound at all, so report it and let the tick run.
+  # An absent or unparseable parked_at is treated as expired and reported. The
+  # guard is load-bearing: GNU date accepts an empty -d operand as midnight of
+  # the current day rather than failing, so a park with no parked_at would be
+  # timed from today's midnight and this note would never print. A park that
+  # cannot be timed is no bound at all, so report it and let the tick run.
   if [[ -z $parked_at ]] || ! parked_epoch=$(date -u -d "$parked_at" +%s 2>/dev/null); then
     echo "crash park at $f has no readable parked_at; treating the park as expired" >&2
     return 1
