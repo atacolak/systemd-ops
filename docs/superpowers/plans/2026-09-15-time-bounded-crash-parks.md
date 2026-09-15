@@ -319,6 +319,24 @@ Expected: FAIL — `cannot find function 'park_owns_blocker' in this scope`
 
 - [ ] **Step 3: Implement the verb**
 
+> **SUPERSEDED by commit 098d91d.** The code block below is the original
+> prescription and it is WRONG as written: it removes the park sidecar first and
+> then runs steps that can still refuse or fail, which leaves a non-retryable
+> partial mutation. A verification constructed the windows: a malformed blocker,
+> a refused blocker symlink or a failed blocker unlink after the park is gone
+> leaves a blocker no retry can clear, because the no-park path short-circuits;
+> and an over-long activity text or an operator-surface error releases the unit
+> while reporting failure with no audit. The implementation therefore validates
+> everything first and removes the park LAST: manifest, ownership, sidecar read,
+> park symlink check, blocker load with its ownership and symlink checks,
+> activity-text bound, operator-surface load, then the owned blocker, then the
+> park, then the activity. Read
+> `src/operator.rs::release_park` at 098d91d rather than this block. One window
+> remains and is known: if the audit write in `finish_write` fails after both
+> unlinks, the park and its blocker are gone with no activity entry, and a retry
+> takes the idempotent no-park path, so that audit is never written. It is
+> recorded here because it is a limit of the verb, not an oversight.
+
 In `src/operator.rs`, immediately after `clear` (ends `:1134`), add:
 
 ```rust
@@ -666,3 +684,11 @@ git commit -m "docs: crash-park cooldown and release-park in changelog and READM
 - Type consistency: `park_owns_blocker`, `release_park`, USAGE string, and the
   proof's reply assertions use the same names and shapes across T2/T3.
 - Every task is one builder packet with a runnable verification command.
+- Beyond-plan additions, recorded here so nothing lands unrecorded. (a) The
+  parked_at guard in the wrapper checks `[[ -z $parked_at ]]` explicitly as well
+  as the date parse, because GNU date accepts an empty `-d` operand as midnight
+  of the current day, so a crash park with no parked_at would otherwise be timed
+  from today's midnight and its stderr note would never print. (b) Task 2 added
+  seven release_park contract tests beyond the one the plan sketched, since a
+  destructive verb needs its refusals pinned. (c) release_park validates before
+  it mutates, which the Step 3 note above records in full.
