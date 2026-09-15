@@ -525,10 +525,29 @@ enum ViewPlan {
     Direct,
     /// The view holds this unit.
     Cached(Block),
-    /// This group's batch did not work: ask for this unit alone and keep it.
+    /// Ask for this unit alone and keep the answer: the group's batch did not
+    /// work, or this name must not travel in a multi-unit call.
     Single,
     /// The view should cover these units with one multi-unit call.
     Batch(Vec<String>),
+}
+
+/// Whether a name is an instance-less template: `foo@.service`, `a@b@.timer`.
+/// The part between the last `@` and the final `.` is empty, and `systemctl
+/// show` refuses such a name, so one of them in a multi-unit call fails the
+/// whole call and every unit in it falls back to its own process.
+fn instance_less_template(name: &str) -> bool {
+    match name.rsplit_once('@') {
+        Some((_, rest)) => rest.rfind('.').is_some_and(|dot| dot == 0),
+        None => false,
+    }
+}
+
+/// Whether a name may travel in a multi-unit call. Every name that reaches an
+/// argument list is validated first, and an instance-less template would fail
+/// the whole call anyway.
+fn batchable(name: &str) -> bool {
+    !instance_less_template(name) && validate_unit_name(name).is_ok()
 }
 
 impl ViewCache {
@@ -552,13 +571,14 @@ impl ViewCache {
         if let Some(block) = entry.and_then(|entry| entry.blocks.get(name)) {
             return ViewPlan::Cached(block.clone());
         }
-        if entry.is_some_and(|entry| entry.singly) {
+        if entry.is_some_and(|entry| entry.singly) || !batchable(name) {
             return ViewPlan::Single;
         }
         let fetched = entry.map(|entry| &entry.blocks);
         let mut targets: Vec<String> = self
             .listed
             .iter()
+            .filter(|unit| batchable(unit))
             .filter(|unit| fetched.is_none_or(|fetched| !fetched.contains_key(*unit)))
             .cloned()
             .collect();
@@ -696,20 +716,21 @@ fn show_many(
 }
 
 /// Split Key=Value output into one block per unit, keyed by its `Id` line.
+/// A block starts at an `Id=` line and runs to the line before the next one.
 /// A block without `Id` is dropped: nothing can attribute it, and the caller
-/// covers that unit with its own call. Blank lines separate blocks, and a line
-/// without `=` is ignored, the same way the single-unit parse ignores it.
+/// covers that unit with its own call. A line without `=` is ignored, the same
+/// way the single-unit parse ignores it.
 fn split_blocks(text: &str, keep_id: bool) -> HashMap<String, Map<String, Value>> {
     let mut blocks = HashMap::new();
     let mut block = Map::new();
     for line in text.lines() {
-        if line.trim().is_empty() {
-            flush_block(&mut blocks, &mut block, keep_id);
+        let Some((key, value)) = line.split_once('=') else {
             continue;
+        };
+        if key == "Id" && block.contains_key("Id") {
+            flush_block(&mut blocks, &mut block, keep_id);
         }
-        if let Some((key, value)) = line.split_once('=') {
-            block.insert(key.to_string(), Value::String(value.to_string()));
-        }
+        block.insert(key.to_string(), Value::String(value.to_string()));
     }
     flush_block(&mut blocks, &mut block, keep_id);
     blocks
@@ -1726,6 +1747,11 @@ graphical.target @1min 30.5s
     /// Install a fake `systemctl` and return its directory and call log.
     /// `show` is the branch that answers a `show` invocation.
     fn fake_systemctl(name: &str, show: &str) -> (PathBuf, PathBuf) {
+        fake_systemctl_listing(name, LISTING, show)
+    }
+
+    /// The same fake with a caller-supplied `list-unit-files` payload.
+    fn fake_systemctl_listing(name: &str, listing: &str, show: &str) -> (PathBuf, PathBuf) {
         let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "systemd-ops-{name}-{}-{sequence}",
@@ -1749,7 +1775,7 @@ graphical.target @1min 30.5s
                  esac\n\
                  exit 0\n",
                 log = log.display(),
-                files = LISTING,
+                files = listing,
                 show = show,
             ),
         )
@@ -1813,6 +1839,127 @@ for unit in $units; do\n\
   printf '\\n'\n\
 done\n\
 exit 0";
+
+    /// A listing that names an instance-less template, which the real
+    /// `systemctl show` refuses with exit 1 and no attribution.
+    const TEMPLATE_LISTING: &str = concat!(
+        r#"[{"unit_file":"managed-a.service","state":"static"},"#,
+        r#"{"unit_file":"managed-b.timer","state":"static"},"#,
+        r#"{"unit_file":"managed-tpl@.service","state":"static"}]"#
+    );
+
+    /// A listing name that `validate_unit_name` refuses: every name reaching
+    /// an argument list is validated first, whatever `--` terminates.
+    const INVALID_LISTING: &str = concat!(
+        r#"[{"unit_file":"managed-a.service","state":"static"},"#,
+        r#"{"unit_file":"managed+b.service","state":"static"}]"#
+    );
+
+    /// Answers a multi-unit call with one block labelled for an alias, the way
+    /// systemd reports a name whose `Id` is the unit it resolves to rather than
+    /// the one that was asked for, and answers a single-unit call with the name
+    /// it was given.
+    const ALIASED_BATCH: &str = "\
+props=\n\
+seen=0\n\
+units=\n\
+for arg in \"$@\"; do\n\
+  case \"$arg\" in\n\
+    --property=*) props=\"${arg#--property=}\" ;;\n\
+    --) seen=1 ;;\n\
+    *) if [ \"$seen\" = 1 ]; then units=\"$units $arg\"; fi ;;\n\
+  esac\n\
+done\n\
+label=\"\"\n\
+count=0\n\
+for unit in $units; do\n\
+  count=$((count + 1))\n\
+  label=$unit\n\
+done\n\
+if [ \"$count\" -gt 1 ]; then label=\"alias-managed.service\"; fi\n\
+for key in $(printf '%s' \"$props\" | tr ',' ' '); do\n\
+  case \"$key\" in\n\
+    Id) value=\"$label\" ;;\n\
+    Description) value=\"$label\" ;;\n\
+    LoadState) value=\"loaded\" ;;\n\
+    *) value=\"\" ;;\n\
+  esac\n\
+  printf '%s=%s\\n' \"$key\" \"$value\"\n\
+done\n\
+exit 0";
+
+    #[test]
+    fn an_aliased_id_in_a_batch_falls_back_to_the_asked_unit() {
+        let (bin, log) = fake_systemctl("view-aliased", ALIASED_BATCH);
+        let (in_view, per_unit, calls) = with_path(&bin, || {
+            let in_view = {
+                let _view = view_cache();
+                list_unit_files(None, Some("managed-*")).unwrap();
+                get_unit("managed-a.service").unwrap()
+            };
+            let per_unit = get_unit("managed-a.service").unwrap();
+            (in_view, per_unit, fs::read_to_string(&log).unwrap())
+        });
+        assert_eq!(in_view["description"], "managed-a.service");
+        assert_eq!(in_view, per_unit);
+        assert_eq!(show_count(&calls), 3, "{calls}");
+        let _ = fs::remove_dir_all(bin.parent().unwrap());
+    }
+
+    #[test]
+    fn an_invalid_listed_name_never_reaches_a_batch_argv() {
+        let (bin, log) = fake_systemctl_listing("view-invalid", INVALID_LISTING, ID_BLOCKS);
+        let (a, calls) = with_path(&bin, || {
+            let _view = view_cache();
+            list_unit_files(None, Some("managed*")).unwrap();
+            let a = get_unit("managed-a.service").unwrap();
+            (a, fs::read_to_string(&log).unwrap())
+        });
+        assert_eq!(a["description"], "managed-a.service");
+        assert_eq!(show_count(&calls), 1, "{calls}");
+        assert!(!calls.contains("managed+b.service"), "{calls}");
+        let _ = fs::remove_dir_all(bin.parent().unwrap());
+    }
+
+    #[test]
+    fn a_template_name_does_not_spoil_the_batch_for_the_rest_of_the_view() {
+        let guard = "for arg in \"$@\"; do case \"$arg\" in *@.*) exit 7 ;; esac; done\n";
+        let show = format!("{guard}{ID_BLOCKS}");
+        let (bin, log) = fake_systemctl_listing("view-template", TEMPLATE_LISTING, &show);
+        let (a, b, tpl, calls) = with_path(&bin, || {
+            let _view = view_cache();
+            list_unit_files(None, Some("managed-*")).unwrap();
+            let a = get_unit("managed-a.service").unwrap();
+            let b = get_unit("managed-b.timer").unwrap();
+            let tpl = get_unit("managed-tpl@.service").unwrap_err();
+            (a, b, tpl, fs::read_to_string(&log).unwrap())
+        });
+        assert_eq!(a["description"], "managed-a.service");
+        assert_eq!(b["description"], "managed-b.timer");
+        assert!(tpl.0.contains("exited with"), "got {}", tpl.0);
+        assert_eq!(show_count(&calls), 2, "{calls}");
+        let _ = fs::remove_dir_all(bin.parent().unwrap());
+    }
+
+    #[test]
+    fn a_block_ends_at_the_next_id_line_not_at_a_blank_line() {
+        let text = "\
+Id=managed-a.service\n\
+Description=first\n\
+\n\
+LoadState=loaded\n\
+Id=managed-b.timer\n\
+Description=second\n";
+        let blocks = split_blocks(text, false);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks["managed-a.service"]["Description"], "first");
+        assert_eq!(
+            blocks["managed-a.service"].get("LoadState"),
+            Some(&Value::String("loaded".into())),
+            "{blocks:?}"
+        );
+        assert_eq!(blocks["managed-b.timer"]["Description"], "second");
+    }
 
     #[test]
     fn a_view_covers_every_listed_unit_in_one_property_call() {
