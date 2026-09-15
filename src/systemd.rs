@@ -716,21 +716,20 @@ fn show_many(
 }
 
 /// Split Key=Value output into one block per unit, keyed by its `Id` line.
-/// A block starts at an `Id=` line and runs to the line before the next one.
 /// A block without `Id` is dropped: nothing can attribute it, and the caller
-/// covers that unit with its own call. A line without `=` is ignored, the same
-/// way the single-unit parse ignores it.
+/// covers that unit with its own call. Blank lines separate blocks, and a line
+/// without `=` is ignored, the same way the single-unit parse ignores it.
 fn split_blocks(text: &str, keep_id: bool) -> HashMap<String, Map<String, Value>> {
     let mut blocks = HashMap::new();
     let mut block = Map::new();
     for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key == "Id" && block.contains_key("Id") {
+        if line.trim().is_empty() {
             flush_block(&mut blocks, &mut block, keep_id);
+            continue;
         }
-        block.insert(key.to_string(), Value::String(value.to_string()));
+        if let Some((key, value)) = line.split_once('=') {
+            block.insert(key.to_string(), Value::String(value.to_string()));
+        }
     }
     flush_block(&mut blocks, &mut block, keep_id);
     blocks
@@ -1809,10 +1808,14 @@ graphical.target @1min 30.5s
             .count()
     }
 
-    /// Answer each unit after `--` with its own `Id`-labelled block, printing
-    /// exactly the properties that were asked for, the way `systemctl show`
-    /// does, including when one call names several units.
-    const ID_BLOCKS: &str = "\
+    /// The shell half both `show` doubles share: read the requested properties
+    /// and the units after `--`, then answer one unit the way the real tool
+    /// lays it out. The Service-interface properties come first, then the `Id=`
+    /// line, then the Unit-interface ones, then a blank line. Every Service
+    /// value is a function of the unit's name, so two units never share one,
+    /// and a unit's own single-unit call agrees with its block in a multi-unit
+    /// call.
+    const SHOW_HEAD: &str = "\
 props=\n\
 seen=0\n\
 units=\n\
@@ -1823,22 +1826,50 @@ for arg in \"$@\"; do\n\
     *) if [ \"$seen\" = 1 ]; then units=\"$units $arg\"; fi ;;\n\
   esac\n\
 done\n\
-for unit in $units; do\n\
-  for key in $(printf '%s' \"$props\" | tr ',' ' '); do\n\
+props=$(printf '%s' \"$props\" | tr ',' ' ')\n\
+print_block() {\n\
+  label=$1\n\
+  stem=${label%.*}\n\
+  seed=$(printf '%d' \"'${stem#\"${stem%?}\"}\")\n\
+  ordered=\n\
+  for key in MainPID Result NRestarts ExecMainStartTimestamp ExecMainCode ExecMainStatus MemoryCurrent CPUUsageNSec Id Description LoadState ActiveState SubState FragmentPath UnitFileState StateChangeTimestamp ActiveEnterTimestamp InactiveEnterTimestamp; do\n\
+    case \" $props \" in *\" $key \"*) ordered=\"$ordered $key\" ;; esac\n\
+  done\n\
+  for key in $ordered; do\n\
     case \"$key\" in\n\
-      Id) value=\"$unit\" ;;\n\
-      Description) value=\"$unit\" ;;\n\
-      LoadState) value=\"loaded\" ;;\n\
-      ActiveState) value=\"inactive\" ;;\n\
-      SubState) value=\"dead\" ;;\n\
-      UnitFileState) value=\"static\" ;;\n\
+      Id) value=\"$label\" ;;\n\
+      MainPID) value=$((1000 + seed)) ;;\n\
+      Result) if [ $((seed % 2)) = 1 ]; then value=exit-code; else value=success; fi ;;\n\
+      NRestarts) value=$((seed % 5)) ;;\n\
+      ExecMainStartTimestamp) value=\"Tue 2026-09-15 16:13:$((seed % 60)) AEST\" ;;\n\
+      ExecMainCode) value=$((seed % 3)) ;;\n\
+      ExecMainStatus) value=$((seed % 7)) ;;\n\
+      MemoryCurrent) value=$((seed * 4096)) ;;\n\
+      CPUUsageNSec) value=$((seed * 1000000)) ;;\n\
+      Description) value=\"$label\" ;;\n\
+      LoadState) value=loaded ;;\n\
+      ActiveState) value=inactive ;;\n\
+      SubState) value=dead ;;\n\
+      FragmentPath) value=\"/usr/lib/systemd/system/$label\" ;;\n\
+      UnitFileState) value=static ;;\n\
+      StateChangeTimestamp) value=\"Tue 2026-09-15 16:13:$((seed % 60)) AEST\" ;;\n\
+      ActiveEnterTimestamp) value=\"Tue 2026-09-15 16:13:$((seed % 60)) AEST\" ;;\n\
+      InactiveEnterTimestamp) value=\"\" ;;\n\
       *) value=\"\" ;;\n\
     esac\n\
     printf '%s=%s\\n' \"$key\" \"$value\"\n\
   done\n\
+  for key in $props; do\n\
+    case \" $ordered \" in *\" $key \"*) ;; *) printf '%s=\\n' \"$key\" ;; esac\n\
+  done\n\
   printf '\\n'\n\
-done\n\
-exit 0";
+}\n";
+
+    /// Every unit after `--` answered with its own real-shaped block, as
+    /// `systemctl show` does when one call names several units.
+    fn id_blocks() -> String {
+        format!("{SHOW_HEAD}for unit in $units; do print_block \"$unit\"; done\nexit 0")
+    }
 
     /// A listing that names an instance-less template, which the real
     /// `systemctl show` refuses with exit 1 and no attribution.
@@ -1859,38 +1890,23 @@ exit 0";
     /// systemd reports a name whose `Id` is the unit it resolves to rather than
     /// the one that was asked for, and answers a single-unit call with the name
     /// it was given.
-    const ALIASED_BATCH: &str = "\
-props=\n\
-seen=0\n\
-units=\n\
-for arg in \"$@\"; do\n\
-  case \"$arg\" in\n\
-    --property=*) props=\"${arg#--property=}\" ;;\n\
-    --) seen=1 ;;\n\
-    *) if [ \"$seen\" = 1 ]; then units=\"$units $arg\"; fi ;;\n\
-  esac\n\
-done\n\
-label=\"\"\n\
-count=0\n\
-for unit in $units; do\n\
-  count=$((count + 1))\n\
-  label=$unit\n\
-done\n\
-if [ \"$count\" -gt 1 ]; then label=\"alias-managed.service\"; fi\n\
-for key in $(printf '%s' \"$props\" | tr ',' ' '); do\n\
-  case \"$key\" in\n\
-    Id) value=\"$label\" ;;\n\
-    Description) value=\"$label\" ;;\n\
-    LoadState) value=\"loaded\" ;;\n\
-    *) value=\"\" ;;\n\
-  esac\n\
-  printf '%s=%s\\n' \"$key\" \"$value\"\n\
-done\n\
-exit 0";
+    fn aliased_batch() -> String {
+        format!(
+            "{SHOW_HEAD}label=\n\
+             count=0\n\
+             for unit in $units; do\n\
+             count=$((count + 1))\n\
+             label=$unit\n\
+             done\n\
+             if [ \"$count\" -gt 1 ]; then label=\"alias-managed.service\"; fi\n\
+             print_block \"$label\"\n\
+             exit 0"
+        )
+    }
 
     #[test]
     fn an_aliased_id_in_a_batch_falls_back_to_the_asked_unit() {
-        let (bin, log) = fake_systemctl("view-aliased", ALIASED_BATCH);
+        let (bin, log) = fake_systemctl("view-aliased", &aliased_batch());
         let (in_view, per_unit, calls) = with_path(&bin, || {
             let in_view = {
                 let _view = view_cache();
@@ -1908,7 +1924,7 @@ exit 0";
 
     #[test]
     fn an_invalid_listed_name_never_reaches_a_batch_argv() {
-        let (bin, log) = fake_systemctl_listing("view-invalid", INVALID_LISTING, ID_BLOCKS);
+        let (bin, log) = fake_systemctl_listing("view-invalid", INVALID_LISTING, &id_blocks());
         let (a, calls) = with_path(&bin, || {
             let _view = view_cache();
             list_unit_files(None, Some("managed*")).unwrap();
@@ -1924,7 +1940,7 @@ exit 0";
     #[test]
     fn a_template_name_does_not_spoil_the_batch_for_the_rest_of_the_view() {
         let guard = "for arg in \"$@\"; do case \"$arg\" in *@.*) exit 7 ;; esac; done\n";
-        let show = format!("{guard}{ID_BLOCKS}");
+        let show = format!("{guard}{}", id_blocks());
         let (bin, log) = fake_systemctl_listing("view-template", TEMPLATE_LISTING, &show);
         let (a, b, tpl, calls) = with_path(&bin, || {
             let _view = view_cache();
@@ -1942,28 +1958,58 @@ exit 0";
     }
 
     #[test]
-    fn a_block_ends_at_the_next_id_line_not_at_a_blank_line() {
+    fn a_blank_line_separates_the_units_of_a_show_of_several() {
         let text = "\
+MainPID=1097\n\
+Result=exit-code\n\
 Id=managed-a.service\n\
-Description=first\n\
+Description=managed-a.service\n\
 \n\
-LoadState=loaded\n\
+MainPID=1098\n\
+Result=success\n\
 Id=managed-b.timer\n\
-Description=second\n";
+Description=managed-b.timer\n";
         let blocks = split_blocks(text, false);
         assert_eq!(blocks.len(), 2, "{blocks:?}");
-        assert_eq!(blocks["managed-a.service"]["Description"], "first");
+        assert_eq!(blocks["managed-a.service"]["MainPID"], "1097");
+        assert_eq!(blocks["managed-a.service"]["Result"], "exit-code");
         assert_eq!(
-            blocks["managed-a.service"].get("LoadState"),
-            Some(&Value::String("loaded".into())),
-            "{blocks:?}"
+            blocks["managed-a.service"]["Description"],
+            "managed-a.service"
         );
-        assert_eq!(blocks["managed-b.timer"]["Description"], "second");
+        assert_eq!(blocks["managed-b.timer"]["MainPID"], "1098", "{blocks:?}");
+        assert_eq!(blocks["managed-b.timer"]["Result"], "success", "{blocks:?}");
+    }
+
+    #[test]
+    fn a_batch_gives_each_unit_its_own_service_values() {
+        let (bin, log) = fake_systemctl("view-values", &id_blocks());
+        let (a, b, per_a, per_b, calls) = with_path(&bin, || {
+            let (a, b) = {
+                let _view = view_cache();
+                list_unit_files(None, Some("managed-*")).unwrap();
+                (
+                    get_unit("managed-a.service").unwrap(),
+                    get_unit("managed-b.timer").unwrap(),
+                )
+            };
+            let per_a = get_unit("managed-a.service").unwrap();
+            let per_b = get_unit("managed-b.timer").unwrap();
+            (a, b, per_a, per_b, fs::read_to_string(&log).unwrap())
+        });
+        assert_eq!(a["pid"], 1097, "{a}");
+        assert_eq!(a["result"], "exit-code", "{a}");
+        assert_eq!(b["pid"], 1098, "{b}");
+        assert_eq!(b["result"], "success", "{b}");
+        assert_eq!(a, per_a);
+        assert_eq!(b, per_b);
+        assert_eq!(show_count(&calls), 3, "{calls}");
+        let _ = fs::remove_dir_all(bin.parent().unwrap());
     }
 
     #[test]
     fn a_view_covers_every_listed_unit_in_one_property_call() {
-        let (bin, log) = fake_systemctl("view-batch", ID_BLOCKS);
+        let (bin, log) = fake_systemctl("view-batch", &id_blocks());
         let (a, b, leak, calls) = with_path(&bin, || {
             let _view = view_cache();
             list_unit_files(None, Some("managed-*")).unwrap();
@@ -1987,7 +2033,7 @@ Description=second\n";
 
     #[test]
     fn a_second_view_refetches_its_units() {
-        let (bin, log) = fake_systemctl("view-twice", ID_BLOCKS);
+        let (bin, log) = fake_systemctl("view-twice", &id_blocks());
         let calls = with_path(&bin, || {
             for _ in 0..2 {
                 let _view = view_cache();
@@ -2002,7 +2048,7 @@ Description=second\n";
 
     #[test]
     fn a_read_after_a_view_goes_back_to_the_backend() {
-        let (bin, log) = fake_systemctl("view-then-read", ID_BLOCKS);
+        let (bin, log) = fake_systemctl("view-then-read", &id_blocks());
         let (inside, outside, calls) = with_path(&bin, || {
             let inside = {
                 let _view = view_cache();
