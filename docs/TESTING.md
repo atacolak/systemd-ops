@@ -30,6 +30,7 @@ bash tests/native-provisioning.sh
 bash tests/wrapper-contract.sh
 bash tests/notify-provenance.sh
 bash tests/operator-report.sh
+bash tests/park-release.sh
 bash tests/pr-attempt.sh
 bash tests/capability-release-run.sh
 ```
