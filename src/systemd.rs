@@ -10,6 +10,7 @@
 
 use serde_json::{json, Map, Value};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fmt;
 use std::io::Read;
 use std::path::PathBuf;
@@ -60,7 +61,13 @@ thread_local! {
     static SURFACE: Cell<Surface> = const { Cell::new(Surface::Full) };
     static WRITE_PREFIX: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
     static PROC_TIMEOUT_MS: Cell<Option<u64>> = const { Cell::new(None) };
+    static VIEW: RefCell<Option<ViewCache>> = const { RefCell::new(None) };
 }
+
+/// Serializes tests that swap process-wide environment. `automation.rs` and
+/// this module both put a fake `systemctl` on `PATH`.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn set_manager(manager: Manager) {
     MANAGER.with(|c| c.set(manager));
@@ -469,12 +476,258 @@ fn analyze() -> Proc {
     Proc::new("systemd-analyze")
 }
 
+/// The units a view has listed and the property blocks it has fetched.
+///
+/// A view lists its units first (`list_units`, `list_unit_files`,
+/// `list_timers`) and then asks for their properties one unit at a time.
+/// Recording the listed names lets the first ask for a property group cover
+/// every listed unit in one `systemctl show`, whose `Id` line labels each
+/// block, instead of one call per unit. The cache lives only between
+/// `view_cache()` and the guard's drop, so no property outlives the view that
+/// asked for it.
+#[derive(Default)]
+struct ViewCache {
+    listed: Vec<String>,
+    groups: HashMap<String, GroupCache>,
+}
+
+/// One property group's blocks, and whether its batch can be trusted.
+#[derive(Default)]
+struct GroupCache {
+    blocks: HashMap<String, Block>,
+    /// Set when a batch for this group failed or came back unattributable.
+    /// Every further ask in this view then uses that unit's own call, so a
+    /// batch that does not work costs one wasted call, never one per unit.
+    singly: bool,
+}
+
+/// A property group's outcome for one unit.
+#[derive(Clone)]
+enum Block {
+    Props(Map<String, Value>),
+    /// The message a single-unit call produced, kept so a later ask for the
+    /// same unit reports the same error instead of running again.
+    Failed(String),
+}
+
+impl Block {
+    fn into_result(self) -> Result<Map<String, Value>, BackendError> {
+        match self {
+            Block::Props(props) => Ok(props),
+            Block::Failed(message) => Err(BackendError(message)),
+        }
+    }
+}
+
+/// What `show` does for one unit and property group.
+enum ViewPlan {
+    /// No view is active: one single-unit call answers this ask.
+    Direct,
+    /// The view holds this unit.
+    Cached(Block),
+    /// This group's batch did not work: ask for this unit alone and keep it.
+    Single,
+    /// The view should cover these units with one multi-unit call.
+    Batch(Vec<String>),
+}
+
+impl ViewCache {
+    /// Remember the units a listing produced. `field` is `unit` for
+    /// `list_units`/`list_timers` rows and `unit_file` for
+    /// `list-unit-files`.
+    fn list(&mut self, rows: &[Value], field: &str) {
+        for row in rows {
+            let Some(value) = row.get(field).and_then(Value::as_str) else {
+                continue;
+            };
+            let name = value.rsplit('/').next().unwrap_or(value);
+            if !self.listed.iter().any(|listed| listed == name) {
+                self.listed.push(name.to_string());
+            }
+        }
+    }
+
+    fn plan(&self, group: &str, name: &str) -> ViewPlan {
+        let entry = self.groups.get(group);
+        if let Some(block) = entry.and_then(|entry| entry.blocks.get(name)) {
+            return ViewPlan::Cached(block.clone());
+        }
+        if entry.is_some_and(|entry| entry.singly) {
+            return ViewPlan::Single;
+        }
+        let fetched = entry.map(|entry| &entry.blocks);
+        let mut targets: Vec<String> = self
+            .listed
+            .iter()
+            .filter(|unit| fetched.is_none_or(|fetched| !fetched.contains_key(*unit)))
+            .cloned()
+            .collect();
+        if !self.listed.iter().any(|unit| unit == name) {
+            targets.push(name.to_string());
+        }
+        ViewPlan::Batch(targets)
+    }
+
+    /// Remember the blocks this view fetched. `singly` marks a group whose
+    /// batch did not work, so it is not tried again.
+    fn store(&mut self, group: &str, blocks: HashMap<String, Block>, singly: bool) {
+        let entry = self.groups.entry(group.to_string()).or_default();
+        entry.singly |= singly;
+        entry.blocks.extend(blocks);
+    }
+}
+
+/// Bounds a view's property cache. Hold it for the length of one view.
+pub(crate) struct ViewGuard;
+
+impl Drop for ViewGuard {
+    fn drop(&mut self) {
+        VIEW.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+/// Start a view: property reads share calls while the guard lives.
+pub(crate) fn view_cache() -> ViewGuard {
+    VIEW.with(|cell| *cell.borrow_mut() = Some(ViewCache::default()));
+    ViewGuard
+}
+
+/// Record the units a listing produced, so the first property ask that
+/// follows can cover them all in one call.
+fn view_listed(rows: &[Value], field: &str) {
+    VIEW.with(|cell| {
+        if let Some(cache) = cell.borrow_mut().as_mut() {
+            cache.list(rows, field);
+        }
+    });
+}
+
 fn show(name: &str, properties: &[&str]) -> Result<Map<String, Value>, BackendError> {
+    let group = properties.join(",");
+    let plan = VIEW.with(|cell| match cell.borrow_mut().as_mut() {
+        None => ViewPlan::Direct,
+        Some(cache) => cache.plan(&group, name),
+    });
+    match plan {
+        ViewPlan::Direct => show_one(name, properties),
+        ViewPlan::Cached(block) => block.into_result(),
+        ViewPlan::Single => {
+            let block = block_of(name, properties);
+            store_blocks(&group, once(name, block.clone()), false);
+            block.into_result()
+        }
+        ViewPlan::Batch(targets) => view_batch(&group, properties, &targets, name),
+    }
+}
+
+/// One `systemctl show` for one unit.
+fn show_one(name: &str, properties: &[&str]) -> Result<Map<String, Value>, BackendError> {
     let mut p = systemctl().arg("show").arg("--no-pager");
     if !properties.is_empty() {
         p = p.arg(format!("--property={}", properties.join(",")));
     }
     p.arg("--").arg(name).key_values()
+}
+
+/// Answer the targets of a view from one `systemctl show`, remember what it
+/// labelled, and return the block for `name`. A batch that failed, or that did
+/// not label `name`, is not tried again in this view: the ask falls back to
+/// that unit's own call, and so does every later ask in the group.
+fn view_batch(
+    group: &str,
+    properties: &[&str],
+    targets: &[String],
+    name: &str,
+) -> Result<Map<String, Value>, BackendError> {
+    let mut blocks: HashMap<String, Block> = show_many(properties, targets)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(unit, props)| (unit, Block::Props(props)))
+        .collect();
+    let singly = !blocks.contains_key(name);
+    let asked = match blocks.get(name) {
+        Some(block) => block.clone(),
+        None => block_of(name, properties),
+    };
+    blocks.insert(name.to_string(), asked.clone());
+    store_blocks(group, blocks, singly);
+    asked.into_result()
+}
+
+/// One unit's block, taken from that unit's own call.
+fn block_of(name: &str, properties: &[&str]) -> Block {
+    match show_one(name, properties) {
+        Ok(props) => Block::Props(props),
+        Err(error) => Block::Failed(error.0),
+    }
+}
+
+fn once(name: &str, block: Block) -> HashMap<String, Block> {
+    HashMap::from([(name.to_string(), block)])
+}
+
+fn store_blocks(group: &str, blocks: HashMap<String, Block>, singly: bool) {
+    VIEW.with(|cell| {
+        if let Some(cache) = cell.borrow_mut().as_mut() {
+            cache.store(group, blocks, singly);
+        }
+    });
+}
+
+/// One `systemctl show` for a whole set of units. `Id` labels each block of
+/// the Key=Value output, which is what lets a batch split back per unit.
+fn show_many(
+    properties: &[&str],
+    targets: &[String],
+) -> Result<HashMap<String, Map<String, Value>>, BackendError> {
+    let mut p = systemctl().arg("show").arg("--no-pager");
+    if !properties.is_empty() {
+        p = p.arg(format!("--property=Id,{}", properties.join(",")));
+    }
+    p = p.arg("--");
+    for target in targets {
+        p = p.arg(target);
+    }
+    let stdout = p.stdout()?;
+    Ok(split_blocks(
+        &String::from_utf8_lossy(&stdout),
+        properties.is_empty() || properties.contains(&"Id"),
+    ))
+}
+
+/// Split Key=Value output into one block per unit, keyed by its `Id` line.
+/// A block without `Id` is dropped: nothing can attribute it, and the caller
+/// covers that unit with its own call. Blank lines separate blocks, and a line
+/// without `=` is ignored, the same way the single-unit parse ignores it.
+fn split_blocks(text: &str, keep_id: bool) -> HashMap<String, Map<String, Value>> {
+    let mut blocks = HashMap::new();
+    let mut block = Map::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            flush_block(&mut blocks, &mut block, keep_id);
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            block.insert(key.to_string(), Value::String(value.to_string()));
+        }
+    }
+    flush_block(&mut blocks, &mut block, keep_id);
+    blocks
+}
+
+fn flush_block(
+    blocks: &mut HashMap<String, Map<String, Value>>,
+    block: &mut Map<String, Value>,
+    keep_id: bool,
+) {
+    let Some(id) = block.get("Id").and_then(Value::as_str).map(str::to_string) else {
+        block.clear();
+        return;
+    };
+    if !keep_id {
+        block.remove("Id");
+    }
+    blocks.insert(id, std::mem::take(block));
 }
 
 fn list_json(verb: &str) -> Result<Vec<Value>, BackendError> {
@@ -640,13 +893,13 @@ pub fn list_units(state: Option<&str>, pattern: Option<&str>) -> Result<Value, B
     } else {
         crate::varlink::list_units().or_else(|_| list_json("list-units"))?
     };
-    Ok(Value::Array(
-        units
-            .into_iter()
-            .filter(|u| state.is_none_or(|s| u["active"] == s) && matches_name(u))
-            .map(|u| unit_row(&u))
-            .collect(),
-    ))
+    let rows: Vec<Value> = units
+        .into_iter()
+        .filter(|u| state.is_none_or(|s| u["active"] == s) && matches_name(u))
+        .map(|u| unit_row(&u))
+        .collect();
+    view_listed(&rows, "unit");
+    Ok(Value::Array(rows))
 }
 
 fn unit_row(unit: &Value) -> Value {
@@ -667,13 +920,13 @@ pub fn failed_units() -> Result<Value, BackendError> {
 pub fn list_timers(pattern: Option<&str>) -> Result<Value, BackendError> {
     let matches_name = glob_on("unit", pattern)?;
     let timers = list_json("list-timers")?;
-    Ok(Value::Array(
-        timers
-            .iter()
-            .filter(|row| matches_name(row))
-            .map(timer_row)
-            .collect(),
-    ))
+    let rows: Vec<Value> = timers
+        .iter()
+        .filter(|row| matches_name(row))
+        .map(timer_row)
+        .collect();
+    view_listed(&rows, "unit");
+    Ok(Value::Array(rows))
 }
 
 fn timer_row(timer: &Value) -> Value {
@@ -706,12 +959,12 @@ pub fn list_unit_files(state: Option<&str>, pattern: Option<&str>) -> Result<Val
         .arg("--output=json")
         .arg("--no-pager")
         .json_array()?;
-    Ok(Value::Array(
-        files
-            .into_iter()
-            .filter(|f| state.is_none_or(|s| f["state"] == s) && matches_name(f))
-            .collect(),
-    ))
+    let rows: Vec<Value> = files
+        .into_iter()
+        .filter(|f| state.is_none_or(|s| f["state"] == s) && matches_name(f))
+        .collect();
+    view_listed(&rows, "unit_file");
+    Ok(Value::Array(rows))
 }
 
 const DEPENDENCY_PROPS: &[&str] = &[
@@ -1148,6 +1401,10 @@ fn parse_blame(text: &str) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn unit_names() {
@@ -1456,5 +1713,240 @@ graphical.target @1min 30.5s
         let err = wait_output_timeout(child, Duration::from_millis(200), "sleep").unwrap_err();
         assert!(err.0.contains("timed out"), "got {}", err.0);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    /// Two managed units, as `list-unit-files --output=json` reports them.
+    const LISTING: &str = concat!(
+        r#"[{"unit_file":"managed-a.service","state":"static","preset":"enabled"},"#,
+        r#"{"unit_file":"managed-b.timer","state":"static","preset":"enabled"}]"#
+    );
+
+    /// Install a fake `systemctl` and return its directory and call log.
+    /// `show` is the branch that answers a `show` invocation.
+    fn fake_systemctl(name: &str, show: &str) -> (PathBuf, PathBuf) {
+        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "systemd-ops-{name}-{}-{sequence}",
+            std::process::id()
+        ));
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let log = root.join("systemctl.log");
+        fs::write(
+            bin.join("systemctl"),
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >>'{log}'\n\
+                 case \" $* \" in\n\
+                 *' list-unit-files '*)\n\
+                 cat <<'EOF'\n{files}\nEOF\n\
+                 ;;\n\
+                 *' show '*)\n\
+                 {show}\n\
+                 ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log = log.display(),
+                files = LISTING,
+                show = show,
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(bin.join("systemctl"), fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, log)
+    }
+
+    fn with_path<T>(bin: &Path, run: impl FnOnce() -> T) -> T {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("PATH");
+        let mut paths = vec![bin.to_path_buf()];
+        if let Some(previous) = previous.as_ref() {
+            paths.extend(std::env::split_paths(previous));
+        }
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        let result = run();
+        match previous {
+            Some(previous) => std::env::set_var("PATH", previous),
+            None => std::env::remove_var("PATH"),
+        }
+        result
+    }
+
+    fn show_count(calls: &str) -> usize {
+        calls
+            .lines()
+            .filter(|line| line.split_whitespace().take(2).any(|word| word == "show"))
+            .count()
+    }
+
+    /// Answer each unit after `--` with its own `Id`-labelled block, printing
+    /// exactly the properties that were asked for, the way `systemctl show`
+    /// does, including when one call names several units.
+    const ID_BLOCKS: &str = "\
+props=\n\
+seen=0\n\
+units=\n\
+for arg in \"$@\"; do\n\
+  case \"$arg\" in\n\
+    --property=*) props=\"${arg#--property=}\" ;;\n\
+    --) seen=1 ;;\n\
+    *) if [ \"$seen\" = 1 ]; then units=\"$units $arg\"; fi ;;\n\
+  esac\n\
+done\n\
+for unit in $units; do\n\
+  for key in $(printf '%s' \"$props\" | tr ',' ' '); do\n\
+    case \"$key\" in\n\
+      Id) value=\"$unit\" ;;\n\
+      Description) value=\"$unit\" ;;\n\
+      LoadState) value=\"loaded\" ;;\n\
+      ActiveState) value=\"inactive\" ;;\n\
+      SubState) value=\"dead\" ;;\n\
+      UnitFileState) value=\"static\" ;;\n\
+      *) value=\"\" ;;\n\
+    esac\n\
+    printf '%s=%s\\n' \"$key\" \"$value\"\n\
+  done\n\
+  printf '\\n'\n\
+done\n\
+exit 0";
+
+    #[test]
+    fn a_view_covers_every_listed_unit_in_one_property_call() {
+        let (bin, log) = fake_systemctl("view-batch", ID_BLOCKS);
+        let (a, b, leak, calls) = with_path(&bin, || {
+            let _view = view_cache();
+            list_unit_files(None, Some("managed-*")).unwrap();
+            let a = get_unit("managed-a.service").unwrap();
+            let b = get_unit("managed-b.timer").unwrap();
+            let props = show("managed-a.service", GET_UNIT_PROPS).unwrap();
+            (
+                a,
+                b,
+                props.contains_key("Id"),
+                fs::read_to_string(&log).unwrap(),
+            )
+        });
+        assert_eq!(a["description"], "managed-a.service");
+        assert_eq!(b["description"], "managed-b.timer");
+        assert_eq!(a["load"], "loaded");
+        assert!(!leak, "the labelling property reached the caller");
+        assert_eq!(show_count(&calls), 1, "{calls}");
+        let _ = fs::remove_dir_all(bin.parent().unwrap());
+    }
+
+    #[test]
+    fn a_second_view_refetches_its_units() {
+        let (bin, log) = fake_systemctl("view-twice", ID_BLOCKS);
+        let calls = with_path(&bin, || {
+            for _ in 0..2 {
+                let _view = view_cache();
+                list_unit_files(None, Some("managed-*")).unwrap();
+                get_unit("managed-a.service").unwrap();
+            }
+            fs::read_to_string(&log).unwrap()
+        });
+        assert_eq!(show_count(&calls), 2, "{calls}");
+        let _ = fs::remove_dir_all(bin.parent().unwrap());
+    }
+
+    #[test]
+    fn a_read_after_a_view_goes_back_to_the_backend() {
+        let (bin, log) = fake_systemctl("view-then-read", ID_BLOCKS);
+        let (inside, outside, calls) = with_path(&bin, || {
+            let inside = {
+                let _view = view_cache();
+                list_unit_files(None, Some("managed-*")).unwrap();
+                get_unit("managed-a.service").unwrap()
+            };
+            let outside = get_unit("managed-a.service").unwrap();
+            (inside, outside, fs::read_to_string(&log).unwrap())
+        });
+        assert_eq!(inside["load"], "loaded");
+        assert_eq!(outside["load"], "loaded");
+        assert_eq!(show_count(&calls), 2, "{calls}");
+        let _ = fs::remove_dir_all(bin.parent().unwrap());
+    }
+
+    #[test]
+    fn an_unlabelled_batch_falls_back_to_one_call_per_unit() {
+        let fixed = "printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\n'";
+        let (bin, log) = fake_systemctl("view-unlabelled", fixed);
+        let (a, b, calls) = with_path(&bin, || {
+            let _view = view_cache();
+            list_unit_files(None, Some("managed-*")).unwrap();
+            let a = get_unit("managed-a.service").unwrap();
+            let b = get_unit("managed-b.timer").unwrap();
+            (a, b, fs::read_to_string(&log).unwrap())
+        });
+        assert_eq!(a["load"], "loaded");
+        assert_eq!(b["load"], "loaded");
+        assert_eq!(show_count(&calls), 3, "{calls}");
+        let _ = fs::remove_dir_all(bin.parent().unwrap());
+    }
+
+    #[test]
+    fn an_unusable_batch_does_not_call_units_the_view_never_asked_for() {
+        let fixed = "printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\n'";
+        let (bin, log) = fake_systemctl("view-unasked", fixed);
+        let (a, calls) = with_path(&bin, || {
+            let _view = view_cache();
+            list_unit_files(None, Some("managed-*")).unwrap();
+            let a = get_unit("managed-a.service").unwrap();
+            (a, fs::read_to_string(&log).unwrap())
+        });
+        assert_eq!(a["load"], "loaded");
+        assert_eq!(show_count(&calls), 2, "{calls}");
+        let _ = fs::remove_dir_all(bin.parent().unwrap());
+    }
+
+    #[test]
+    fn a_failed_batch_falls_back_to_one_call_per_unit() {
+        let show = "\
+seen=0\n\
+units=0\n\
+for arg in \"$@\"; do\n\
+  if [ \"$seen\" = 1 ]; then\n\
+    units=$((units + 1))\n\
+  elif [ \"$arg\" = \"--\" ]; then\n\
+    seen=1\n\
+  fi\n\
+done\n\
+if [ \"$units\" -gt 1 ]; then exit 7; fi\n\
+printf 'LoadState=loaded\\n'\n\
+exit 0";
+        let (bin, log) = fake_systemctl("view-batch-fails", show);
+        let (a, b, calls) = with_path(&bin, || {
+            let _view = view_cache();
+            list_unit_files(None, Some("managed-*")).unwrap();
+            let a = get_unit("managed-a.service").unwrap();
+            let b = get_unit("managed-b.timer").unwrap();
+            (a, b, fs::read_to_string(&log).unwrap())
+        });
+        assert_eq!(a["load"], "loaded");
+        assert_eq!(b["load"], "loaded");
+        assert_eq!(show_count(&calls), 3, "{calls}");
+        let _ = fs::remove_dir_all(bin.parent().unwrap());
+    }
+
+    #[test]
+    fn a_failing_unit_is_asked_once_per_view() {
+        let (bin, log) = fake_systemctl("view-failing", "exit 23");
+        let (first, second, again, calls) = with_path(&bin, || {
+            let _view = view_cache();
+            list_unit_files(None, Some("managed-*")).unwrap();
+            let first = get_unit("managed-a.service").unwrap_err();
+            let second = get_unit("managed-b.timer").unwrap_err();
+            let again = get_unit("managed-a.service").unwrap_err();
+            (first, second, again, fs::read_to_string(&log).unwrap())
+        });
+        assert!(first.0.contains("exited with"), "got {}", first.0);
+        assert!(second.0.contains("exited with"), "got {}", second.0);
+        assert_eq!(again.0, first.0);
+        assert_eq!(show_count(&calls), 3, "{calls}");
+        let _ = fs::remove_dir_all(bin.parent().unwrap());
     }
 }

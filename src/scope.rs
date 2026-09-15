@@ -366,6 +366,7 @@ pub fn show(cwd: Option<&str>) -> Result<ScopeView, BackendError> {
 }
 
 pub fn show_manifest(manifest: &ScopeManifest) -> Result<ScopeView, BackendError> {
+    let _view = systemd::view_cache();
     let mut owned_views = operations::list_operations_matching(&manifest.owned)?;
     let present: Vec<String> = owned_views
         .iter()

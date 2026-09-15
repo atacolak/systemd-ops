@@ -2347,13 +2347,9 @@ pub fn complete_now(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex,
-    };
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    static PATH_LOCK: Mutex<()> = Mutex::new(());
 
     fn tmp_root(name: &str) -> PathBuf {
         let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -2438,7 +2434,7 @@ mod tests {
     }
 
     fn with_user_unit_dir<T>(root: &Path, stems: &[&str], run: impl FnOnce() -> T) -> T {
-        let _guard = PATH_LOCK
+        let _guard = crate::systemd::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         systemd::set_manager(systemd::Manager::User);
@@ -2568,7 +2564,7 @@ mod tests {
     }
 
     fn with_path<T>(bin: &Path, run: impl FnOnce() -> T) -> T {
-        let _guard = PATH_LOCK
+        let _guard = crate::systemd::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = std::env::var_os("PATH");
@@ -2760,7 +2756,7 @@ mod tests {
     }
 
     fn with_bound_operation<T>(root: &Path, stem: &str, run: impl FnOnce() -> T) -> T {
-        let _guard = PATH_LOCK
+        let _guard = crate::systemd::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous_root = std::env::var_os("SYSTEMD_OPS_SCOPE_ROOT");
