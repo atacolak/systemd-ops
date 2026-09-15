@@ -528,6 +528,13 @@ ensure_clean_worktree() {
 
 FAILURE_BUDGET=${FAILURE_BUDGET:-2}
 
+# Seconds a crash park binds its input. A crash is a property of the
+# environment, not of the input, so the park stops binding this long after
+# parked_at and the tick runs one attempt; the unchanged budget re-parks on
+# failure with a fresh parked_at. Crash only: every other park kind stays
+# fingerprint-terminal until the input moves or an operator releases the park.
+PARK_CRASH_COOLDOWN_SECONDS=${PARK_CRASH_COOLDOWN_SECONDS:-1800}
+
 failure_budget_file() {
   printf '%s\n' "$STATE_DIR/failure-budget.json"
 }
@@ -552,13 +559,33 @@ operational_park_fingerprint() {
   printf '%s\n' "$parked"
 }
 
-# True when this observation is the input an operational park already covered.
-# A different fingerprint never matches, so a later input runs normally.
+# True when this observation is the input an operational park already covered
+# and the park still binds it. A different fingerprint never matches, so a
+# later input runs normally. Only crash parks expire: PARK_CRASH_COOLDOWN_SECONDS
+# after parked_at the park stops binding and the tick runs one attempt. The
+# budget still stands at FAILURE_BUDGET, so a failed attempt re-parks with a
+# fresh parked_at. timeout, contract-failure and dirty-at-exit stay
+# fingerprint-terminal until the input moves or an operator releases the park.
 input_matches_operational_park() {
   local input=$1
   local parked
   parked=$(operational_park_fingerprint) || return 1
-  [[ -n "$parked" && "$parked" == "$input" ]]
+  [[ -n "$parked" && "$parked" == "$input" ]] || return 1
+  # The fingerprint matched, so the sidecar parsed. Only crash parks expire.
+  local f kind parked_at parked_epoch now_epoch
+  f=$(operational_park_file)
+  kind=$(jq -r '.last_kind // empty' "$f" 2>/dev/null)
+  [[ $kind == crash ]] || return 0
+  parked_at=$(jq -r '.parked_at // empty' "$f" 2>/dev/null)
+  # An absent parked_at is not a date: GNU date reads an empty operand as now,
+  # which would bind the park for the whole cooldown. A park that cannot be
+  # timed is no bound at all, so report it and let the tick run.
+  if [[ -z $parked_at ]] || ! parked_epoch=$(date -u -d "$parked_at" +%s 2>/dev/null); then
+    echo "crash park at $f has no readable parked_at; treating the park as expired" >&2
+    return 1
+  fi
+  now_epoch=$(date -u +%s)
+  (( now_epoch - parked_epoch < PARK_CRASH_COOLDOWN_SECONDS ))
 }
 
 failure_budget_count() {

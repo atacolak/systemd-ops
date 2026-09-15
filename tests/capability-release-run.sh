@@ -524,12 +524,25 @@ cmp -s "$TMP/cap-park-blocker.json" "$CAP_STATE/blocker.json" \
 [[ $(grep -c "already correct for" "$SCOPE/ops-argv.log" || true) -eq 0 ]] \
   || fail "the park skip self-reported READY"
 
+# A crash park is time-bounded: with the cooldown elapsed the same unchanged
+# input gets exactly one fresh attempt, and the budget, still standing at
+# FAILURE_BUDGET, re-parks on failure with a fresh parked_at.
+code=$(PARK_CRASH_COOLDOWN_SECONDS=0 run_cap_code 1000 "$target" "$TMP/cap-park-expired.out")
+unset PARK_CRASH_COOLDOWN_SECONDS
+[[ $code -eq 0 ]] || fail "expired crash park exited $code, want the re-park: $(cat "$TMP/cap-park-expired.out")"
+[[ $(grep -c called "$SCOPE/agent-calls" || true) -eq 3 ]] \
+  || fail "expired crash park did not run exactly one pass"
+jq -e '.failures == 3 and .input_fingerprint == "fp-cap"' "$CAP_STATE/failure-budget.json" >/dev/null \
+  || fail "re-park did not keep the budget climbing"
+jq -e '.input_fingerprint == "fp-cap"' "$CAP_STATE/operational-park.json" >/dev/null \
+  || fail "re-park did not restore the park sidecar"
+
 # A different fingerprint is a new input, so it runs. A failure that is not a
 # park leaves the park record alone.
 export PROOF_FINGERPRINT=fp-cap-later
 code=$(run_cap_code 1000 "$target" "$TMP/cap-park-next.out")
 [[ $code -eq 7 ]] || fail "changed input exited $code, want a fresh pass failure: $(cat "$TMP/cap-park-next.out")"
-[[ $(grep -c called "$SCOPE/agent-calls" || true) -eq 3 ]] || fail "changed input did not run a pass"
+[[ $(grep -c called "$SCOPE/agent-calls" || true) -eq 4 ]] || fail "changed input did not run a pass"
 jq -e '.input_fingerprint == "fp-cap"' "$CAP_STATE/operational-park.json" >/dev/null \
   || fail "a failed attempt rewrote the park record"
 

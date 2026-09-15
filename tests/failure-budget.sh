@@ -200,4 +200,44 @@ recover_worktree cap/recover worktree-dirty "dedicated worktree is dirty: $WORKT
 input_matches_operational_park fp-rec && fail "a recovered input still matched the park sidecar"
 grep -q 'automation clear-blocker' "$OPS_LOG" || fail "recover_worktree did not clear the blocker"
 
+# --- crash parks are time-bounded; every other kind stays terminal ---
+# An expired crash park no longer binds the input: the tick runs one attempt.
+record_operational_park fp-crash crash
+( PARK_CRASH_COOLDOWN_SECONDS=0; input_matches_operational_park fp-crash ) \
+  && fail "expired crash park still skipped the input"
+# A fresh crash park still binds inside the cooldown.
+( PARK_CRASH_COOLDOWN_SECONDS=999999; input_matches_operational_park fp-crash ) \
+  || fail "fresh crash park did not skip the input"
+# A crash park with no readable parked_at fails open, like a corrupt record,
+# and the wrapper says so on stderr.
+jq -nc '{version:1,input_fingerprint:"fp-nodate",last_kind:"crash"}' \
+  >"$STATE_DIR/operational-park.json"
+nodate_err=$( ( PARK_CRASH_COOLDOWN_SECONDS=999999; input_matches_operational_park fp-nodate ) 2>&1 >/dev/null || true )
+[[ $nodate_err == *"no readable parked_at"* ]] \
+  || fail "crash park without parked_at was not reported: $nodate_err"
+( PARK_CRASH_COOLDOWN_SECONDS=999999; input_matches_operational_park fp-nodate ) \
+  && fail "crash park without parked_at skipped the input"
+# timeout, contract-failure and dirty-at-exit stay fingerprint-terminal even
+# with a zero cooldown.
+for terminal_kind in timeout contract-failure dirty-at-exit; do
+  record_operational_park fp-term "$terminal_kind"
+  ( PARK_CRASH_COOLDOWN_SECONDS=0; input_matches_operational_park fp-term ) \
+    || fail "$terminal_kind park expired; only crash parks are time-bounded"
+done
+# Re-park after expiry: the budget already stands at FAILURE_BUDGET, so one
+# failed attempt re-parks, overwrites the sidecar with a fresh parked_at, and
+# the budget keeps climbing.
+rm -f "$STATE_DIR/failure-budget.json"
+record_operational_park fp-crash crash
+record_attempt_failure fp-crash crash >/dev/null
+record_attempt_failure fp-crash crash >/dev/null
+first_at=$(jq -er '.parked_at' "$STATE_DIR/operational-park.json")
+sleep 1
+operational_failure_maybe_park fp-crash crash 7 \
+  || fail "third identical crash did not re-park"
+[[ $(jq -er '.parked_at' "$STATE_DIR/operational-park.json") != "$first_at" ]] \
+  || fail "re-park did not refresh parked_at"
+jq -e '.failures == 3' "$STATE_DIR/failure-budget.json" >/dev/null \
+  || fail "re-park did not keep the budget climbing"
+
 echo "failure-budget ok"

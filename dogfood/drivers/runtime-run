@@ -226,9 +226,11 @@ if input_is_processed "$current_input"; then
   exit 0
 fi
 # An operational park bounds the retry instead of certifying the input: while
-# the observation still matches the parked fingerprint this tick does no work.
-# The skip reports nothing, writes no processed state and clears no blocker or
-# budget; it only declines to burn a pass.
+# the observation still matches a park that binds it, this tick does no work.
+# A crash park stops binding PARK_CRASH_COOLDOWN_SECONDS after parked_at; every
+# other kind is fingerprint-terminal until the input moves or an operator
+# releases the park. The skip reports nothing, writes no processed state and
+# clears no blocker or budget; it only declines to burn a pass.
 if input_matches_operational_park "$current_input"; then
   exit 0
 fi
