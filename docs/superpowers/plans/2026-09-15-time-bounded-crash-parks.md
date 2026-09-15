@@ -327,15 +327,21 @@ Expected: FAIL — `cannot find function 'park_owns_blocker' in this scope`
 > leaves a blocker no retry can clear, because the no-park path short-circuits;
 > and an over-long activity text or an operator-surface error releases the unit
 > while reporting failure with no audit. The implementation therefore validates
-> everything first and removes the park LAST: manifest, ownership, sidecar read,
-> park symlink check, blocker load with its ownership and symlink checks,
-> activity-text bound, operator-surface load, then the owned blocker, then the
-> park, then the activity. Read
+> everything first and removes the park LAST, in this exact order:
+> `operation_home_checked` and ownership, the park symlink check, the existence
+> check that yields the idempotent no-park reply, the sidecar read, the blocker
+> load with its ownership and symlink checks, the activity-text bound, the
+> operator-surface load, then the owned blocker if the park owns one, then the
+> park, then the activity entry and its truncation. Read
 > `src/operator.rs::release_park` at 098d91d rather than this block. One window
-> remains and is known: if the audit write in `finish_write` fails after both
-> unlinks, the park and its blocker are gone with no activity entry, and a retry
-> takes the idempotent no-park path, so that audit is never written. It is
-> recorded here because it is a limit of the verb, not an oversight.
+> remains and is known: if the audit write in `finish_write` fails after the
+> unlinks, the park and, when the park owned one, its blocker are already gone
+> with no activity entry, while the caller sees exit 1 with ok:false, so the
+> release has been applied on disk and reported as failed, and a retry takes the
+> idempotent no-park path, so that audit is never written. No test injects that
+> failure, so the window is recorded in prose only. It is recorded here because
+> it is a limit of the verb, not an oversight. The step heading below and the
+> three fenced blocks it introduces are all superseded.
 
 In `src/operator.rs`, immediately after `clear` (ends `:1134`), add:
 
