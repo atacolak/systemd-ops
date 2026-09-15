@@ -74,6 +74,7 @@ Commands:
   automation checkpoint --input-fingerprint HASH [--generation VALUE] [--output-revision VALUE]
   automation blocker --kind KIND --summary TEXT [--route self|parent|lead] [--input-fingerprint HASH] [--iteration ID] [--code N]
   automation clear-blocker
+  automation release-park --unit STEM
 
   automation notify-parent [--event checkpoint|blocked|completed]
 
@@ -843,6 +844,11 @@ fn run_automation(
             remaining_flags(args).map_err(BackendError)?;
             automation::clear_blocker(scope_root, cwd)
         }
+        "release-park" => {
+            let unit = require_opt(args, "--unit").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            operator::release_park(scope_root, cwd, &unit)
+        }
         "notify-parent" => {
             let event = take_opt(args, "--event").map_err(BackendError)?;
             remaining_flags(args).map_err(BackendError)?;
@@ -1045,5 +1051,6 @@ mod tests {
         assert!(USAGE.contains(
             "operator report --unit STEM --headline TEXT --summary JSON_ARRAY --outcome ready|blocked"
         ));
+        assert!(USAGE.contains("automation release-park --unit STEM"));
     }
 }

@@ -1133,6 +1133,107 @@ pub fn clear(
     }))
 }
 
+/// True only for the park's own blocker record: an iteration-failed blocker
+/// bound to the parked fingerprint. A semantic-blocked or any other blocker is
+/// not the park's record and survives a release.
+fn park_owns_blocker(blocker: &crate::automation::Blocker, park_fingerprint: Option<&str>) -> bool {
+    blocker.kind == "iteration-failed"
+        && park_fingerprint.is_some()
+        && blocker.input_fingerprint.as_deref() == park_fingerprint
+}
+
+/// Release an operational park: remove the sidecar and the park's own blocker,
+/// and record the release in operator activity. The failure budget is
+/// deliberately kept: it already stands at the budget, so the next failure
+/// re-parks. Processed state, checkpoints, units, and worktrees are untouched.
+///
+/// The write-prefix guard is not consulted: it gates systemd unit mutations,
+/// and this verb only touches automation state under the operation home.
+pub fn release_park(
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+    stem: &str,
+) -> Result<Value, BackendError> {
+    let manifest = resolved_manifest(explicit_root, cwd)?;
+    require_owned(&manifest, stem)?;
+    let home = crate::automation::operation_home_checked(&manifest.root, stem)?;
+    let state = home.join("state");
+    let park_path = state.join("operational-park.json");
+    refuse_symlink(&park_path)?;
+    if !park_path.exists() {
+        return Ok(json!({
+            "unit": stem,
+            "released": false,
+            "blocker_cleared": false,
+        }));
+    }
+    let record = fs::read(&park_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let field = |key: &str| -> Option<String> {
+        record
+            .as_ref()
+            .and_then(|r| r.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let fingerprint = field("input_fingerprint");
+    let kind = field("last_kind");
+    let parked_at = field("parked_at");
+    fs::remove_file(&park_path)
+        .map_err(|e| BackendError(format!("remove {}: {e}", park_path.display())))?;
+    let mut blocker_cleared = false;
+    if let Some(blocker) = crate::automation::load_blocker(&manifest.root, stem)? {
+        if park_owns_blocker(&blocker, fingerprint.as_deref()) {
+            let path = state.join("blocker.json");
+            refuse_symlink(&path)?;
+            fs::remove_file(&path)
+                .map_err(|e| BackendError(format!("remove {}: {e}", path.display())))?;
+            blocker_cleared = true;
+        }
+    }
+    let text = bound(
+        "activity.text",
+        &format!(
+            "released operational park (kind={}, fingerprint={}, parked_at={})",
+            kind.as_deref().unwrap_or("unknown"),
+            fingerprint.as_deref().unwrap_or("unknown"),
+            parked_at.as_deref().unwrap_or("unknown"),
+        ),
+        MAX_ACTIVITY_TEXT,
+    )?;
+    let (load, warning) = load_with_warning(&manifest.root, stem);
+    let mut surface = match load {
+        OperatorLoad::Ready(s) => s,
+        OperatorLoad::Missing => empty_surface(),
+        OperatorLoad::Error(msg) => {
+            return Err(BackendError(format!(
+                "operator state for '{stem}' is malformed: {msg}"
+            )))
+        }
+    };
+    surface.activity.push(OperatorActivity {
+        at: now_stamp(),
+        text,
+    });
+    if surface.activity.len() > MAX_ACTIVITY {
+        let drop = surface.activity.len() - MAX_ACTIVITY;
+        surface.activity.drain(0..drop);
+    }
+    finish_write(&manifest.root, stem, &surface)?;
+    Ok(json!({
+        "unit": stem,
+        "released": true,
+        "park": {
+            "input_fingerprint": fingerprint,
+            "last_kind": kind,
+            "parked_at": parked_at,
+        },
+        "blocker_cleared": blocker_cleared,
+        "warning": warning,
+    }))
+}
+
 /// Soft join used by ScopeView for owned operations.
 pub fn join_for_scope(
     root: &Path,
@@ -1643,6 +1744,198 @@ mod tests {
             ..Default::default()
         };
         assert!(atomic_write(&link, &surface).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn park_state(root: &Path, stem: &str) -> PathBuf {
+        ensure_dirs(root, stem).unwrap()
+    }
+
+    fn plant_park(root: &Path, stem: &str, fingerprint: &str, kind: &str) {
+        let state = park_state(root, stem);
+        let park = json!({
+            "version": 1,
+            "input_fingerprint": fingerprint,
+            "last_kind": kind,
+            "parked_at": "2026-09-15T05:51:30Z",
+        });
+        fs::write(
+            state.join("operational-park.json"),
+            serde_json::to_vec(&park).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn plant_blocker(root: &Path, stem: &str, fingerprint: Option<&str>, kind: &str) {
+        park_state(root, stem);
+        let blocker = crate::automation::Blocker {
+            version: if fingerprint.is_some() { 2 } else { 1 },
+            id: "blk-proof".into(),
+            input_fingerprint: fingerprint.map(str::to_string),
+            kind: kind.into(),
+            route: "parent".into(),
+            at: "2026-09-15T05:51:30Z".into(),
+            iteration_id: None,
+            code: Some(1),
+            summary: "proof blocker".into(),
+        };
+        fs::write(
+            crate::automation::blocker_path(root, stem),
+            serde_json::to_vec(&blocker).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn park_owns_blocker_matching_rules() {
+        let blocker = crate::automation::Blocker {
+            version: 2,
+            id: "b1".into(),
+            input_fingerprint: Some("fp-1".into()),
+            kind: "iteration-failed".into(),
+            route: "parent".into(),
+            at: "2026-09-15T05:51:30Z".into(),
+            iteration_id: None,
+            code: Some(0),
+            summary: "parked after 2 identical crash failures on unchanged input".into(),
+        };
+        assert!(park_owns_blocker(&blocker, Some("fp-1")));
+        assert!(!park_owns_blocker(&blocker, Some("fp-other")));
+        assert!(!park_owns_blocker(&blocker, None));
+        let semantic = crate::automation::Blocker {
+            kind: "semantic-blocked".into(),
+            ..blocker
+        };
+        assert!(!park_owns_blocker(&semantic, Some("fp-1")));
+    }
+
+    #[test]
+    fn release_park_clears_the_park_and_its_blocker() {
+        let root = scoped_root();
+        let stem = "managed-personal-park";
+        plant_park(&root, stem, "fp-1", "crash");
+        plant_blocker(&root, stem, Some("fp-1"), "iteration-failed");
+        let state = park_state(&root, stem);
+
+        let released = release_park(Some(root.to_str().unwrap()), None, stem).unwrap();
+
+        assert_eq!(released["released"], true);
+        assert_eq!(released["blocker_cleared"], true);
+        assert_eq!(released["unit"], stem);
+        assert_eq!(released["park"]["input_fingerprint"], "fp-1");
+        assert_eq!(released["park"]["last_kind"], "crash");
+        assert_eq!(released["park"]["parked_at"], "2026-09-15T05:51:30Z");
+        assert!(!state.join("operational-park.json").exists());
+        assert!(!crate::automation::blocker_path(&root, stem).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_park_records_the_release_in_activity() {
+        let root = scoped_root();
+        let stem = "managed-personal-park";
+        plant_park(&root, stem, "fp-1", "crash");
+
+        release_park(Some(root.to_str().unwrap()), None, stem).unwrap();
+
+        match load(&root, stem) {
+            OperatorLoad::Ready(surface) => {
+                let text = &surface.activity.last().unwrap().text;
+                assert!(text.contains("released operational park"), "got: {text}");
+                assert!(text.contains("crash"), "got: {text}");
+                assert!(text.contains("fp-1"), "got: {text}");
+                assert!(text.contains("2026-09-15T05:51:30Z"), "got: {text}");
+            }
+            other => panic!("expected ready, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_park_keeps_the_budget_and_the_processed_state() {
+        let root = scoped_root();
+        let stem = "managed-personal-park";
+        plant_park(&root, stem, "fp-1", "crash");
+        let state = park_state(&root, stem);
+        let budget = state.join("failure-budget.json");
+        let processed = crate::automation::processed_path(&root, stem);
+        let checkpoint = crate::automation::checkpoint_path(&root, stem);
+        fs::write(&budget, br#"{"version":1,"failures":2}"#).unwrap();
+        fs::write(&processed, br#"{"version":1,"outcome":"ready"}"#).unwrap();
+        fs::write(&checkpoint, br#"{"version":2,"input_fingerprint":"fp-1"}"#).unwrap();
+
+        release_park(Some(root.to_str().unwrap()), None, stem).unwrap();
+
+        assert!(budget.exists(), "the budget must survive a release");
+        assert!(processed.exists(), "processed state must survive a release");
+        assert!(checkpoint.exists(), "the checkpoint must survive a release");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_park_keeps_a_blocker_it_does_not_own() {
+        let root = scoped_root();
+        let stem = "managed-personal-park";
+        plant_park(&root, stem, "fp-1", "crash");
+        plant_blocker(&root, stem, Some("fp-other"), "iteration-failed");
+
+        let released = release_park(Some(root.to_str().unwrap()), None, stem).unwrap();
+
+        assert_eq!(released["released"], true);
+        assert_eq!(released["blocker_cleared"], false);
+        assert!(
+            crate::automation::blocker_path(&root, stem).exists(),
+            "a blocker bound to another fingerprint is not the park's"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_park_keeps_a_semantic_blocker() {
+        let root = scoped_root();
+        let stem = "managed-personal-park";
+        plant_park(&root, stem, "fp-1", "crash");
+        plant_blocker(&root, stem, Some("fp-1"), "semantic-blocked");
+
+        let released = release_park(Some(root.to_str().unwrap()), None, stem).unwrap();
+
+        assert_eq!(released["blocker_cleared"], false);
+        assert!(
+            crate::automation::blocker_path(&root, stem).exists(),
+            "a semantic blocker is not the park's record"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_park_is_idempotent_when_no_park_exists() {
+        let root = scoped_root();
+        let stem = "managed-personal-park";
+        park_state(&root, stem);
+
+        let first = release_park(Some(root.to_str().unwrap()), None, stem).unwrap();
+        let second = release_park(Some(root.to_str().unwrap()), None, stem).unwrap();
+
+        assert_eq!(first["released"], false);
+        assert_eq!(first["blocker_cleared"], false);
+        assert_eq!(second["released"], false);
+        assert_eq!(second["blocker_cleared"], false);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_park_refuses_a_symlinked_park() {
+        let root = scoped_root();
+        let stem = "managed-personal-park";
+        let state = park_state(&root, stem);
+        let real = root.join("real-park.json");
+        fs::write(&real, b"{}").unwrap();
+        std::os::unix::fs::symlink(&real, state.join("operational-park.json")).unwrap();
+
+        let err = release_park(Some(root.to_str().unwrap()), None, stem).unwrap_err();
+
+        assert!(err.0.contains("symlink"), "got: {}", err.0);
+        assert!(real.exists(), "the symlink target must survive");
         let _ = fs::remove_dir_all(&root);
     }
 }
