@@ -104,7 +104,7 @@ pre-change code both FAIL (shown in Step 2). Guards
 `bash tests/pr-attempt.sh` and `bash tests/wrapper-contract.sh` stay green —
 they pin timeout-park and semantic-blocked behaviour this task must not move.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/failure-budget.sh` immediately before the final
 `echo "failure-budget ok"` line:
@@ -169,7 +169,7 @@ jq -e '.input_fingerprint == "fp-cap"' "$CAP_STATE/operational-park.json" >/dev/
   || fail "re-park did not restore the park sidecar"
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `bash tests/failure-budget.sh`
 Expected: FAIL with `expired crash park still skipped the input`
@@ -178,7 +178,7 @@ Run: `bash tests/capability-release-run.sh`
 Expected: FAIL with `expired crash park did not run exactly one pass`
 (the tick skips, so `agent-calls` stays at 2)
 
-- [ ] **Step 3: Implement the cooldown**
+- [x] **Step 3: Implement the cooldown**
 
 In `dogfood/lib/automation-wrapper`, immediately after
 `FAILURE_BUDGET=${FAILURE_BUDGET:-2}` (`:529`) add:
@@ -236,7 +236,7 @@ reads (keeping each driver's own final word "pass"/"attempt"):
 # clears no blocker or budget; it only declines to burn a pass.
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `bash tests/failure-budget.sh`
 Expected: PASS (`failure-budget ok`)
@@ -247,7 +247,7 @@ Expected: PASS
 Run (guards): `bash tests/pr-attempt.sh && bash tests/wrapper-contract.sh`
 Expected: PASS, PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add dogfood/lib/automation-wrapper dogfood/drivers/capability-run dogfood/drivers/pr-run dogfood/drivers/runtime-run tests/failure-budget.sh tests/capability-release-run.sh
@@ -270,7 +270,7 @@ git commit -m "automation: time-bound crash parks behind PARK_CRASH_COOLDOWN_SEC
 fails. `cargo clippy --all-targets --locked -- -D warnings` and
 `cargo fmt --check` stay clean.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `src/operator.rs`'s `mod tests`, add:
 
@@ -310,14 +310,14 @@ In `src/bin/systemd_ops.rs`'s `usage_lists_scope_root_and_iterations` test
         assert!(USAGE.contains("automation release-park --unit STEM"));
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test`
 Expected: FAIL — `cannot find function 'park_owns_blocker' in this scope`
 (compile error), or, if the implementation order put the USAGE line first,
 `assertion failed: USAGE.contains("automation release-park --unit STEM")`
 
-- [ ] **Step 3: Implement the verb**
+- [x] **Step 3: Implement the verb**
 
 > **SUPERSEDED by commit 098d91d.** The code block below is the original
 > prescription and it is WRONG as written: it removes the park sidecar first and
@@ -458,7 +458,7 @@ In `run_automation`, after the `"clear-blocker"` arm (`:842-845`) add:
         }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test`
 Expected: PASS, including `park_owns_blocker_matching_rules` and
@@ -467,7 +467,7 @@ Expected: PASS, including `park_owns_blocker_matching_rules` and
 Run: `cargo clippy --all-targets --locked -- -D warnings && cargo fmt --check`
 Expected: clean
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/operator.rs src/bin/systemd_ops.rs
@@ -488,7 +488,7 @@ passes against the just-built `target/debug/systemd-ops`; on the pre-Task-2
 binary it FAILS with `unknown automation command 'release-park'`. A verifier
 can re-run the script against any build.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/park-release.sh` (modeled on `tests/operator-report.sh`):
 
@@ -584,19 +584,19 @@ jq -e '.error.message | contains("missing --unit")' <<<"$out" >/dev/null \
 echo "park-release ok"
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo build && bash tests/park-release.sh`
 Expected: FAIL — `expected rejection`/`expected ok` mismatch because the reply
 is `unknown automation command 'release-park'` (when run before Task 2 lands;
 after Task 2 this is the pass proof)
 
-- [ ] **Step 3: Register the proof**
+- [x] **Step 3: Register the proof**
 
 In `docs/TESTING.md`, add `bash tests/park-release.sh` to the fast-gates list
 immediately after the `bash tests/operator-report.sh` line.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo build && bash tests/park-release.sh`
 Expected: PASS (`park-release ok`)
@@ -604,7 +604,7 @@ Expected: PASS (`park-release ok`)
 Run (guards): `bash tests/operator-report.sh && bash tests/automation-cli.sh`
 Expected: PASS, PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/park-release.sh docs/TESTING.md
@@ -625,7 +625,7 @@ git commit -m "test(automation): prove release-park clears the park, keeps the b
 all pass. `tests/docs.sh` proves the man page obligation is genuinely
 unaffected (no MCP surface changed).
 
-- [ ] **Step 1: CHANGELOG entry**
+- [x] **Step 1: CHANGELOG entry**
 
 In `CHANGELOG.md`, under `## 0.7.0 (not published)`, add a new paragraph:
 
@@ -644,7 +644,7 @@ blocker, records the release in operator activity, and deliberately keeps
 ownership like every operation-state write and mutates no systemd unit.
 ```
 
-- [ ] **Step 2: README automation paragraph**
+- [x] **Step 2: README automation paragraph**
 
 In `README.md`'s automation paragraph (`:137-153`), after the sentence about
 `automation process` writing `state/processed.json`, add:
@@ -660,12 +660,12 @@ budget (one attempt, then re-park on failure), and records the release in
 operator activity.
 ```
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 Run: `grep -q "release-park" CHANGELOG.md && grep -q "PARK_CRASH_COOLDOWN_SECONDS" CHANGELOG.md && grep -q "release-park" README.md && bash tests/docs.sh`
 Expected: all pass; `tests/docs.sh` prints `PASS: the man page is clean and indexable`
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add CHANGELOG.md README.md
