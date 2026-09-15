@@ -70,7 +70,6 @@ struct App {
     last_frame: Instant,
     last_backend_cmd: Option<String>,
     last_backend_elapsed: Option<Duration>,
-    refreshing: bool,
     inflight_since: Option<Instant>,
     want_logs: bool,
     detail_view: DetailView,
@@ -309,7 +308,6 @@ impl App {
             last_frame: Instant::now(),
             last_backend_cmd: None,
             last_backend_elapsed: None,
-            refreshing: false,
             inflight_since: None,
             want_logs: false,
             detail_view: DetailView::Cockpit,
@@ -956,7 +954,7 @@ fn mark(semantic: &str, health: &str, lifecycle: &str) -> &'static str {
     match semantic {
         "ready" => "●",
         "running" => "▶",
-        "waiting" => "⏳",
+        "waiting" => "·",
         "stale" => "◌",
         "blocked" => "■",
         "neutral" => "○",
@@ -1193,7 +1191,6 @@ impl TuiRuntime {
         };
         tui_trace("dispatch", &format!("{job:?}"));
         let _ = self.jobs.send(job);
-        self.app.refreshing = self.gate.inflight_refresh() || self.gate.busy;
         if self.app.inflight_since.is_none() {
             self.app.inflight_since = Some(Instant::now());
         }
@@ -1207,8 +1204,6 @@ impl TuiRuntime {
                 scope_root: None,
                 cwd: None,
             });
-        } else {
-            self.app.refreshing = true;
         }
     }
 
@@ -1250,7 +1245,6 @@ impl TuiRuntime {
                 }
             }
         }
-        self.app.refreshing = self.gate.inflight_refresh() || self.gate.busy;
         if !self.gate.busy {
             self.app.inflight_since = None;
         }
@@ -2175,11 +2169,6 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             "backend slow · showing last snapshot   q still quits",
             Style::default().fg(YELLOW),
         ))
-    } else if app.refreshing {
-        Line::from(Span::styled(
-            "refreshing…   q quit   j/k still move",
-            Style::default().fg(ACCENT),
-        ))
     } else {
         let detail = match app.detail_view {
             DetailView::Cockpit => "cockpit",
@@ -2835,6 +2824,11 @@ mod tests {
         assert_eq!(mark(&row.semantic_state, &row.health, &row.lifecycle), "✓");
 
         assert_eq!(when_label(&row, SystemTime::now()), "completed");
+    }
+
+    #[test]
+    fn waiting_mark_is_a_middle_dot() {
+        assert_eq!(mark("waiting", "", ""), "·");
     }
 
     #[test]
@@ -3626,6 +3620,26 @@ mod tests {
         assert!(app.diagnostics_open);
     }
 
+    #[test]
+    fn idle_refresh_keeps_the_normal_footer() {
+        let mut h = Harness::new();
+        h.app.last_refresh = Instant::now() - REFRESH_EVERY;
+        h.maybe_auto_refresh();
+        assert_eq!(h.dispatched.len(), 1);
+        let text = draw_app(&mut h.app, 100, 34);
+        assert!(text.contains("r refresh"));
+        assert!(!text.contains("refreshing"));
+    }
+
+    #[test]
+    fn hung_refresh_replaces_the_footer_with_the_slow_notice() {
+        let mut app = App::from_view(two_ops_view());
+        app.inflight_since = Some(Instant::now() - HUNG_AFTER);
+        let text = draw_app(&mut app, 100, 34);
+        assert!(text.contains("backend slow"));
+        assert!(!text.contains("r refresh"));
+    }
+
     fn two_ops_view() -> ScopeView {
         let mut view = empty_view();
         view.owned.push(serde_json::json!({
@@ -3659,7 +3673,6 @@ mod tests {
 
         fn dispatch(&mut self, job: BackendJob) {
             self.dispatched.push(job);
-            self.app.refreshing = true;
             if self.app.inflight_since.is_none() {
                 self.app.inflight_since = Some(Instant::now());
             }
@@ -3672,8 +3685,6 @@ mod tests {
                     scope_root: None,
                     cwd: None,
                 });
-            } else {
-                self.app.refreshing = true;
             }
         }
 
@@ -3700,7 +3711,6 @@ mod tests {
             if let Some(job) = next {
                 self.dispatch(job);
             }
-            self.app.refreshing = self.gate.inflight_refresh() || self.gate.busy;
             if !self.gate.busy {
                 self.app.inflight_since = None;
             }
@@ -3739,7 +3749,7 @@ mod tests {
         let first = h.selected_unit();
         h.key(KeyCode::Char('r'));
         assert_eq!(h.dispatched.len(), 1);
-        assert!(h.app.refreshing);
+        assert!(h.app.inflight_since.is_some());
         h.key(KeyCode::Down);
         let moved = h.selected_unit();
         assert_ne!(moved, first);
@@ -3752,7 +3762,7 @@ mod tests {
     fn hung_refresh_still_quits() {
         let mut h = Harness::new();
         h.key(KeyCode::Char('r'));
-        assert!(h.app.refreshing);
+        assert!(h.app.inflight_since.is_some());
         assert!(h.key(KeyCode::Char('q')));
         assert!(h.quit);
         assert_eq!(h.dispatched.len(), 1);
