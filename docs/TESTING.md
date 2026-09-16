@@ -28,8 +28,10 @@ bash tests/pr-observe-wake.sh
 bash tests/failure-budget.sh
 bash tests/native-provisioning.sh
 bash tests/wrapper-contract.sh
+bash tests/native-addon-exports.sh
 bash tests/notify-provenance.sh
 bash tests/operator-report.sh
+bash tests/automation-cli.sh
 bash tests/park-release.sh
 bash tests/pr-attempt.sh
 bash tests/capability-release-run.sh

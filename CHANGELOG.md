@@ -34,11 +34,13 @@ repointed. It also copies gitignored build artifacts except `target/` and
 or `bun install` after recover.
 
 `ensure_clean_worktree` copies a validation-pinned `packages/natives/native/*.node`
-and asserts the export surface (`countTokens`, `executeShell`, `visibleWidth`,
-`DesktopSession`, `hashlineStripPrefixes`, `EditStore`) before handing a tree
-to the agent. Failure is blocker kind `native-provisioning`, not a 20-minute
-contract-failure park. An unset or empty `NATIVE_ADDON_EXPORTS` still uses that
-default list.
+and asserts the export surface before handing a tree to the agent. Failure is
+blocker kind `native-provisioning`, not a 20-minute contract-failure park. The
+required set is derived from the tree's own generated surface,
+`packages/natives/native/index.js`: every `nativeBindings.<name>` reference
+except names starting with `__`. `NATIVE_ADDON_EXPORTS`, when set, replaces the
+derived set and says so on stderr. A tree with no generated surface requires
+nothing.
 
 Generic observation is now first-class. `[observation]` names a
 scope-relative observer. `automation observe` validates observer payload
