@@ -127,7 +127,7 @@ pwd >"${SYSTEMD_OPS_SCOPE_ROOT}/omp-cwd"
 git rev-parse HEAD >"${SYSTEMD_OPS_SCOPE_ROOT}/omp-head"
 git status --porcelain=v1 >"${SYSTEMD_OPS_SCOPE_ROOT}/omp-dirty"
 "$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "proof current" --summary '\''["report accepted"]'\'' --outcome ready >/dev/null'
-run_pr "$scope" >/tmp/pr-attempt-success.out 2>/tmp/pr-attempt-success.err || fail "success wrapper failed: $(cat /tmp/pr-attempt-success.err)"
+run_pr "$scope" >"$TMP/pr-attempt-success.out" 2>"$TMP/pr-attempt-success.err" || fail "success wrapper failed: $(cat "$TMP/pr-attempt-success.err")"
 grep -qx -- '--max-time' "$scope/omp-argv" && grep -qx 45m "$scope/omp-argv" || fail "PR command was not 45m: $(cat "$scope/omp-argv")"
 attempt_cwd=$(cat "$scope/omp-cwd")
 [[ $attempt_cwd == "$scope/attempts/$STEM/"* ]] || fail "attempt cwd was $attempt_cwd"
@@ -146,13 +146,13 @@ scope=$(make_scope dirty-ready)
 write_omp "$scope/fake-omp" 'echo leftover >foo.ts
 "$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "dirty ready" --summary '\''["claimed ready"]'\'' --outcome ready >/dev/null'
 set +e
-run_pr "$scope" >/tmp/pr-attempt-dirty.out 2>/tmp/pr-attempt-dirty.err
+run_pr "$scope" >"$TMP/pr-attempt-dirty.out" 2>"$TMP/pr-attempt-dirty.err"
 code=$?
 set -e
 [[ $code -ne 0 ]] || fail "dirty READY succeeded"
 [[ ! -e $scope/.systemd-ops/operations/$STEM/state/checkpoint.json ]] || fail "dirty READY wrote checkpoint"
 [[ ! -e $scope/.systemd-ops/operations/$STEM/state/processed.json ]] || fail "dirty READY marked processed"
-grep -q foo.ts /tmp/pr-attempt-dirty.err || fail "dirty READY did not log dirty files"
+grep -q foo.ts "$TMP/pr-attempt-dirty.err" || fail "dirty READY did not log dirty files"
 [[ $(find "$scope/attempts" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l) -eq 0 ]] || fail "dirty READY leaked attempt"
 [[ -f $scope/user-worktree/user-dirty.txt ]] || fail "dirty READY destroyed user worktree"
 
@@ -161,12 +161,12 @@ scope=$(make_scope dirty-blocked)
 write_omp "$scope/fake-omp" 'echo leftover >bar.ts
 "$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "dirty blocked" --summary '\''["claimed blocked"]'\'' --outcome blocked --route parent >/dev/null'
 set +e
-run_pr "$scope" >/tmp/pr-attempt-dblock.out 2>/tmp/pr-attempt-dblock.err
+run_pr "$scope" >"$TMP/pr-attempt-dblock.out" 2>"$TMP/pr-attempt-dblock.err"
 code=$?
 set -e
 [[ $code -ne 0 ]] || fail "dirty BLOCKED succeeded"
 [[ ! -e $scope/.systemd-ops/operations/$STEM/state/processed.json ]] || fail "dirty BLOCKED marked processed"
-grep -q bar.ts /tmp/pr-attempt-dblock.err || fail "dirty BLOCKED did not log dirty files"
+grep -q bar.ts "$TMP/pr-attempt-dblock.err" || fail "dirty BLOCKED did not log dirty files"
 
 # --- clean BLOCKED: a semantic outcome, so it certifies the input ---
 # Contrast for the park case below, and the replacement for the assertion that a
@@ -174,8 +174,8 @@ grep -q bar.ts /tmp/pr-attempt-dblock.err || fail "dirty BLOCKED did not log dir
 # the input, records semantic-blocked, and writes no park sidecar.
 scope=$(make_scope blocked-clean)
 write_omp "$scope/fake-omp" '"$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "clean blocked" --summary '\''["blocked"]'\'' --outcome blocked --route parent >/dev/null'
-run_pr "$scope" >/tmp/pr-attempt-blocked.out 2>/tmp/pr-attempt-blocked.err \
-  || fail "clean BLOCKED failed: $(cat /tmp/pr-attempt-blocked.err)"
+run_pr "$scope" >"$TMP/pr-attempt-blocked.out" 2>"$TMP/pr-attempt-blocked.err" \
+  || fail "clean BLOCKED failed: $(cat "$TMP/pr-attempt-blocked.err")"
 [[ -f $scope/user-worktree/user-dirty.txt ]] || fail "clean BLOCKED destroyed user worktree"
 jq -e '.outcome=="blocked"' "$scope/.systemd-ops/operations/$STEM/state/processed.json" >/dev/null \
   || fail "clean BLOCKED did not process the input"
@@ -194,11 +194,11 @@ write_omp "$scope/fake-omp" 'echo scratch >scratch.ts
 pwd >"${SYSTEMD_OPS_SCOPE_ROOT}/timeout-cwd"
 exit 124'
 set +e
-run_pr "$scope" >/tmp/pr-attempt-t1.out 2>/tmp/pr-attempt-t1.err
+run_pr "$scope" >"$TMP/pr-attempt-t1.out" 2>"$TMP/pr-attempt-t1.err"
 code=$?
 set -e
 [[ $code -eq 124 ]] || fail "timeout exited $code"
-grep -q 'uncommitted attempt discarded' /tmp/pr-attempt-t1.err || fail "timeout did not log discard"
+grep -q 'uncommitted attempt discarded' "$TMP/pr-attempt-t1.err" || fail "timeout did not log discard"
 [[ ! -e $scope/.systemd-ops/operations/$STEM/state/processed.json ]] || fail "first timeout marked processed"
 t1=$(cat "$scope/timeout-cwd")
 [[ ! -e $t1 ]] || fail "timeout attempt was not removed"
@@ -211,7 +211,7 @@ git rev-parse HEAD >"${SYSTEMD_OPS_SCOPE_ROOT}/timeout2-head"
 git status --porcelain=v1 >"${SYSTEMD_OPS_SCOPE_ROOT}/timeout2-dirty"
 exit 124'
 set +e
-run_pr "$scope" >/tmp/pr-attempt-t2.out 2>/tmp/pr-attempt-t2.err
+run_pr "$scope" >"$TMP/pr-attempt-t2.out" 2>"$TMP/pr-attempt-t2.err"
 code=$?
 set -e
 [[ $(cat "$scope/timeout2-head") == "$head_a" ]] || fail "retry did not start from fork head A"
@@ -243,29 +243,29 @@ observed_fp=$(SYSTEMD_OPS_SCOPE_ROOT="$scope" SYSTEMD_OPS_OPERATION=$STEM "$BIN"
 rm -f "$scope/.systemd-ops/operations/$STEM/state/operational-park.json"
 write_omp "$scope/fake-omp" 'echo called >>"${SYSTEMD_OPS_SCOPE_ROOT}/agent-calls"'
 set +e
-run_pr "$scope" >/tmp/pr-attempt-retry.out 2>/tmp/pr-attempt-retry.err
+run_pr "$scope" >"$TMP/pr-attempt-retry.out" 2>"$TMP/pr-attempt-retry.err"
 code=$?
 set -e
-[[ $code -eq 0 ]] || fail "retry of an unbounded input exited $code: $(cat /tmp/pr-attempt-retry.err)"
+[[ $code -eq 0 ]] || fail "retry of an unbounded input exited $code: $(cat "$TMP/pr-attempt-retry.err")"
 [[ $(wc -l <"$scope/agent-calls") -eq 1 ]] || fail "retry of an unbounded input did not run exactly one pass"
 jq -e '.failures==3' "$scope/.systemd-ops/operations/$STEM/state/failure-budget.json" >/dev/null \
   || fail "the retry did not record its own attempt"
 
 # An unchanged parked input burns no attempt: the bound is the sidecar, and the
 # skip writes no processed state and rewrites neither the budget nor the blocker.
-cp "$scope/.systemd-ops/operations/$STEM/state/failure-budget.json" /tmp/pr-attempt-budget.json
-cp "$scope/.systemd-ops/operations/$STEM/state/blocker.json" /tmp/pr-attempt-blocker.json
+cp "$scope/.systemd-ops/operations/$STEM/state/failure-budget.json" "$TMP/pr-attempt-budget.json"
+cp "$scope/.systemd-ops/operations/$STEM/state/blocker.json" "$TMP/pr-attempt-blocker.json"
 for _ in 1 2 3; do
-  run_pr "$scope" >/tmp/pr-attempt-skip.out 2>/tmp/pr-attempt-skip.err || true
+  run_pr "$scope" >"$TMP/pr-attempt-skip.out" 2>"$TMP/pr-attempt-skip.err" || true
 done
 [[ $(wc -l <"$scope/agent-calls") -eq 1 ]] || fail "parked identical input burned an attempt"
-[[ ! -s /tmp/pr-attempt-skip.out && ! -s /tmp/pr-attempt-skip.err ]] \
-  || fail "the park skip reported something: $(cat /tmp/pr-attempt-skip.out /tmp/pr-attempt-skip.err)"
+[[ ! -s "$TMP/pr-attempt-skip.out" && ! -s "$TMP/pr-attempt-skip.err" ]] \
+  || fail "the park skip reported something: $(cat "$TMP/pr-attempt-skip.out" "$TMP/pr-attempt-skip.err")"
 [[ ! -e $scope/.systemd-ops/operations/$STEM/state/processed.json ]] \
   || fail "the park skip certified the input as processed"
-cmp -s /tmp/pr-attempt-budget.json "$scope/.systemd-ops/operations/$STEM/state/failure-budget.json" \
+cmp -s "$TMP/pr-attempt-budget.json" "$scope/.systemd-ops/operations/$STEM/state/failure-budget.json" \
   || fail "the park skip rewrote the failure budget"
-cmp -s /tmp/pr-attempt-blocker.json "$scope/.systemd-ops/operations/$STEM/state/blocker.json" \
+cmp -s "$TMP/pr-attempt-blocker.json" "$scope/.systemd-ops/operations/$STEM/state/blocker.json" \
   || fail "the park skip rewrote the blocker"
 
 # A different observation is a different input, so it runs while the bound is in
@@ -273,7 +273,7 @@ cmp -s /tmp/pr-attempt-blocker.json "$scope/.systemd-ops/operations/$STEM/state/
 printf y >"$scope/world"
 write_omp "$scope/fake-omp" 'echo called-y >>"${SYSTEMD_OPS_SCOPE_ROOT}/agent-calls-y"
 "$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "new world" --summary '\''["ok"]'\'' --outcome ready >/dev/null'
-run_pr "$scope" >/tmp/pr-attempt-y.out 2>/tmp/pr-attempt-y.err || fail "new world did not unpark: $(cat /tmp/pr-attempt-y.err)"
+run_pr "$scope" >"$TMP/pr-attempt-y.out" 2>"$TMP/pr-attempt-y.err" || fail "new world did not unpark: $(cat "$TMP/pr-attempt-y.err")"
 [[ -f $scope/agent-calls-y ]] || fail "new world did not invoke OMP"
 [[ ! -e $scope/.systemd-ops/operations/$STEM/state/operational-park.json ]] \
   || fail "a READY report left the stale park record"
@@ -288,13 +288,13 @@ git -c user.email=proof@example.invalid -c user.name=proof commit -qm pushed
 git push -q fork HEAD:refs/heads/'"$BRANCH"'
 exit 124'
 set +e
-run_pr "$scope" >/tmp/pr-attempt-push.out 2>/tmp/pr-attempt-push.err
+run_pr "$scope" >"$TMP/pr-attempt-push.out" 2>"$TMP/pr-attempt-push.err"
 set -e
 head_b=$(git -C "$scope/user-worktree" rev-parse "fork/$BRANCH")
 [[ $head_b != "$(git -C "$scope/user-worktree" rev-parse HEAD)" ]] || true
 write_omp "$scope/fake-omp" 'git rev-parse HEAD >"${SYSTEMD_OPS_SCOPE_ROOT}/retry-head"
 "$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "from B" --summary '\''["ok"]'\'' --outcome ready >/dev/null'
-run_pr "$scope" >/tmp/pr-attempt-fromb.out 2>/tmp/pr-attempt-fromb.err || fail "retry after push failed: $(cat /tmp/pr-attempt-fromb.err)"
+run_pr "$scope" >"$TMP/pr-attempt-fromb.out" 2>"$TMP/pr-attempt-fromb.err" || fail "retry after push failed: $(cat "$TMP/pr-attempt-fromb.err")"
 [[ $(cat "$scope/retry-head") == "$head_b" ]] || fail "retry after push started at $(cat "$scope/retry-head") want $head_b"
 
 # --- MERGED before pass: complete without a model invocation ---
@@ -336,7 +336,7 @@ PR_ATTEMPT_ROOT="$scope/attempts" \
 GIT_BASE="$scope/user-worktree" \
 GH_BIN="$scope/bin/gh" \
 "$scope/.systemd-ops/operations/$STEM/run" \
-  >/tmp/pr-attempt-merged.out 2>/tmp/pr-attempt-merged.err || fail "MERGED-before-pass wrapper failed: $(cat /tmp/pr-attempt-merged.err)"
+  >"$TMP/pr-attempt-merged.out" 2>"$TMP/pr-attempt-merged.err" || fail "MERGED-before-pass wrapper failed: $(cat "$TMP/pr-attempt-merged.err")"
 [[ ! -e $scope/agent-calls ]] || fail "MERGED-before-pass invoked OMP"
 [[ $(find "$scope/attempts" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l) -eq 0 ]] || fail "MERGED-before-pass created an attempt"
 grep -q 'automation complete' "$scope/complete-args" || fail "MERGED-before-pass did not complete: $(cat "$scope/complete-args" 2>/dev/null || true)"
