@@ -359,13 +359,66 @@ native_addon_filename() {
   printf '%s\n' "${NATIVE_ADDON_NAME:-pi_natives.linux-x64-modern.node}"
 }
 
-native_addon_has_exports() {
-  local file=$1
-  local missing
-  missing=$(python3 - "$file" <<'PY'
+# Export names a candidate addon must carry for $WORKTREE's own generated
+# surface.
+#
+# DERIVED, never declared: packages/natives/native/index.js is generated from
+# the Rust addon, so every `nativeBindings.<name>` it reads is a name the addon
+# has to export. The hand-written literal that used to live here is exactly what
+# let an addon older than the JS that loads it pass — it named
+# `hashlineStripPrefixes` while the surface read `hashlineIsReadTruncationNotice`,
+# so a generation shipped the addon without it and every `.md` write threw.
+native_addon_required_exports() {
+  local surface="$WORKTREE/packages/natives/native/index.js"
+  if [[ -n "${NATIVE_ADDON_EXPORTS:-}" ]]; then
+    # Explicit operator override. When set it REPLACES the derived set — it wins
+    # over the surface entirely — because its purpose is a one-off probe of an
+    # addon from a foreign tree. Exporting it in the automation environment
+    # therefore disables the derived check for every provision, so announce it
+    # rather than weakening the guard in silence.
+    echo "NATIVE_ADDON_EXPORTS is set: replacing the derived native export set" >&2
+    printf '%s\n' $NATIVE_ADDON_EXPORTS
+    return 0
+  fi
+  # A tree with no generated surface has no addon contract to check.
+  [[ -f "$surface" ]] || return 0
+  # THE RULE, stated rather than implied by a regex: no `__`-prefixed export is
+  # an ABI requirement. packages/natives/native/loader-state.js reads this same
+  # generated file and applies exactly this rule —
+  # getWorkspaceRequiredExports filters `!name.startsWith("__")`
+  # (loader-state.js:744; the filter line numbers drift with the concurrent
+  # natives change, the symbol is the stable citation), and
+  # installNativeTokioRuntime's doc (loader-state.js:870-877) says the tolerance
+  # is CORRECT, not a convenience: an addon predating `__ompInstallTokioRuntime`
+  # is legitimate and falls back to napi-rs's default runtime.
+  #
+  # `__piNativesV<version>` is one INSTANCE of the rule, not the rule: it is the
+  # version sentinel, loader-state.js skips sentinel validation for workspace
+  # loads and isCompatiblePreSentinelNativeAddon deliberately accepts an addon
+  # that carries no current-version sentinel, so requiring it here would refuse
+  # the very release-versioned addons this provisioner exists to copy.
+  #
+  # Excluding only the sentinel regex is what made this file a SECOND source of
+  # truth for one contract: `__ompInstallTokioRuntime` stayed in the required
+  # set, so the guard would have refused an addon the loader tolerates.
+  grep -oE 'nativeBindings\.[A-Za-z_$][A-Za-z0-9_$]*' "$surface" \
+    | sed 's/^nativeBindings\.//' \
+    | grep -vE '^__' \
+    | sort -u
+}
+
+# Entries of the resolved requirement set that $file does not carry. Prints them
+# (nothing when none are missing) and returns non-zero when it printed any. The
+# set is an argument because the drift guard has already resolved it: resolving
+# again would announce an operator override twice on the refusal path.
+native_addon_missing_exports() {
+  local file=$1 need=$2 missing
+  # NATIVE_ADDON_EXPORTS carries the resolved list into the scan; precedence
+  # over the derived set is decided once, in native_addon_required_exports.
+  missing=$(NATIVE_ADDON_EXPORTS="$need" python3 - "$file" <<'PY'
 import os, sys
 path = sys.argv[1]
-need = (os.environ.get("NATIVE_ADDON_EXPORTS") or "countTokens executeShell visibleWidth DesktopSession hashlineStripPrefixes EditStore").split()
+need = (os.environ.get("NATIVE_ADDON_EXPORTS") or "").split()
 data = open(path, "rb").read()
 missing = [name for name in need if name.encode() not in data]
 if missing:
@@ -377,6 +430,48 @@ PY
     return 1
   }
   return 0
+}
+
+native_addon_has_exports() {
+  local file=$1 need
+  # No surface and no override means no requirement: keep the wrapper inert.
+  need=$(native_addon_required_exports) || return 0
+  [[ -n "$need" ]] || return 0
+  native_addon_missing_exports "$file" "$need"
+}
+
+# Drift guard. An addon that cannot satisfy the required set is a generation
+# that throws `TypeError: x is not a function` at whichever call site reads the
+# missing name, so a refusal has to name what is missing, where the requirement
+# came from, and how to rebuild — not just exit non-zero.
+#
+# The resolved set is an optional third argument for callers that already
+# resolved it: provision_native_addon runs up to three checks, and resolving per
+# check announces one operator override three times.
+native_addon_export_drift() {
+  local file=$1 label=${2:-native addon} need=${3-} missing required origin
+  if [[ $# -lt 3 ]]; then
+    # Resolved here with stderr intact, deliberately: on the override path that
+    # stream is the only place the operator learns the derived guard is off, and
+    # a refusal must not suppress it.
+    need=$(native_addon_required_exports) || return 0
+  fi
+  [[ -n "$need" ]] || return 0
+  missing=$(native_addon_missing_exports "$file" "$need") || true
+  [[ -n "$missing" ]] || return 0
+  required=$(printf '%s\n' $need | wc -l)
+  # Say where the requirement actually came from. Naming this tree's generated
+  # surface while NATIVE_ADDON_EXPORTS supplied the list sends the next reader to
+  # a file that has nothing to do with the refusal.
+  if [[ -n "${NATIVE_ADDON_EXPORTS:-}" ]]; then
+    origin="required by the NATIVE_ADDON_EXPORTS operator override"
+  else
+    origin="derived from $WORKTREE/packages/natives/native/index.js"
+  fi
+  printf '%s %s is export-deficient: missing %s of %s exports %s (%s); rebuild it with `bun --cwd=packages/natives run build` in %s, or point NATIVE_ADDON_SOURCE at a rebuilt addon\n' \
+    "$label" "$file" "$(printf '%s\n' $missing | wc -l)" "$required" \
+    "$origin" "$missing" "$WORKTREE"
+  return 1
 }
 
 native_addon_source_file() {
@@ -410,13 +505,21 @@ native_addon_source_file() {
 }
 
 provision_native_addon() {
-  local dest_dir dest src missing
+  local dest_dir dest src need
   dest_dir="$WORKTREE/packages/natives/native"
   if [[ ! -d "$WORKTREE/packages/natives" ]]; then
     return 0
   fi
+  # Resolved ONCE per provision and threaded into every check below. Each
+  # resolution announces an operator override, and a provision runs up to three
+  # checks (destination probe, source drift, destination drift), so resolving per
+  # check told the operator the derived guard was off three times for one copy.
+  # After the early return, so a tree without packages/natives stays silent.
+  need=$(native_addon_required_exports) || return 0
   dest="$dest_dir/$(native_addon_filename)"
-  if [[ -f "$dest" ]] && native_addon_has_exports "$dest" >/dev/null; then
+  # Same no-op semantics as native_addon_has_exports, on the set resolved above:
+  # an existing destination that satisfies it, or no requirement at all, is done.
+  if [[ -f "$dest" ]] && native_addon_missing_exports "$dest" "$need" >/dev/null; then
     return 0
   fi
   src=$(native_addon_source_file) || {
@@ -424,19 +527,16 @@ provision_native_addon() {
     return 1
   }
   if [[ "$(readlink -f "$src" 2>/dev/null || true)" == "$(readlink -f "$dest" 2>/dev/null || true)" ]]; then
-    echo "native addon at $dest is export-deficient and has no other pinned source" >&2
+    native_addon_export_drift "$dest" "native addon at" "$need" >&2 || true
+    echo "native addon at $dest has no other pinned source to copy" >&2
     return 1
   fi
-  missing=$(native_addon_has_exports "$src" 2>/dev/null || true)
-  if [[ -n "$missing" ]]; then
-    echo "native addon source is export-deficient ($src missing $missing)" >&2
+  if ! native_addon_export_drift "$src" "native addon source" "$need" >&2; then
     return 1
   fi
   mkdir -p "$dest_dir" || return 1
   cp -a "$src" "$dest" || return 1
-  missing=$(native_addon_has_exports "$dest" 2>/dev/null || true)
-  if [[ -n "$missing" ]]; then
-    echo "native addon at $dest is export-deficient (missing $missing)" >&2
+  if ! native_addon_export_drift "$dest" "native addon at" "$need" >&2; then
     return 1
   fi
   return 0
