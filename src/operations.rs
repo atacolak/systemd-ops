@@ -1206,11 +1206,13 @@ fn split_exec(line: &str) -> (Option<String>, Vec<String>) {
     (Some(path), argv)
 }
 
+/// True for a unit-file state systemd considers wanted at boot.
+pub fn enablement_on(state: &str) -> bool {
+    matches!(state, "enabled" | "enabled-runtime" | "static")
+}
+
 fn enablement_is_on(enablement: &Value) -> bool {
-    matches!(
-        enablement.as_str(),
-        Some("enabled") | Some("enabled-runtime") | Some("static")
-    )
+    enablement.as_str().is_some_and(enablement_on)
 }
 
 fn has_future_trigger(view: &Value) -> bool {
@@ -1223,6 +1225,24 @@ fn has_future_trigger(view: &Value) -> bool {
 
 fn is_timer_operation(view: &Value) -> bool {
     view.get("activation").and_then(Value::as_str) == Some("timer")
+}
+
+/// Wanted by systemd but not scheduled: an enabled timer oneshot with no
+/// future trigger. Lifecycle completion is not consulted here; the scope
+/// layer owns that.
+pub fn is_wanted_inactive_timer(view: &Value) -> bool {
+    if view.get("missing").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    if !matches!(
+        view.get("kind").and_then(Value::as_str),
+        Some("oneshot") | Some("oneshot-linger")
+    ) {
+        return false;
+    }
+    is_timer_operation(view)
+        && enablement_is_on(view.get("enablement").unwrap_or(&Value::Null))
+        && !has_future_trigger(view)
 }
 
 fn editable_spec_json(
@@ -2411,6 +2431,100 @@ mod tests {
         });
         assert_eq!(operation_health(&view), "unknown");
         assert_eq!(health_basis(&view), "not-scheduled");
+    }
+
+    #[test]
+    fn enablement_on_matches_systemd_wanted_states() {
+        assert!(enablement_on("enabled"));
+        assert!(enablement_on("enabled-runtime"));
+        assert!(enablement_on("static"));
+        assert!(!enablement_on("disabled"));
+        assert!(!enablement_on("masked"));
+        assert!(!enablement_on(""));
+    }
+
+    #[test]
+    fn wanted_inactive_pins_the_0914_shape() {
+        let view = json!({
+            "kind": "oneshot",
+            "activation": "timer",
+            "enablement": "enabled",
+            "next": Value::Null,
+            "last_result": "success",
+            "last": "2026-09-14T10:12:13Z",
+            "state": "inactive",
+            "sub": "dead",
+        });
+        assert!(is_wanted_inactive_timer(&view));
+        assert_eq!(operation_health(&view), "unknown");
+        assert_eq!(health_basis(&view), "not-scheduled");
+    }
+
+    #[test]
+    fn wanted_inactive_covers_never_run_without_moving_its_basis() {
+        let view = json!({
+            "kind": "oneshot",
+            "activation": "timer",
+            "enablement": "enabled",
+            "next": Value::Null,
+            "last_result": Value::Null,
+            "last": Value::Null,
+            "state": "inactive",
+            "sub": "dead",
+        });
+        assert!(is_wanted_inactive_timer(&view));
+        assert_eq!(operation_health(&view), "unknown");
+        assert_eq!(health_basis(&view), "never-run");
+    }
+
+    #[test]
+    fn wanted_inactive_rejects_scheduled_disabled_simple_direct_and_missing() {
+        let scheduled = json!({
+            "kind": "oneshot",
+            "activation": "timer",
+            "enablement": "enabled",
+            "next": "2026-09-17T07:00:00Z",
+            "last_result": "success",
+            "last": "2026-09-16T07:00:00Z",
+        });
+        assert!(!is_wanted_inactive_timer(&scheduled));
+
+        let disabled = json!({
+            "kind": "oneshot",
+            "activation": "timer",
+            "enablement": "disabled",
+            "next": Value::Null,
+            "last_result": "success",
+            "last": "2026-09-16T07:00:00Z",
+        });
+        assert!(!is_wanted_inactive_timer(&disabled));
+
+        let simple = json!({
+            "kind": "simple",
+            "activation": "direct",
+            "enablement": "enabled",
+            "state": "inactive",
+            "sub": "dead",
+        });
+        assert!(!is_wanted_inactive_timer(&simple));
+
+        let direct = json!({
+            "kind": "oneshot",
+            "activation": "direct",
+            "enablement": "enabled",
+            "next": Value::Null,
+            "last_result": "success",
+            "last": "2026-09-16T07:00:00Z",
+        });
+        assert!(!is_wanted_inactive_timer(&direct));
+
+        let missing = json!({
+            "kind": Value::Null,
+            "enablement": "enabled",
+            "next": Value::Null,
+            "missing": true,
+        });
+        assert!(!is_wanted_inactive_timer(&missing));
     }
 
     #[test]
