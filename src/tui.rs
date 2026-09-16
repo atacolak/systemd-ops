@@ -150,6 +150,7 @@ struct Row {
     scope_root: String,
     operation_home: String,
     health_basis: String,
+    enablement: String,
     activation: String,
     about: String,
     headline: String,
@@ -777,6 +778,7 @@ fn row_from_view(v: &Value, relationship: &'static str) -> Option<Row> {
         cwd: json_str(v, "cwd"),
         fragments,
         health_basis: json_str(v, "health_basis"),
+        enablement: json_str(v, "enablement"),
         activation: json_str(v, "activation"),
         about,
         headline,
@@ -2279,6 +2281,9 @@ fn when_label(r: &Row, now: SystemTime) -> String {
     if r.health_basis == "never-run" {
         return "never ran".into();
     }
+    if r.health_basis == "not-scheduled" && crate::operations::enablement_on(&r.enablement) {
+        return "not scheduled".into();
+    }
     String::new()
 }
 
@@ -2502,6 +2507,7 @@ mod tests {
             cwd: String::new(),
             fragments: String::new(),
             health_basis: String::new(),
+            enablement: String::new(),
             schedule: String::new(),
             scope_id: String::new(),
             scope_root: String::new(),
@@ -2792,6 +2798,21 @@ mod tests {
         r.sub = "start".into();
         assert_eq!(when_label(&r, SystemTime::now()), "running");
         r.state = "inactive".into();
+        assert_eq!(when_label(&r, SystemTime::now()), "");
+    }
+
+    #[test]
+    fn wanted_inactive_timer_reads_not_scheduled() {
+        let mut r = dummy("managed-omp-project-lead-watch", "owned");
+        r.kind = "oneshot".into();
+        r.activation = "timer".into();
+        r.enablement = "enabled".into();
+        r.health_basis = "not-scheduled".into();
+        r.last_result = "success".into();
+        r.state = "inactive".into();
+        r.sub = "dead".into();
+        assert_eq!(when_label(&r, SystemTime::now()), "not scheduled");
+        r.enablement = "disabled".into();
         assert_eq!(when_label(&r, SystemTime::now()), "");
     }
 
