@@ -421,6 +421,7 @@ pub fn aggregate(
         } else {
             operations::operation_health(&view)
         };
+        let wanted_inactive = !completed && operations::is_wanted_inactive_timer(&view);
         view["health"] = json!(op_health);
         view["relationship"] = json!("owned");
         view["critical"] = json!(critical);
@@ -476,8 +477,24 @@ pub fn aggregate(
                 attention.push(Attention {
                     operation: unit,
                     relationship: "owned",
-                    code: "operation_unknown",
-                    reason: "unknown".into(),
+                    code: if wanted_inactive {
+                        "wanted_inactive"
+                    } else {
+                        "operation_unknown"
+                    },
+                    reason: if wanted_inactive {
+                        "enabled, no future trigger".into()
+                    } else {
+                        "unknown".into()
+                    },
+                });
+            }
+            "unknown" if wanted_inactive => {
+                attention.push(Attention {
+                    operation: unit,
+                    relationship: "owned",
+                    code: "wanted_inactive",
+                    reason: "enabled, no future trigger".into(),
                 });
             }
             _ => {}
@@ -994,6 +1011,99 @@ operation = "managed-proxy-health"
         assert_eq!(view.health, ScopeHealth::Unknown);
         assert_eq!(view.attention[0].reason, "unknown");
         assert_eq!(view.attention[0].code, "operation_unknown");
+    }
+
+    fn dark_0914(unit: &str) -> Value {
+        op(
+            unit,
+            json!({
+                "kind": "oneshot",
+                "activation": "timer",
+                "enablement": "enabled",
+                "next": Value::Null,
+                "last_result": "success",
+                "last": "2026-09-14T10:12:13Z",
+                "state": "inactive",
+                "sub": "dead",
+            }),
+        )
+    }
+
+    #[test]
+    fn wanted_inactive_timer_gets_attention_without_degrading_scope() {
+        let view = aggregate(&manifest(), vec![dark_0914("managed-speech-watch")], vec![]);
+        assert_eq!(view.health, ScopeHealth::Healthy);
+        assert_eq!(view.attention.len(), 1, "{:?}", view.attention);
+        assert_eq!(view.attention[0].operation, "managed-speech-watch");
+        assert_eq!(view.attention[0].relationship, "owned");
+        assert_eq!(view.attention[0].code, "wanted_inactive");
+        assert_eq!(view.attention[0].reason, "enabled, no future trigger");
+        assert_eq!(view.owned[0]["health"], json!("unknown"));
+        assert_eq!(view.owned[0]["critical"], json!(false));
+    }
+
+    #[test]
+    fn critical_wanted_inactive_keeps_todays_unknown_health() {
+        let view = aggregate(&manifest(), vec![dark_0914("managed-speech-asr")], vec![]);
+        assert_eq!(view.health, ScopeHealth::Unknown);
+        assert_eq!(view.attention.len(), 1, "{:?}", view.attention);
+        assert_eq!(view.attention[0].code, "wanted_inactive");
+        assert_eq!(view.owned[0]["critical"], json!(true));
+    }
+
+    #[test]
+    fn enabled_timer_with_a_future_trigger_is_quiet() {
+        let view = aggregate(
+            &manifest(),
+            vec![op(
+                "managed-speech-watch",
+                json!({
+                    "kind": "oneshot",
+                    "activation": "timer",
+                    "enablement": "enabled",
+                    "next": "2026-09-17T07:00:00Z",
+                    "last_result": "success",
+                    "last": "2026-09-16T07:00:00Z",
+                }),
+            )],
+            vec![],
+        );
+        assert_eq!(view.health, ScopeHealth::Healthy);
+        assert!(view.attention.is_empty(), "{:?}", view.attention);
+    }
+
+    #[test]
+    fn completed_and_disabled_timer_stays_quiet() {
+        let root = tmp("completed-quiet");
+        let state = root.join(".systemd-ops/operations/managed-speech-watch/state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("lifecycle.json"),
+            "{\"status\":\"completed\",\"completed_at\":\"2026-09-15T00:00:00Z\",\"reason\":\"merged\"}",
+        )
+        .unwrap();
+        let mut m = manifest();
+        m.root = root.clone();
+        let view = aggregate(
+            &m,
+            vec![op(
+                "managed-speech-watch",
+                json!({
+                    "kind": "oneshot",
+                    "activation": "timer",
+                    "enablement": "disabled",
+                    "next": Value::Null,
+                    "last_result": "success",
+                    "last": "2026-09-15T00:00:00Z",
+                    "state": "inactive",
+                    "sub": "dead",
+                }),
+            )],
+            vec![],
+        );
+        assert_eq!(view.health, ScopeHealth::Healthy);
+        assert!(view.attention.is_empty(), "{:?}", view.attention);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
