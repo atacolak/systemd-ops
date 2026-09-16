@@ -213,7 +213,10 @@ Operation: `healthy` | `failed` | `unknown`.
 - Scheduled oneshot: never-run is `unknown`, never success. Last
   actual result failure → `failed`. Last success is `healthy` only if
   the timer is enabled and a future trigger exists; otherwise
-  `unknown` (`health_basis=not-scheduled`).
+  `unknown` (`health_basis=not-scheduled`). An *enabled* timer with no
+  future trigger keeps that `unknown`, and is additionally listed under
+  scope attention as `wanted_inactive`: systemd wants the unit, nothing
+  will fire it. Health does not move for it.
 - Long-running (`simple`) expected active: `active`/`running` →
   `healthy`; `failed` state → `failed`; enabled but inactive →
   `failed`; disabled and inactive → `unknown`.
@@ -236,6 +239,7 @@ ScopeView
   owned[]     operation views + critical flag
   watching[]  operation views
   attention[] { operation, relationship, code, reason }
+              code: operation_failed | operation_unknown | wanted_inactive
   warnings[]  soft/non-fatal notes (e.g. malformed operator state)
 ```
 
@@ -274,6 +278,17 @@ Aggregation:
 
 Attention is not a health value. It lists what an operator/agent
 should notice. No acknowledgement lifecycle.
+
+| Attention code | Condition | Scope health effect |
+|---|---|---|
+| `operation_failed` | owned or watched operation health `failed` | `failed` when owned and critical, else `degraded` |
+| `operation_unknown` | owned critical operation health `unknown` that is not `wanted_inactive` | `unknown` |
+| `wanted_inactive` | owned timer oneshot, enablement on, lifecycle not completed, no future trigger | none on its own; `unknown` only because the unit is critical |
+
+A lifecycle-completed operation is never listed: completion disables the
+timer on purpose, and completed operations are read as `healthy` during
+aggregation. A disabled, lifecycle-active timer is not listed either -
+nothing wants it.
 
 Watched failure is an external dependency, not something this scope
 owns. Subscriptions live on the consumer manifest. Provider units do
