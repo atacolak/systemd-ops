@@ -239,9 +239,12 @@ operator: systemd-ops --json automation release-park --unit managed-omp-cap-x
   `src/operator.rs:1019-1024`). Symlink sidecar/blocker: refused
   (`refuse_symlink`).
 - Parked PR child feeding the release gate: an unprocessed child is unsettled
-  by contract, so `capability_release_gate` holds the launch to +3600 s
-  (`PR_RELEASE_GRACE_SECONDS`) instead of the ~300 s quiet window; accepted,
-  and recorded in the plan's self-review notes.
+  by contract, so on a release crossing `capability_release_gate` holds the
+  launch to +3600 s (`PR_RELEASE_GRACE_SECONDS`) instead of the ~300 s quiet
+  window, while a same-generation pass still launches at once; accepted, and
+  recorded in the plan's self-review notes, which carry the caveat that this
+  consequence is inferred from the pins and code reading rather than observed
+  end to end, since no test feeds a real PR park into the release gate.
 
 ## Testing (behavioral contracts; exact tests live in the plan)
 

@@ -704,10 +704,14 @@ git commit -m "docs: crash-park cooldown and release-park in changelog and READM
   `pr_child_is_settled_for_generation` reports the child unsettled,
   `capability_release_gate` takes the unsettled branch, and capability-run
   launches only at +3600 s (`PR_RELEASE_GRACE_SECONDS`) with launch-grace and
-  the prompt naming the unsettled units. The ~300 s quiet window
+  the prompt naming the unsettled units. That hold applies on a release
+  crossing; a same-generation pass still launches at once, unprocessed child or
+  not (`tests/pr-settlement.sh:96-97`). The ~300 s quiet window
   (`PR_SETTLE_QUIET_SECONDS`) is reachable only when the children are settled,
   so that timing path moves from about 5 minutes to 1 hour. Accepted, not a
   defect: an unprocessed child is unsettled by contract. Pinned by
   `tests/pr-settlement.sh:51-56` (an unprocessed child is not settled) and
   `tests/pr-settlement.sh:99-106` (wait-unsettled at +0 and +3599,
-  launch-grace at +3600).
+  launch-grace at +3600). The basis is that pinned unit semantics plus code
+  reading rather than an end-to-end run, so the consequence above is inferred
+  rather than observed: no test feeds a real PR park into the release gate.
