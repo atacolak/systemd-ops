@@ -350,6 +350,11 @@ recover_worktree() {
   # The park sidecar is the other half of the blocker just cleared. The park
   # covered an unchanged observation; the worktree is clean again, so leaving
   # the fingerprint behind would make every later tick skip with no work.
+  # Accepted limit: the clear is best effort and unchecked, so an unwritable
+  # state directory leaves the park behind while this function still reports
+  # success (the echo below sets its status). The drivers' park skip then keeps
+  # matching a repaired tree. That state also breaks every other state write,
+  # and rm reports it on stderr, so the staleness is loud rather than silent.
   rm -f "$(operational_park_file)"
   echo "rebound $OPERATION_STEM to clean worktree $new" >&2
 

@@ -238,6 +238,10 @@ operator: systemd-ops --json automation release-park --unit managed-omp-cap-x
   `operator.json`: error, exit 1 (same as `operator append`,
   `src/operator.rs:1019-1024`). Symlink sidecar/blocker: refused
   (`refuse_symlink`).
+- Parked PR child feeding the release gate: an unprocessed child is unsettled
+  by contract, so `capability_release_gate` holds the launch to +3600 s
+  (`PR_RELEASE_GRACE_SECONDS`) instead of the ~300 s quiet window; accepted,
+  and recorded in the plan's self-review notes.
 
 ## Testing (behavioral contracts; exact tests live in the plan)
 

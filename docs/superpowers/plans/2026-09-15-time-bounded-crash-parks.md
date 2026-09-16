@@ -698,3 +698,16 @@ git commit -m "docs: crash-park cooldown and release-park in changelog and READM
   seven release_park contract tests beyond the one the plan sketched, since a
   destructive verb needs its refusals pinned. (c) release_park validates before
   it mutates, which the Step 3 note above records in full.
+- Accepted release-latency consequence of the PR-family park work (commit
+  116b229), recorded here so a reader meets it as a limit rather than a
+  surprise. A parked PR child writes no processed state, so
+  `pr_child_is_settled_for_generation` reports the child unsettled,
+  `capability_release_gate` takes the unsettled branch, and capability-run
+  launches only at +3600 s (`PR_RELEASE_GRACE_SECONDS`) with launch-grace and
+  the prompt naming the unsettled units. The ~300 s quiet window
+  (`PR_SETTLE_QUIET_SECONDS`) is reachable only when the children are settled,
+  so that timing path moves from about 5 minutes to 1 hour. Accepted, not a
+  defect: an unprocessed child is unsettled by contract. Pinned by
+  `tests/pr-settlement.sh:51-56` (an unprocessed child is not settled) and
+  `tests/pr-settlement.sh:99-106` (wait-unsettled at +0 and +3599,
+  launch-grace at +3600).
