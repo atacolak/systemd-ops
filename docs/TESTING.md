@@ -37,11 +37,17 @@ bash tests/pr-attempt.sh
 bash tests/capability-release-run.sh
 ```
 
-CI runs all of these in the Dogfood proofs step. `make check` runs the Rust
-gates (`cargo test`, clippy, fmt) plus `tests/docs.sh`; it does not run the
-dogfood proofs. Scope discovery, `editable_spec`
+CI runs the Rust gates in their own steps, the dogfood proofs in the
+Dogfood proofs step, and `tests/docs.sh` in the Man page lint step.
+`make check` runs the Rust gates (`cargo test`, clippy, fmt) plus
+`tests/docs.sh`; it does not run the dogfood proofs. Scope discovery,
+`editable_spec`
 round-trip, provenance warnings, and ScopeView aggregation are unit
 tests under `src/scope.rs` and `src/operations.rs`.
+
+Two proofs stay out of CI on purpose: `tests/cli-direct.sh` needs a live
+user manager, and `tests/release-check.sh` needs KVM and a network for
+the cloud images it downloads.
 
 `tests/docs.sh` lints the man page: `groff -mandoc -ww -z`, which is
 what Debian runs as `manpage-has-errors-from-man`, and `lexgrog`, which
