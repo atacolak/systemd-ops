@@ -376,7 +376,14 @@ One file on the runtime-integrator:
         "recorded_at": "<RFC3339 or empty>"
       },
       "occupancy": [
-        {"name": "...", "generation": "<40 hex>", "state": "live|stopped|retired", "acked_at": "<RFC3339>"}
+        {
+          "name": "...",
+          "runtime_generation": {"sha": "<40 hex>", "label": "omp@<8>"},
+          "upgrade_target": null,
+          "state": "live|stopped|retired",
+          "reason": "",
+          "acked_at": "<RFC3339>"
+        }
       ],
       "stall": {
         "phase": "<phase>",
@@ -391,6 +398,115 @@ install. Promote rewrites `published-generation.json` as today's
 
 The "current + two recent" prune is retired. GC is a separate verb
 (D3b) that reads `occupancy`.
+
+### D3c. Shared runtime-generation record
+
+One record. Two consumers. No third identity.
+
+Identity:
+
+- `sha`: exactly 40 lowercase `[0-9a-f]`. This is `output_revision`
+  (the directory name under `generations/`, the tree a process
+  executes). It is not the compose/input `generation` field on
+  today's `published-generation.json`.
+- `label`: `omp@` plus the first 8 characters of `sha`. Live
+  example: sha
+  `e2057f4b2f1bcaf52a4ce8c0aa026faa55a2b377` is
+  `omp@e2057f4b`.
+
+`compose_generation` (today's `published-generation.json`
+`generation`, live `1c0303b1f2ec515cbf4b44a9a49d68a029531aac`)
+is a source field on promoted and candidate only. It is not
+the identity and it is not what occupancy names.
+
+Actor observation (midi owns the write; same types):
+
+    {
+      "runtime_generation": {"sha": "<40 hex>", "label": "omp@<8>"},
+      "upgrade_target": null,
+      "rollout": {"state": "current", "reason": ""}
+    }
+
+`upgrade_target` is `{sha,label}` only when a promote is pending
+for that actor; otherwise null. `rollout.state` is one of
+`current|pending|migrating|acked|stopped|retired`. `reason` is
+one line or empty.
+
+Occupancy midi publishes (D4b) is the same record plus `name`
+and `acked_at`. systemd-ops does not scrape HCOM or `/proc`
+to invent occupancy rows. The conservative process-executable
+check is a GC refuse, not an occupancy write.
+
+systemd-ops inspect on `managed-omp-runtime-integrator`
+projects one object, `runtime_generation`:
+
+    {
+      "promoted": {
+        "sha": "<40 hex>",
+        "label": "omp@<8>",
+        "compose_generation": "<40 hex>",
+        "promoted_at": "<RFC3339>",
+        "path": "<absolute>"
+      },
+      "candidate": {
+        "sha": "<40 hex>",
+        "label": "omp@<8>",
+        "compose_generation": "<40 hex>",
+        "phase": "candidate|canary|rolling_out|converged",
+        "composed_at": "<RFC3339>"
+      },
+      "cohort": {
+        "migrated": [
+          {"name": "...", "runtime_generation": {"sha":"...","label":"..."},
+           "state": "acked|stopped|retired", "acked_at": "<RFC3339>"}
+        ],
+        "pending": [
+          {"name": "...", "runtime_generation": {"sha":"...","label":"..."},
+           "upgrade_target": {"sha":"...","label":"..."},
+           "state": "pending|migrating", "reason": "<one line>"}
+        ]
+      },
+      "retained": [
+        {
+          "sha": "<40 hex>",
+          "label": "omp@<8>",
+          "path": "<absolute>",
+          "reasons": ["promoted"]
+        }
+      ]
+    }
+
+`candidate` is null when there is none. `promoted` is null only
+before the first promote (today it is the live
+`published-generation.json` pointer).
+
+`retained[].reasons` is the only answer to "why can generation
+X not be garbage-collected yet?". Allowed reasons, and only
+these:
+
+- `promoted`  -  sha is the promoted pointer
+- `candidate`  -  sha is the current candidate
+- `live-occupancy:<name>`  -  a `state=live` occupancy row names
+  that sha
+- `process-executable`  -  a process executable resolves into
+  that generation directory
+- `current-symlink`  -  `generations/current` points at it
+
+A directory under `generations/` with an empty `reasons` array
+is GC-eligible. The newest-3 prune is gone. Live 2026-09-17
+`a268e6a1...` and `1a6a4aaab...` have no reason under this
+rule.
+
+Two queries, one record:
+
+- "what omp is <actor> running?" =
+  `occupancy[name].runtime_generation.label` (and `.sha`)
+- "why can <sha> not be GC'd?" = `retained[sha].reasons`
+
+Canary ACK `generation` / `observed_generation` are this
+identity sha, not `compose_generation`. midi confirms or
+rejects this identity before Task 5/6 land.
+
 
 `runtime-run` after READY postconditions and a successful
 `generation_is_loadable` check:
@@ -451,9 +567,15 @@ candidate. It does not invent a new generation.
 
     {
       "version": 1,
-      "generation": "<40 hex>",
+      "generation": "<40 hex identity sha>",
       "actors": [
-        {"name": "<actor>", "generation": "<40 hex>", "state": "live|stopped|retired"}
+        {
+          "name": "<actor>",
+          "runtime_generation": {"sha": "<40 hex>", "label": "omp@<8>"},
+          "upgrade_target": null,
+          "state": "live|stopped|retired",
+          "reason": ""
+        }
       ]
     }
 
@@ -546,7 +668,9 @@ drop that source from runtime membership (the child is gone, so
 ### D8. Inspect and stall surface
 
 `automation inspect --unit managed-omp-runtime-integrator` gains
-`deployment` equal to `deployment.json` (or null if absent).
+`deployment` equal to `deployment.json` (or null if absent) and
+`runtime_generation` equal to the D3c projection (or null if
+neither `published-generation.json` nor `deployment.json` exists).
 
 `automation inspect --unit managed-omp-cap-<capability>` gains
 `desired_inputs` equal to the file (or null) and
@@ -594,7 +718,10 @@ Hermetic proofs, no live oh-my-pi writes:
   once and is atomic (current and published-generation match)
 - `tests/deploy-gc.sh`: GC refuses a live occupancy row; GC refuses
   when `current` points at G; GC removes G when occupancy is
-  retired/stopped/acked elsewhere and the process check is clean
+  retired/stopped/acked elsewhere and the process check is clean.
+  inspect `runtime_generation.retained` names a reason for every
+  kept directory and is empty-reasons for a GC-eligible leftover.
+  "what is <actor> running?" is occupancy `runtime_generation.label`.
 - `tests/normalize-pr.sh`: after apply the unit is absent from
   `list-operations`; a missing `merge_sha` is refused; no GitHub
   call site is introduced

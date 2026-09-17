@@ -204,10 +204,15 @@ promoted). systemd-ops does not call `recycle_actor` or `hcom r`.
 - Create: `tests/deploy-gc.sh`
 - Modify: `dogfood/drivers/runtime-run` (delete newest-3 prune call sites)
 
-**Verification:** occupancy apply rewrites the `occupancy` array and
-moves phase to `converged` when every row is acked on promoted or
-`stopped`/`retired`. GC refuses a `state=live` row naming G, refuses
-when `current` points at G, and removes G when both checks pass.
+**Verification:** occupancy apply rewrites the `occupancy` array
+using the D3c record (`runtime_generation.sha` is output_revision,
+label is `omp@` + first 8). Phase becomes `converged` when every
+row is acked on promoted or `stopped`/`retired`. GC refuses a
+`state=live` row naming that sha, refuses when `current` points at
+it, and removes it when both checks pass.
+`automation inspect` `runtime_generation.retained` lists every
+kept directory with at least one of the five reasons; a leftover
+with empty reasons is GC-eligible.
 `rg prune_runtime_generations dogfood/drivers/runtime-run` is empty.
 
 - [ ] **Step 1: Write the failing proof**
