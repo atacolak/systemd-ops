@@ -709,6 +709,7 @@ Hermetic proofs, no live oh-my-pi writes:
 
 - `src/automation.rs` unit: fingerprint absent file equals today's
   hash; present file moves the hash; refuse malformed admit spec
+  (bad hex, mixed kinds, empty delta, `..` path); refuse
   `overseer`; duplicate `(originating_work, artifact_identity)` is
   a no-op write
 - `tests/admission.sh`: existing capability desired-inputs write
