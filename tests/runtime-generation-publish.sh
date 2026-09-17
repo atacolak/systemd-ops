@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Publish-by-generation hop: READY compose snapshots a detached generation
-# before checkpoint. Never touches the live ~/.bun/bin/omp.
+# READY compose snapshots a detached candidate generation and does not
+# flip generations/current or the omp install. The flip lives in
+# runtime-promote and rewrites published-generation.json only then.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DRIVER=${RUNTIME_RUN:-$ROOT/dogfood/drivers/runtime-run}
 LIB=${WRAPPER_LIB:-$ROOT/dogfood/lib/automation-wrapper}
+PROMOTE=${RUNTIME_PROMOTE:-$ROOT/dogfood/lib/runtime-promote}
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 command -v jq >/dev/null || fail "jq required"
@@ -87,13 +89,9 @@ export STATE_DIR=$STATE
 # shellcheck source=/dev/null
 source "$DRIVER"
 
-publish_runtime_generation gen-1 "$rev1" || fail "first publish failed"
+initial_omp=$(readlink -f "$BINDIR/omp")
+publish_runtime_generation gen-1 "$rev1" || fail "first compose failed"
 [[ -d $GENS/$rev1 ]] || fail "first generation directory missing"
-[[ -L $GENS/current ]] || fail "current symlink missing"
-[[ $(readlink -f "$GENS/current") == $(readlink -f "$GENS/$rev1") ]] \
-  || fail "current does not point at first generation"
-[[ $(readlink -f "$BINDIR/omp") == $(readlink -f "$GENS/current/packages/coding-agent/scripts/ompalt") ]] \
-  || fail "omp install did not resolve into generations/current"
 [[ -f $GENS/$rev1/node_modules/pkg/index.js ]] || fail "node_modules payload was not copied"
 [[ -f $GENS/$rev1/packages/natives/native/pi_natives.linux-x64-modern.node ]] \
   || fail "untracked .node payload was not copied"
@@ -102,6 +100,54 @@ publish_runtime_generation gen-1 "$rev1" || fail "first publish failed"
 [[ -f $GENS/$rev1/packages/stats/dist/client/index.js ]] \
   || fail "ignored packages/stats/dist was dropped"
 [[ ! -e $GENS/$rev1/target/debug/omp ]] || fail "target/ leaked into the generation"
+
+[[ ! -e $GENS/current && ! -L $GENS/current ]] \
+  || fail "READY compose moved generations/current"
+[[ $(readlink -f "$BINDIR/omp") == "$initial_omp" ]] \
+  || fail "READY compose moved the omp install"
+[[ ! -f $STATE/published-generation.json ]] \
+  || fail "READY compose rewrote published-generation.json"
+jq -e --arg gen gen-1 --arg rev "$rev1" '
+  .candidate.phase=="candidate"
+  and .candidate.generation==$gen
+  and .candidate.output_revision==$rev
+' "$STATE/deployment.json" >/dev/null \
+  || fail "deployment.json did not record phase=candidate after READY compose"
+
+python3 - "$DRIVER" <<'PY' || fail "READY compose calls prune_runtime_generations"
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+start = text.find("publish_runtime_generation() {")
+marker = '\n}\n\nif [[ "${RUNTIME_RUN_LIB:-}" == 1 ]]'
+end = text.find(marker, start)
+if start < 0 or end < 0:
+    raise SystemExit(1)
+if "prune_runtime_generations" in text[start:end]:
+    raise SystemExit(1)
+PY
+
+echo compose-advanced >"$COMPOSE/packages/coding-agent/scripts/ompalt"
+[[ $(cat "$GENS/$rev1/packages/coding-agent/scripts/ompalt") == *ompalt-v1* ]] \
+  || fail "compose worktree advance mutated the published generation"
+git -C "$COMPOSE" checkout -- packages/coding-agent/scripts/ompalt
+
+publish_runtime_generation gen-1 "$rev1" || fail "idempotent recompose failed"
+count=$(find "$GENS" -mindepth 1 -maxdepth 1 -type d | wc -l)
+[[ $count -eq 1 ]] || fail "idempotent recompose created extra generation dirs ($count)"
+[[ ! -e $GENS/current && ! -L $GENS/current ]] \
+  || fail "idempotent recompose moved generations/current"
+[[ ! -f $STATE/published-generation.json ]] \
+  || fail "idempotent recompose rewrote published-generation.json"
+
+[[ -r $PROMOTE ]] || fail "missing $PROMOTE"
+# shellcheck source=/dev/null
+source "$PROMOTE"
+promote_runtime_generation gen-1 "$rev1" || fail "first promote failed"
+[[ -L $GENS/current ]] || fail "promote did not create current"
+[[ $(readlink -f "$GENS/current") == $(readlink -f "$GENS/$rev1") ]] \
+  || fail "promote did not point current at first generation"
+[[ $(readlink -f "$BINDIR/omp") == $(readlink -f "$GENS/current/packages/coding-agent/scripts/ompalt") ]] \
+  || fail "promote did not resolve omp install into generations/current"
 jq -e --arg gen gen-1 --arg rev "$rev1" --arg path "$(readlink -f "$GENS/$rev1")" '
   .version==1
   and .generation==$gen
@@ -109,16 +155,7 @@ jq -e --arg gen gen-1 --arg rev "$rev1" --arg path "$(readlink -f "$GENS/$rev1")
   and .path==$path
   and (.published_at|test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))
 ' "$STATE/published-generation.json" >/dev/null \
-  || fail "published-generation.json mismatch after first publish"
-
-echo compose-advanced >"$COMPOSE/packages/coding-agent/scripts/ompalt"
-[[ $(cat "$GENS/$rev1/packages/coding-agent/scripts/ompalt") == *ompalt-v1* ]] \
-  || fail "compose worktree advance mutated the published generation"
-git -C "$COMPOSE" checkout -- packages/coding-agent/scripts/ompalt
-
-publish_runtime_generation gen-1 "$rev1" || fail "idempotent republish failed"
-count=$(find "$GENS" -mindepth 1 -maxdepth 1 -type d | wc -l)
-[[ $count -eq 1 ]] || fail "idempotent republish created extra generation dirs ($count)"
+  || fail "published-generation.json mismatch after first promote"
 
 hollow=$TMP/hollow
 mkdir -p "$hollow/packages/coding-agent/scripts"
@@ -126,17 +163,21 @@ if copy_untracked_runtime_payload "$hollow" "$GENS/$rev1"; then
   fail "copy_untracked_runtime_payload succeeded without src node_modules"
 fi
 [[ -d $GENS/$rev1/node_modules ]] || fail "failed copy removed dest node_modules"
-before_omp=$(readlink -f "$BINDIR/omp")
-WORKTREE=$hollow
-if publish_runtime_generation gen-hollow "$rev1"; then
-  fail "publish succeeded from a node_modules-less worktree"
-fi
-[[ $(readlink -f "$BINDIR/omp") == "$before_omp" ]] \
-  || fail "failed publish repointed omp"
-WORKTREE=$COMPOSE
-
 before_current=$(readlink -f "$GENS/current")
 before_omp=$(readlink -f "$BINDIR/omp")
+before_published=$(cat "$STATE/published-generation.json")
+WORKTREE=$hollow
+if publish_runtime_generation gen-hollow "$rev1"; then
+  fail "compose succeeded from a node_modules-less worktree"
+fi
+[[ $(readlink -f "$GENS/current") == "$before_current" ]] \
+  || fail "failed compose flipped generations/current"
+[[ $(readlink -f "$BINDIR/omp") == "$before_omp" ]] \
+  || fail "failed compose repointed omp"
+[[ $(cat "$STATE/published-generation.json") == "$before_published" ]] \
+  || fail "failed compose rewrote published-generation.json"
+WORKTREE=$COMPOSE
+
 cat >"$COMPOSE/packages/coding-agent/scripts/ompalt" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == --help ]]; then
@@ -150,13 +191,18 @@ chmod 0755 "$COMPOSE/packages/coding-agent/scripts/ompalt"
 git -C "$COMPOSE" add packages/coding-agent/scripts/ompalt
 git -C "$COMPOSE" commit -qm 'broken-smoke'
 rev_broken=$(git -C "$COMPOSE" rev-parse HEAD)
+before_current=$(readlink -f "$GENS/current")
+before_omp=$(readlink -f "$BINDIR/omp")
+before_published=$(cat "$STATE/published-generation.json")
 if publish_runtime_generation gen-broken "$rev_broken"; then
-  fail "publish succeeded when generation --smoke-test failed"
+  fail "compose succeeded when generation --smoke-test failed"
 fi
 [[ $(readlink -f "$GENS/current") == "$before_current" ]] \
   || fail "failed load postcondition flipped generations/current"
 [[ $(readlink -f "$BINDIR/omp") == "$before_omp" ]] \
   || fail "failed load postcondition repointed omp"
+[[ $(cat "$STATE/published-generation.json") == "$before_published" ]] \
+  || fail "failed load postcondition rewrote published-generation.json"
 git -C "$COMPOSE" worktree remove --force "$GENS/$rev_broken" >/dev/null 2>&1 \
   || rm -rf "$GENS/$rev_broken"
 cat >"$COMPOSE/packages/coding-agent/scripts/ompalt" <<'EOF'
@@ -172,11 +218,6 @@ chmod 0755 "$COMPOSE/packages/coding-agent/scripts/ompalt"
 git -C "$COMPOSE" add packages/coding-agent/scripts/ompalt
 git -C "$COMPOSE" commit -qm 'restore-smoke'
 
-
-
-
-
-
 foreign=$TMP/foreign-omp
 ln -s /bin/true "$foreign"
 OMP_INSTALL=$foreign
@@ -184,9 +225,13 @@ if publish_runtime_generation gen-x "$rev1"; then
   fail "unexpected omp target was treated as repointable"
 fi
 [[ $(readlink -f "$BINDIR/omp") == $(readlink -f "$GENS/current/packages/coding-agent/scripts/ompalt") ]] \
-  || fail "failed publish mutated the fixture omp install"
+  || fail "failed compose mutated the fixture omp install"
+[[ $(cat "$STATE/published-generation.json") == "$before_published" ]] \
+  || fail "failed compose from a foreign omp rewrote published-generation.json"
 OMP_INSTALL=$BINDIR/omp
 
+promoted_current=$(readlink -f "$GENS/current")
+published_before=$(cat "$STATE/published-generation.json")
 revs=("$rev1")
 for n in 2 3 4; do
   cat >"$COMPOSE/packages/coding-agent/scripts/ompalt" <<EOF
@@ -204,22 +249,37 @@ EOF
   rev=$(git -C "$COMPOSE" rev-parse HEAD)
   revs+=("$rev")
   echo "payload-v$n" >"$COMPOSE/node_modules/pkg/index.js"
-  publish_runtime_generation "gen-$n" "$rev" || fail "publish $n failed"
+  publish_runtime_generation "gen-$n" "$rev" || fail "compose $n failed"
+  [[ $(readlink -f "$GENS/current") == "$promoted_current" ]] \
+    || fail "READY compose $n moved generations/current"
+  [[ $(readlink -f "$BINDIR/omp") == $(readlink -f "$GENS/current/packages/coding-agent/scripts/ompalt") ]] \
+    || fail "READY compose $n moved the omp install"
+  [[ $(cat "$STATE/published-generation.json") == "$published_before" ]] \
+    || fail "READY compose $n rewrote published-generation.json"
+  jq -e --arg gen "gen-$n" --arg rev "$rev" '
+    .candidate.phase=="candidate"
+    and .candidate.generation==$gen
+    and .candidate.output_revision==$rev
+  ' "$STATE/deployment.json" >/dev/null \
+    || fail "deployment.json did not record phase=candidate after compose $n"
 done
 
 gen_dirs=$(find "$GENS" -mindepth 1 -maxdepth 1 -type d | wc -l)
-[[ $gen_dirs -le 3 ]] || fail "prune left $gen_dirs generation directories, want <=3"
+[[ $gen_dirs -eq 4 ]] || fail "compose dropped or pruned generation directories ($gen_dirs)"
+[[ -d $GENS/${revs[0]} ]] || fail "oldest generation is missing after later composes"
+[[ $promoted_current == $(readlink -f "$GENS/${revs[0]}") ]] \
+  || fail "current left the previous promoted generation"
+
+promote_runtime_generation gen-4 "${revs[3]}" || fail "promote of newest candidate failed"
 current=$(readlink -f "$GENS/current")
-[[ -d $current ]] || fail "current target was pruned"
 [[ $current == $(readlink -f "$GENS/${revs[3]}") ]] \
-  || fail "current is not the newest generation"
-[[ -d $GENS/${revs[0]} ]] && fail "oldest generation was not pruned"
+  || fail "promote did not move current to the newest generation"
 jq -e --arg gen gen-4 --arg rev "${revs[3]}" '
   .generation==$gen and .output_revision==$rev
 ' "$STATE/published-generation.json" >/dev/null \
-  || fail "published-generation.json did not track newest publish"
+  || fail "published-generation.json did not track newest promote"
 [[ $(readlink -f "$BINDIR/omp") == $(readlink -f "$GENS/current/packages/coding-agent/scripts/ompalt") ]] \
-  || fail "omp install drifted off generations/current after prune"
+  || fail "omp install drifted off generations/current after promote"
 
 if [[ -n "${LIVE_OMP:-}" ]]; then
   now=$(readlink -f /home/sf/.bun/bin/omp 2>/dev/null || true)

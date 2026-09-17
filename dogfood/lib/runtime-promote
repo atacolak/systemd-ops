@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Extracted current-flip and published-generation write. Sourced, never executed.
+
+ensure_omp_points_at_current() {
+  local omp=$OMP_INSTALL
+  local gens target desired resolved tmp
+  gens=$(readlink -f "$GENERATIONS_ROOT") || return 1
+  target="$gens/current/packages/coding-agent/scripts/ompalt"
+  if [[ ! -e "$target" && ! -L "$target" ]]; then
+    echo "published generation is missing $target" >&2
+    return 1
+  fi
+  desired=$(readlink -f "$target") || return 1
+  resolved=$(readlink -f "$omp") || return 1
+  if [[ "$resolved" == "$desired" ]]; then
+    return 0
+  fi
+  tmp="$omp.tmp.$$"
+  ln -s "$target" "$tmp" || return 1
+  if ! mv -T "$tmp" "$omp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  return 0
+}
+
+write_published_generation_json() {
+  local generation=$1 output_revision=$2 gen_dir=$3
+  local published_at path tmp out
+  published_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  path=$(readlink -f "$gen_dir") || return 1
+  mkdir -p "$STATE_DIR" || return 1
+  out="$STATE_DIR/published-generation.json"
+  tmp="$out.tmp.$$"
+  jq -n \
+    --arg generation "$generation" \
+    --arg output_revision "$output_revision" \
+    --arg published_at "$published_at" \
+    --arg path "$path" \
+    '{version:1,generation:$generation,output_revision:$output_revision,published_at:$published_at,path:$path}' \
+    >"$tmp" || return 1
+  mv -T "$tmp" "$out"
+}
+
+promote_runtime_generation() {
+  local generation=$1 output_revision=$2
+  local gen_dir tmp
+  gen_dir="$GENERATIONS_ROOT/$output_revision"
+  if [[ ! -d "$gen_dir" ]]; then
+    echo "promote target is missing: $gen_dir" >&2
+    return 1
+  fi
+  tmp="$GENERATIONS_ROOT/.current.tmp.$$"
+  ln -s "$gen_dir" "$tmp" || return 1
+  if ! mv -T "$tmp" "$GENERATIONS_ROOT/current"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  ensure_omp_points_at_current || return 1
+  write_published_generation_json "$generation" "$output_revision" "$gen_dir" || return 1
+  return 0
+}
