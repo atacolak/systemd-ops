@@ -308,9 +308,11 @@ No em dash, no non-ASCII.
 
 **Verification:** each specimen has an admit event, a moved
 capability fingerprint, a READY checkpoint that contains the
-admitted revision, a candidate `deployment.json` that did not flip
-`current`, a midi canary ACK, a promote that did, and occupancy
-rows. Product-close happens after rollout, not after compose.
+admitted artifact identity (`.66`: worktree-delta base + path
+sha256s, not a 40-hex; `omp-vuz.1`: the commit midi picks), a
+candidate `deployment.json` that did not flip `current`, a midi
+canary ACK, a promote that did, and occupancy rows. Product-close
+happens after rollout, not after compose.
 
 - [ ] **Step 1: midi supplies the `.66` worktree-delta and invokes admit**
 - [ ] **Step 2: maintainer consumes; compose candidates; midi canaries**
