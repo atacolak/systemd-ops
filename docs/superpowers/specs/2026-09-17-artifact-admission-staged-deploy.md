@@ -344,6 +344,17 @@ artifacts it must reconcile into `cap/<capability>` against the current
 upstream generation. How it reconciles is the maintainer's job. This
 spec does not cherry-pick and does not copy a classified worktree.
 
+A READY checkpoint certifies consume. Feature-presence is not consume.
+`desired_unconsumed` (D8) is true when any admitted commit revision is
+not an ancestor of the capability HEAD, or any admitted worktree-delta
+has a named path whose bound worktree file is missing or whose sha256
+does not match. While it is true, `capability-run` must not
+`mark_processed` ready, must not write a READY checkpoint, and must
+not verified-noop self-report READY. An agent `automation_report`
+outcome=ready does not override the predicate. Midi #99663: consume
+must reconcile `desired-inputs`, not treat a later thinking-level
+commit as already having consumed a mismatched worktree-delta.
+
 Upstream generation changes still come from the observer's
 `world_fingerprint` / `generation`. Desired artifacts stay constant
 across that change. Both moving independently is the point.
@@ -610,7 +621,8 @@ On pass it removes that generation worktree and drops it from
 ### D5. Wake
 
 Existing capability: the desired-inputs write moves `input_fingerprint`
-(D2). The next `capability-run` tick cannot no-op-skip. No extra wake
+(D2). The next `capability-run` tick cannot no-op-skip and cannot
+READY-certify while `desired_unconsumed` is true. No extra wake
 channel.
 
 New capability: author apply enables the timer. First tick observes

@@ -76,11 +76,12 @@ that creating the file with one input changes the hex. A builder
 cannot satisfy both by always appending `desired=`. `cargo test --lib
 automation::` passes.
 
-- [ ] **Step 1: Write the failing tests**
-- [ ] **Step 2: Make the tests pass**
-- [ ] **Step 3: Commit**
+- [x] **Step 1: Write the failing tests**
+- [x] **Step 2: Make the tests pass**
+- [x] **Step 3: Commit**
 
 `git commit -m "feat: hash desired-inputs into observation when present"`
+Landed `7a2862f`. `review-sdo-a89.2` PASS.
 
 ---
 
@@ -104,11 +105,12 @@ duplicate identity is a no-op. `overseer` as `originating_work` or
 hex), mixed kinds, empty delta, and a `..` path are refused. No unit
 is created or rewritten.
 
-- [ ] **Step 1: Write the failing proof**
-- [ ] **Step 2: Make the proof pass**
-- [ ] **Step 3: Commit**
+- [x] **Step 1: Write the failing proof**
+- [x] **Step 2: Make the proof pass**
+- [x] **Step 3: Commit**
 
 `git commit -m "feat: automation plan-admit for an existing capability"`
+Landed `6106d14`. `review-sdo-a89.3` PASS.
 
 This is the midi-facing invoke. After this commit the existing-cap
 path is callable. New-cap creation is Task 3.
@@ -134,11 +136,12 @@ with a sibling is refused. `fork/cap/<id>` is not pushed.
 Worktree-delta of a new capability copies no bytes and does not
 `git worktree add` from the classified tree.
 
-- [ ] **Step 1: Write the failing proof**
-- [ ] **Step 2: Make the proof pass**
-- [ ] **Step 3: Commit**
+- [x] **Step 1: Write the failing proof**
+- [x] **Step 2: Make the proof pass**
+- [x] **Step 3: Commit**
 
 `git commit -m "feat: plan-admit creates a capability-maintainer child"`
+Landed `e962b5b`. `review-sdo-a89.4` PASS.
 
 ---
 
