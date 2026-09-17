@@ -157,6 +157,26 @@ manually rescue it. Then `omp-vuz.1` on the same path.
   waits until `.66` proves candidate -> canary -> promote ->
   rollout -> live-proof.
 
+**Observed** - midi #98865 classified capability homes (not created,
+not invented here). `scope.toml` has no `capability_worktree_root`,
+so new-cap admit requires `worktree`. These are the homes:
+
+- `.66`: `/home/sf/worktrees/omp/admit/retry-fallback-unowned`
+- `omp-vuz.1`: `/home/sf/worktrees/omp/admit/todo-passive-phase`
+
+Rejected as the home:
+
+- `/home/sf/worktrees/omp/cap/retry-fallback-unowned` (livu, HEAD
+  `b5a0e2264b`)
+- `/home/sf/.omp/wt/ayn-66-f6de4bd` (classified artifact, not the
+  capability home)
+- `/home/sf/worktrees/omp/cap/todo-passive-phase` (livu,
+  `4517803da2`)
+
+midi will not `mkdir` these and will not `git worktree add`.
+systemd-ops will not create them ahead of apply. Worktree-delta
+apply does not create a git worktree and does not copy bytes.
+
 **Observed** - livu `/tmp/tytn-t4-hera-request.md` prepared local
 `cap/*` branches and proposed `author plan-create` packets. Those hops
 assumed the old cherry-pick path and wait on this primitive. midi

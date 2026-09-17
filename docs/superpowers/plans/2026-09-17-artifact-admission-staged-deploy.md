@@ -304,7 +304,11 @@ No em dash, no non-ASCII.
 **Depends:** Tasks 2-6 at minimum. Task 3 if `.66` needs a new cap.
 **Forbidden:** hand-author of livu's proposed units; copying
 `/home/sf/.omp/wt/ayn-66-f6de4bd`; cherry-pick onto runtime; flipping
-`~/.bun/bin/omp` by hand.
+`~/.bun/bin/omp` by hand; `mkdir` or `git worktree add` of
+`/home/sf/worktrees/omp/admit/retry-fallback-unowned` or
+`/home/sf/worktrees/omp/admit/todo-passive-phase` before apply;
+using livu `/home/sf/worktrees/omp/cap/retry-fallback-unowned` or
+`/home/sf/worktrees/omp/cap/todo-passive-phase` as the D1 home.
 
 **Verification:** each specimen has an admit event, a moved
 capability fingerprint, a READY checkpoint that contains the
