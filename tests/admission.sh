@@ -261,6 +261,227 @@ refuse_unchanged "$(jq -nc --arg cap "$CAP" --arg sha "$DELTA_SHA" '{
 [[ ! -e /home/sf/worktrees/omp/admit/todo-passive-phase ]] \
   || fail "classified admit home todo-passive-phase exists"
 
+# Supersedes proofs: throwaway existing capability with one desired input.
+REPLACE_CAP=replace-cap
+REPLACE_STEM=managed-omp-cap-$REPLACE_CAP
+REPLACE_HOME=$SCOPE/.systemd-ops/operations/$REPLACE_STEM
+REPLACE_DESIRED=$REPLACE_HOME/state/desired-inputs.json
+REPLACE_UNIT=$UNIT_DIR/$REPLACE_STEM.service
+REPLACE_OLD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+REPLACE_NEW=cccccccccccccccccccccccccccccccccccccccc
+
+mkdir -p "$REPLACE_HOME"
+cp "$HOME_DIR/automation.toml" "$REPLACE_HOME/automation.toml"
+cat >"$REPLACE_UNIT" <<EOF
+# Managed by systemd-ops
+[Unit]
+Description=$REPLACE_CAP
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+WorkingDirectory=$SCOPE
+EOF
+
+cat >"$TMP/bin/git" <<EOF
+#!/bin/sh
+printf '%s\\n' "\$*" >>"$TMP/git.log"
+case " \$* " in
+  *" worktree add "*)
+    echo "git worktree add is forbidden in admission proof" >&2
+    exit 1
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+chmod 755 "$TMP/bin/git"
+
+cat >"$TMP/bin/systemctl" <<EOF
+#!/bin/sh
+unit_dir=$UNIT_DIR
+while [ "\${1:-}" = --user ]; do shift; done
+case " \$* " in
+  *" list-unit-files "*)
+    printf '['
+    sep=
+    for f in "\$unit_dir"/*; do
+      [ -f "\$f" ] || continue
+      printf '%s{"unit_file":"%s","state":"static","preset":"enabled"}' "\$sep" "\$(basename "\$f")"
+      sep=,
+    done
+    printf ']\\n'
+    ;;
+  *" list-units "*|*" list-timers "*)
+    printf '%s\\n' '[]'
+    ;;
+  *" show "*)
+    unit=\${*##* }
+    printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nFragmentPath=%s/%s\\n' "\$unit_dir" "\$unit"
+    ;;
+  *)
+    printf '%s\\n' '[]'
+    ;;
+esac
+EOF
+chmod 755 "$TMP/bin/systemctl"
+
+replace_unit_hash=$(file_hash "$REPLACE_UNIT")
+replace_meta_hash=$(file_hash "$REPLACE_HOME/automation.toml")
+export SYSTEMD_OPS_OPERATION=$REPLACE_STEM
+
+REPLACE_OLD_SPEC=$(jq -nc --arg rev "$REPLACE_OLD" --arg cap "$REPLACE_CAP" '{
+  version: 1,
+  originating_work: "omp-tytn.6",
+  artifact_revision: $rev,
+  capability: $cap
+}')
+applied=$(admit_apply "$REPLACE_OLD_SPEC")
+ok "$applied"
+jq -e --arg rev "$REPLACE_OLD" '
+  .version == 1 and
+  (.inputs | length) == 1 and
+  .inputs[0].artifact_identity == $rev
+' "$REPLACE_DESIRED" >/dev/null || fail "replace-cap seed: $(cat "$REPLACE_DESIRED")"
+
+replace_before=$(json automation observe)
+ok "$replace_before"
+replace_fp=$(jq -er '.data.observation.input_fingerprint' <<<"$replace_before")
+before_replace_files=$(find "$SCOPE" "$UNIT_DIR" -type f | sort)
+
+REPLACE_SPEC=$(jq -nc --arg rev "$REPLACE_NEW" --arg old "$REPLACE_OLD" --arg cap "$REPLACE_CAP" '{
+  version: 1,
+  originating_work: "omp-tytn.6",
+  artifact_revision: $rev,
+  capability: $cap,
+  supersedes: $old
+}')
+applied=$(admit_apply "$REPLACE_SPEC")
+ok "$applied"
+jq -e --arg rev "$REPLACE_NEW" --arg old "$REPLACE_OLD" '
+  .version == 1 and
+  (.inputs | length) == 1 and
+  .inputs[0].originating_work == "omp-tytn.6" and
+  .inputs[0].artifact_kind == "commit" and
+  .inputs[0].artifact_revision == $rev and
+  .inputs[0].artifact_identity == $rev and
+  (.inputs[0].admitted_at | type == "string") and
+  (.inputs | map(.artifact_identity) | index($old) | not)
+' "$REPLACE_DESIRED" >/dev/null || fail "supersedes desired-inputs: $(cat "$REPLACE_DESIRED")"
+
+replace_after=$(json automation observe)
+ok "$replace_after"
+replace_fp_after=$(jq -er '.data.observation.input_fingerprint' <<<"$replace_after")
+[[ $replace_fp_after != "$replace_fp" ]] || fail "supersedes did not move input_fingerprint"
+
+[[ $(file_hash "$REPLACE_UNIT") == "$replace_unit_hash" ]] || fail "supersedes rewrote the unit"
+[[ $(file_hash "$REPLACE_HOME/automation.toml") == "$replace_meta_hash" ]] || fail "supersedes rewrote automation.toml"
+
+after_replace_files=$(find "$SCOPE" "$UNIT_DIR" -type f | sort)
+[[ $after_replace_files == "$before_replace_files" ]] \
+  || fail "supersedes wrote extra files: $(comm -13 <(printf '%s\n' "$before_replace_files") <(printf '%s\n' "$after_replace_files"))"
+
+if [[ -f $TMP/git.log ]]; then
+  grep -F 'worktree add' "$TMP/git.log" \
+    && fail "supersedes invoked git worktree add: $(cat "$TMP/git.log")"
+fi
+
+replace_bytes=$(cat "$REPLACE_DESIRED")
+replace_refuse() {
+  local spec=$1 label=$2
+  local out
+  out=$(admit "$spec" || true)
+  rejected "$out"
+  [[ $(cat "$REPLACE_DESIRED") == "$replace_bytes" ]] || fail "$label wrote desired-inputs: $out"
+  [[ $(file_hash "$REPLACE_UNIT") == "$replace_unit_hash" ]] || fail "$label rewrote the unit"
+  [[ $(file_hash "$REPLACE_HOME/automation.toml") == "$replace_meta_hash" ]] || fail "$label rewrote automation.toml"
+}
+
+replace_refuse "$(jq -nc --arg rev "$REPLACE_NEW" --arg cap "$REPLACE_CAP" '{
+  version: 1,
+  originating_work: "omp-tytn.6",
+  artifact_revision: $rev,
+  capability: $cap,
+  supersedes: "not-hex"
+}')" "supersedes not hex"
+
+replace_refuse "$(jq -nc --arg rev "$REPLACE_NEW" --arg cap "$REPLACE_CAP" '{
+  version: 1,
+  originating_work: "omp-tytn.6",
+  artifact_revision: $rev,
+  capability: $cap,
+  supersedes: $rev
+}')" "supersedes equals artifact_identity"
+
+replace_refuse "$(jq -nc --arg rev "$REPLACE_NEW" --arg old "$REPLACE_OLD" --arg cap "$REPLACE_CAP" '{
+  version: 1,
+  originating_work: "omp-tytn.6",
+  artifact_revision: "dddddddddddddddddddddddddddddddddddddddd",
+  capability: $cap,
+  supersedes: $old
+}')" "supersedes identity absent"
+
+ABSENT_CAP=absent-cap
+ABSENT_STEM=managed-omp-cap-$ABSENT_CAP
+absent=$(admit "$(jq -nc --arg cap "$ABSENT_CAP" --arg old "$REPLACE_NEW" '{
+  version: 1,
+  originating_work: "omp-tytn.7",
+  artifact_revision: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  capability: $cap,
+  supersedes: $old
+}')" || true)
+rejected "$absent"
+[[ $(cat "$REPLACE_DESIRED") == "$replace_bytes" ]] || fail "new-cap supersedes wrote replace-cap desired-inputs"
+[[ ! -e $SCOPE/.systemd-ops/operations/$ABSENT_STEM/automation.toml ]]   || fail "new-cap supersedes wrote automation.toml"
+[[ ! -e $UNIT_DIR/$ABSENT_STEM.service ]]   || fail "new-cap supersedes created a unit"
+[[ ! -e $SCOPE/.systemd-ops/operations/$ABSENT_STEM/state/desired-inputs.json ]]   || fail "new-cap supersedes wrote desired-inputs"
+
+REPLACE_APPEND=ffffffffffffffffffffffffffffffffffffffff
+applied=$(admit_apply "$(jq -nc --arg rev "$REPLACE_APPEND" --arg cap "$REPLACE_CAP" '{
+  version: 1,
+  originating_work: "omp-tytn.6",
+  artifact_revision: $rev,
+  capability: $cap
+}')")
+ok "$applied"
+jq -e --arg first "$REPLACE_NEW" --arg second "$REPLACE_APPEND" '
+  .version == 1 and
+  (.inputs | length) == 2 and
+  .inputs[0].artifact_identity == $first and
+  .inputs[1].artifact_identity == $second and
+  .inputs[0].originating_work == "omp-tytn.6" and
+  .inputs[1].originating_work == "omp-tytn.6"
+' "$REPLACE_DESIRED" >/dev/null || fail "second admit without supersedes did not append: $(cat "$REPLACE_DESIRED")"
+[[ $(file_hash "$REPLACE_UNIT") == "$replace_unit_hash" ]] || fail "append without supersedes rewrote the unit"
+
+replace_bytes=$(cat "$REPLACE_DESIRED")
+replace_refuse "$(jq -nc --arg rev "$REPLACE_APPEND" --arg old "$REPLACE_NEW" --arg cap "$REPLACE_CAP" '{
+  version: 1,
+  originating_work: "omp-tytn.6",
+  artifact_revision: $rev,
+  capability: $cap,
+  supersedes: $old
+}')" "replacement already exists as another entry"
+
+REPLACE_INPLACE=9999999999999999999999999999999999999999
+applied=$(admit_apply "$(jq -nc --arg rev "$REPLACE_INPLACE" --arg old "$REPLACE_NEW" --arg cap "$REPLACE_CAP" '{
+  version: 1,
+  originating_work: "omp-tytn.6",
+  artifact_revision: $rev,
+  capability: $cap,
+  supersedes: $old
+}')")
+ok "$applied"
+jq -e --arg first "$REPLACE_INPLACE" --arg second "$REPLACE_APPEND" '
+  .version == 1 and
+  (.inputs | length) == 2 and
+  .inputs[0].artifact_identity == $first and
+  .inputs[1].artifact_identity == $second
+' "$REPLACE_DESIRED" >/dev/null || fail "supersedes did not replace in place: $(cat "$REPLACE_DESIRED")"
+[[ $(file_hash "$REPLACE_UNIT") == "$replace_unit_hash" ]] || fail "in-place supersedes rewrote the unit"
+
+export SYSTEMD_OPS_OPERATION=$STEM
+
 echo "admission existing-capability ok"
 
 # New-capability half. Same throwaway scope; no oh-my-pi writes.

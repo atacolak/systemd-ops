@@ -1920,6 +1920,31 @@ struct AdmitSpec {
     artifact_revision: Option<String>,
     base: Option<String>,
     delta: Option<Vec<DeltaFile>>,
+    supersedes: Option<String>,
+}
+
+fn parse_supersedes(spec: &Value, artifact_identity: &str) -> Result<Option<String>, BackendError> {
+    match spec.get("supersedes") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            let valid = matches!(value.len(), 40 | 64)
+                && value
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+            if !valid {
+                return Err(BackendError(
+                    "supersedes must be 40 or 64 lowercase hex".into(),
+                ));
+            }
+            if value == artifact_identity {
+                return Err(BackendError(
+                    "supersedes must not equal the new artifact_identity".into(),
+                ));
+            }
+            Ok(Some(value.clone()))
+        }
+        Some(_) => Err(BackendError("supersedes must be a string".into())),
+    }
 }
 
 fn lowercase_hex(label: &str, value: &str, len: usize) -> Result<String, BackendError> {
@@ -2046,14 +2071,17 @@ fn parse_admit_spec(spec: &Value) -> Result<AdmitSpec, BackendError> {
             .and_then(Value::as_str)
             .ok_or_else(|| BackendError("missing required argument: artifact_revision".into()))?;
         let artifact_revision = lowercase_hex("artifact_revision", revision, 40)?;
+        let artifact_identity = artifact_revision.clone();
+        let supersedes = parse_supersedes(spec, &artifact_identity)?;
         return Ok(AdmitSpec {
             originating_work,
             capability,
             artifact_kind: "commit".into(),
-            artifact_identity: artifact_revision.clone(),
+            artifact_identity,
             artifact_revision: Some(artifact_revision),
             base: None,
             delta: None,
+            supersedes,
         });
     }
     let base = spec
@@ -2090,6 +2118,7 @@ fn parse_admit_spec(spec: &Value) -> Result<AdmitSpec, BackendError> {
         });
     }
     let artifact_identity = worktree_delta_identity(&base, &delta);
+    let supersedes = parse_supersedes(spec, &artifact_identity)?;
     Ok(AdmitSpec {
         originating_work,
         capability,
@@ -2098,6 +2127,7 @@ fn parse_admit_spec(spec: &Value) -> Result<AdmitSpec, BackendError> {
         artifact_revision: None,
         base: Some(base),
         delta: Some(delta),
+        supersedes,
     })
 }
 
@@ -2211,6 +2241,37 @@ pub fn plan_admit(
     }
     let desired_path = desired_inputs_path(&manifest.root, &stem);
     let desired_snapshot = snapshot(&desired_path);
+    if let Some(supersedes) = admit.supersedes.as_deref() {
+        let unit_path = systemd::unit_file_dir().join(format!("{stem}.service"));
+        if !unit_path.is_file() || !desired_path.is_file() {
+            return Err(BackendError(
+                "supersedes is existing-capability only".into(),
+            ));
+        }
+        let bytes = read_optional_bytes(&desired_path)?.ok_or_else(|| {
+            BackendError("supersedes is existing-capability only".into())
+        })?;
+        let desired = serde_json::from_slice::<DesiredInputsFile>(&bytes).map_err(|error| {
+            BackendError(format!("malformed desired-inputs.json: {error}"))
+        })?;
+        if !desired
+            .inputs
+            .iter()
+            .any(|input| input.artifact_identity == supersedes)
+        {
+            return Err(BackendError(
+                "supersedes identity is absent from desired-inputs".into(),
+            ));
+        }
+        if desired.inputs.iter().any(|input| {
+            input.originating_work == admit.originating_work
+                && input.artifact_identity == admit.artifact_identity
+        }) {
+            return Err(BackendError(
+                "supersedes refused: replacement already exists as another entry".into(),
+            ));
+        }
+    }
     let cfg = crate::config::current_or_load()?;
     let payload = json!({
         "action": "admit",
@@ -2222,6 +2283,7 @@ pub fn plan_admit(
         "artifact_revision": admit.artifact_revision,
         "base": admit.base,
         "delta": admit.delta,
+        "supersedes": admit.supersedes,
         "desired_inputs_snapshot": snapshot_json(&desired_snapshot),
     });
     let (plan_token, sealed) = token::mint(
@@ -2258,6 +2320,15 @@ fn apply_admit(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Bac
         .get("scope_root")
         .and_then(Value::as_str)
         .ok_or_else(|| BackendError("invalid automation plan token".into()))?;
+    if plan.payload.get("supersedes").and_then(Value::as_str).is_some() {
+        let unit_path = systemd::unit_file_dir().join(format!("{}.service", plan.unit));
+        let desired_path = Path::new(&snapshot.path);
+        if !unit_path.is_file() || !desired_path.is_file() {
+            return Err(BackendError(
+                "supersedes is existing-capability only".into(),
+            ));
+        }
+    }
     if load_metadata(Path::new(scope_root), &plan.unit)?.is_none() {
         let capability = plan
             .payload
@@ -2304,10 +2375,22 @@ fn apply_admit(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Bac
             "desired-inputs.json version must be 1".into(),
         ));
     }
+    let supersedes = match plan.payload.get("supersedes") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => return Err(BackendError("invalid automation plan token".into())),
+    };
     let duplicate = desired.inputs.iter().any(|input| {
         input.originating_work == originating_work && input.artifact_identity == artifact_identity
     });
-    if !duplicate {
+    let replace_at = if let Some(supersedes) = supersedes {
+        Some(desired.inputs.iter().position(|input| input.artifact_identity == supersedes).ok_or_else(
+            || BackendError("supersedes identity is absent from desired-inputs".into()),
+        )?)
+    } else {
+        None
+    };
+    if replace_at.is_some() || !duplicate {
         let artifact_kind = plan
             .payload
             .get("artifact_kind")
@@ -2330,7 +2413,7 @@ fn apply_admit(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Bac
                 BackendError("invalid automation plan token".into())
             })?),
         };
-        desired.inputs.push(DesiredInput {
+        let entry = DesiredInput {
             originating_work: originating_work.to_string(),
             artifact_kind,
             artifact_revision,
@@ -2338,7 +2421,21 @@ fn apply_admit(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Bac
             delta,
             artifact_identity: artifact_identity.to_string(),
             admitted_at: crate::config::unix_to_rfc3339(crate::config::now_unix()),
-        });
+        };
+        if let Some(index) = replace_at {
+            if desired.inputs.iter().enumerate().any(|(other, input)| {
+                other != index
+                    && input.originating_work == originating_work
+                    && input.artifact_identity == artifact_identity
+            }) {
+                return Err(BackendError(
+                    "supersedes refused: replacement already exists as another entry".into(),
+                ));
+            }
+            desired.inputs[index] = entry;
+        } else {
+            desired.inputs.push(entry);
+        }
         atomic_write(path, &serialize_pretty(&desired)?)?;
     }
     Ok(json!({
@@ -2346,7 +2443,7 @@ fn apply_admit(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Bac
         "unit": plan.unit,
         "action": "admit",
         "applied": true,
-        "noop": duplicate,
+        "noop": replace_at.is_none() && duplicate,
         "desired_inputs": snapshot.path,
     }))
 }
