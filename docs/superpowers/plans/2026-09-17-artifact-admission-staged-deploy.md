@@ -95,11 +95,14 @@ automation::` passes.
 
 **Verification:** `tests/admission.sh` creates a fake owned capability
 home with `automation.toml`, calls `plan-admit` + `apply` with a valid
-triple, and asserts `desired-inputs.json` gained exactly one entry and
-`automation observe` moved `input_fingerprint`. A second identical
-admit is a no-op (same bytes, same hash). `overseer` as
-`originating_work` or `capability` is refused with no write. Malformed
-revision (not 40 hex) is refused. No unit is created or rewritten.
+commit triple, and asserts `desired-inputs.json` gained exactly one
+entry and `automation observe` moved `input_fingerprint`. A second
+identical admit is a no-op (same bytes, same hash). The same proof
+repeats with `artifact_kind=worktree-delta` (base + one file sha256);
+duplicate identity is a no-op. `overseer` as `originating_work` or
+`capability` is refused with no write. Malformed revision (not 40
+hex), mixed kinds, empty delta, and a `..` path are refused. No unit
+is created or rewritten.
 
 - [ ] **Step 1: Write the failing proof**
 - [ ] **Step 2: Make the proof pass**
@@ -128,6 +131,8 @@ with `agent=capability-maintainer` and
 `parent=managed-omp-runtime-integrator`, writes the first desired
 input, and leaves the timer enabled. A colliding `capability:` tag
 with a sibling is refused. `fork/cap/<id>` is not pushed.
+Worktree-delta of a new capability copies no bytes and does not
+`git worktree add` from the classified tree.
 
 - [ ] **Step 1: Write the failing proof**
 - [ ] **Step 2: Make the proof pass**
@@ -278,8 +283,8 @@ unit. The empty-delta command is the existing
 **Verification:** `automation inspect` on a fixture runtime unit
 returns `deployment.phase` and `deployment.stall`. `scope show`
 attention contains `canary_pending` for a candidate with pending
-canary and `admission_unconsumed` for a cap whose desired revision
-is not an ancestor of HEAD. The topology file (in-repo copy) has no
+canary and `admission_unconsumed` for a cap whose desired commit is
+not an ancestor of HEAD or whose worktree-delta hashes do not match. The topology file (in-repo copy) has no
 `PR [0-9]`, no `managed-omp-pr-`, and no concrete capability
 instance names; it describes the two loops from the charter.
 `docs/TESTING.md` names every new `tests/*.sh` added by Tasks 2-8.
@@ -307,7 +312,7 @@ admitted revision, a candidate `deployment.json` that did not flip
 `current`, a midi canary ACK, a promote that did, and occupancy
 rows. Product-close happens after rollout, not after compose.
 
-- [ ] **Step 1: midi supplies the `.66` triple and invokes admit**
+- [ ] **Step 1: midi supplies the `.66` worktree-delta and invokes admit**
 - [ ] **Step 2: maintainer consumes; compose candidates; midi canaries**
 - [ ] **Step 3: promote + occupancy; then repeat for `omp-vuz.1`**
 

@@ -89,9 +89,10 @@ no canary-ack verb.
 nests an author plan token and writes `automation.toml` on apply. That
 is the composition admission must reuse. Do not add a second unit writer.
 
-**Observed** - `automation.toml` is read at `src/automation.rs:220` and
-has no other write site in Rust besides the automation apply path.
-Drivers never write it.
+**Observed** - `src/automation.rs:219-221` is the `metadata_path`
+helper (operation home plus `automation.toml`). The load is
+`load_metadata` via `brain_revision` (`:1010-1033`). The write is the
+automation apply path. Drivers never write it.
 
 ### Capability no-op / empty-delta already exists
 
@@ -130,18 +131,40 @@ manually rescue it. Then `omp-vuz.1` on the same path.
 **Observed** - that worktree is detached at
 `969062200754ea02cfac922e5ebb8c608c079e15` with uncommitted edits in
 `packages/coding-agent/src/session/retry-fallback-chains.ts` and
-`packages/coding-agent/test/retry-fallback.test.ts`. The verified
-revision midi will pass to admit may differ from that HEAD. This spec
-does not pick the sha.
+`packages/coding-agent/test/retry-fallback.test.ts`.
+
+**Observed** - midi #98551 classification (recorded, not invented):
+
+- `.66` is a NEW capability `retry-fallback-unowned`.
+  `originating_work` is `omp-actor-bridge-ayn.66`. The verified
+  artifact is the uncommitted delta, so there is no 40-hex
+  `artifact_revision`. midi published md5
+  `09a69cffff3d91f6c93bcff08af0be1a` (chains.ts) and
+  `ab012925df6c70c059256c3c082cd85e` (retry-fallback.test.ts).
+  Re-read matched. Content sha256 of those two files at classify
+  time:
+  `a94bf2596c9533e313250b9e79680da3de25187e28ee79e7bf43d88a7571020d`
+  and
+  `02f5d7157dc21318b8022fb63675f9baf9bc96dab307ff42d9667dcacfa1e1f0`.
+  Not `.67` / `explicit-model-fallback-or-fail`. Not any live cap.
+  Keep `74bb202b88`. `review-ayn-66b` PASS.
+- `omp-vuz.1` is a NEW capability `todo-passive-phase`.
+  `originating_work` is `omp-vuz.1`. midi classified tip
+  `76643a6871e1a17c4a199564df95e73490b1060a`. Observed
+  `feat/todo-passive-phase` HEAD at record time
+  `95fba1fc88f5999730a76d57963d99f7956dbb48` (classified tip is an
+  ancestor). This spec does not pick the sha. The second specimen
+  waits until `.66` proves candidate -> canary -> promote ->
+  rollout -> live-proof.
 
 **Observed** - livu `/tmp/tytn-t4-hera-request.md` prepared local
 `cap/*` branches and proposed `author plan-create` packets. Those hops
-assumed the old cherry-pick path and wait on this primitive. This spec
-forbids hand-authoring those units on the old path.
+assumed the old cherry-pick path and wait on this primitive. midi
+#98551: do not consume livu `cap/*` trees. Those local shas are not
+admission artifacts. This spec forbids hand-authoring those units on
+the old path.
 
-**Unknown** - midi's exact `(originating_work, artifact_revision,
-capability)` triple for `.66` and for `omp-vuz.1`. The verbs accept
-the triple; they do not classify.
+The verbs accept the classified artifact. They do not classify.
 
 ## Decisions
 
@@ -154,7 +177,11 @@ One sealed-token family, no driver-only path, no second unit writer.
     systemd-ops --json --manager user --scope-root <scope> \
       automation apply --plan-token <token>
 
-`--spec` is one JSON object:
+`--spec` is one JSON object. Two artifact kinds. Default kind when
+`artifact_kind` is omitted is `commit` (the invoke already sent to
+midi stays valid).
+
+Commit form:
 
     {
       "version": 1,
@@ -163,15 +190,45 @@ One sealed-token family, no driver-only path, no second unit writer.
       "capability": "<capability identity>"
     }
 
+Worktree-delta form (required for an uncommitted verified delta):
+
+    {
+      "version": 1,
+      "originating_work": "<bead or epic id>",
+      "capability": "<capability identity>",
+      "artifact_kind": "worktree-delta",
+      "base": "<40 lowercase hex>",
+      "delta": [
+        {"path": "<repo-relative file>", "sha256": "<64 lowercase hex>"}
+      ]
+    }
+
 Optional, new-capability only:
 
       "worktree": "<absolute path>"
+
+`worktree` names the capability home. It is not a copy source.
 
 Charset:
 
 - `originating_work`: `[A-Za-z0-9_.:-]+`, 1..80
 - `capability`: `[A-Za-z0-9_-]+`, 1..50
-- `artifact_revision`: exactly 40 `[0-9a-f]`
+- `artifact_revision` / `base`: exactly 40 `[0-9a-f]`
+- `artifact_kind`: `commit` or `worktree-delta`
+- each `delta[].path`: relative, 1..200, printable ASCII, no NUL,
+  no leading `/`, no `..` component
+- each `delta[].sha256`: exactly 64 `[0-9a-f]`
+- `delta`: 1..32 entries, paths unique
+
+`artifact_identity` is the duplicate key (with `originating_work`):
+
+- commit: the 40-hex `artifact_revision`
+- worktree-delta: `sha256` of these UTF-8 bytes, paths sorted
+  bytewise, each line terminated by a newline:
+
+      worktree-delta
+      base=<40 hex>
+      <path>=<64 hex>
 
 `capability` is the product identity (`retry-fallback-unowned`), not a
 unit stem. systemd-ops maps it:
@@ -185,9 +242,9 @@ unit stem. systemd-ops maps it:
 MCP tools, if added, wrap these two verbs only. They do not grow a
 third write path.
 
-Existing capability: apply appends the triple to
+Existing capability: apply appends the entry to
 `operations/<unit>/state/desired-inputs.json`, refuses a duplicate
-`(originating_work, artifact_revision)`, and does not rewrite the unit.
+`(originating_work, artifact_identity)`, and does not rewrite the unit.
 
 New capability: apply composes, in one `write::apply`:
 
@@ -201,19 +258,26 @@ New capability: apply composes, in one `write::apply`:
 
 `worktree` is required for a new capability when the scope has no
 `capability_worktree_root` in `scope.toml`. Default, when that key is
-present: `<capability_worktree_root>/<capability>`. The verb creates
-the detached worktree at `artifact_revision` only when the directory
-does not already exist. It does not push `fork/cap/<capability>`.
-Push remains Ata's product gate; a child whose `capability-observe`
-cannot resolve `fork/$BRANCH` stays unready, which is existing
-observer behaviour, not a new rule.
+present: `<capability_worktree_root>/<capability>`. Commit form:
+the verb creates the detached worktree at `artifact_revision` only
+when the directory does not already exist. Worktree-delta form:
+apply does not create a git worktree and does not copy file bytes
+from the classified tree or from `worktree`. It writes the unit
+(when new), `automation.toml`, `desired-inputs.json`, and starts
+the timer. The maintainer reconciles HOW. It does not push
+`fork/cap/<capability>`. Push remains Ata's product gate; a child
+whose `capability-observe` cannot resolve `fork/$BRANCH` stays
+unready, which is existing observer behaviour, not a new rule.
 
 Refuse:
 
 - missing or malformed fields (rc 2, no write)
+- `artifact_kind=worktree-delta` together with `artifact_revision`
+- `artifact_kind=commit` (or omitted) without `artifact_revision`
+- `worktree-delta` without `base` or with an empty/malformed `delta`
 - `overseer` as `originating_work` or `capability`
 - a capability identity that collides on `capability:` or `branch:`
-  tags with a live sibling (`runtime-reconcile:24-35` already exits 4)
+  tags with a live sibling (`runtime-reconcile:28-40` already exits 4)
 - apply without a matching sealed token
 
 ### D2. Desired artifacts enter the observation hash
@@ -227,7 +291,17 @@ File, per capability operation:
       "inputs": [
         {
           "originating_work": "...",
-          "artifact_revision": "...",
+          "artifact_kind": "commit",
+          "artifact_revision": "<40 hex>",
+          "artifact_identity": "<40 hex>",
+          "admitted_at": "<RFC3339>"
+        },
+        {
+          "originating_work": "...",
+          "artifact_kind": "worktree-delta",
+          "base": "<40 hex>",
+          "delta": [{"path": "...", "sha256": "<64 hex>"}],
+          "artifact_identity": "<64 hex>",
           "admitted_at": "<RFC3339>"
         }
       ]
@@ -246,9 +320,9 @@ when it is present. Adding or removing a revision therefore moves
 hash, so the formula change is not a fleet-wide reprocess.
 
 The capability maintainer reads `desired-inputs.json` as the set of
-revisions it must reconcile into `cap/<capability>` against the current
+artifacts it must reconcile into `cap/<capability>` against the current
 upstream generation. How it reconciles is the maintainer's job. This
-spec does not cherry-pick.
+spec does not cherry-pick and does not copy a classified worktree.
 
 Upstream generation changes still come from the observer's
 `world_fingerprint` / `generation`. Desired artifacts stay constant
@@ -368,7 +442,7 @@ HCOM or `/proc` to build the cohort.
 
 After promote, phase becomes `rolling_out`. It becomes `converged`
 when every occupancy row is either acked on the promoted generation
-or `state=retired` / `state=stopped` and not in a required-live set.
+or `state=retired` / `state=stopped`.
 Stopped and retired are not eternal blockers.
 
     automation plan-deploy-gc --generation <40 hex>
@@ -456,8 +530,11 @@ drop that source from runtime membership (the child is gone, so
 
 `automation inspect --unit managed-omp-cap-<capability>` gains
 `desired_inputs` equal to the file (or null) and
-`desired_unconsumed` true when any admitted revision is not an
-ancestor of the capability HEAD.
+`desired_unconsumed` true when any admitted commit revision is not
+an ancestor of the capability HEAD, or any admitted worktree-delta
+has a named path whose bound capability-worktree file is missing or
+whose sha256 does not match. A missing capability worktree is
+unconsumed.
 
 `scope show` attention, runtime-integrator only:
 
@@ -481,11 +558,14 @@ without reading journals.
 Hermetic proofs, no live oh-my-pi writes:
 
 - `src/automation.rs` unit: fingerprint absent file equals today's
-  hash; present file moves the hash; refuse malformed admit spec;
-  refuse `overseer`; duplicate triple is a no-op write
-- `tests/admission.sh`: existing capability desired-inputs write;
-  new capability creates unit + `automation.toml` + first input +
-  timer enabled; both through plan/apply
+  hash; present file moves the hash; refuse malformed admit spec
+  (bad hex, mixed kinds, empty delta, `..` path); refuse
+  `overseer`; duplicate `(originating_work, artifact_identity)` is
+  a no-op write
+- `tests/admission.sh`: existing capability desired-inputs write
+  for both kinds; new capability creates unit + `automation.toml`
+  + first input + timer enabled; worktree-delta apply copies no
+  bytes and does not `git worktree add`; both through plan/apply
 - `tests/runtime-generation-publish.sh`: rewrite the current-flip
   pins. Candidate READY must leave `generations/current` and the omp
   install on the previous promoted generation. A separate promote
@@ -512,8 +592,10 @@ it (named in `docs/TESTING.md` in the same commit that adds them).
 ### D10. Dogfood order
 
 1. midi classifies `.66` and invokes `plan-admit` + `apply` with the
-   real triple. systemd-ops does not invent the sha and does not
-   copy `/home/sf/.omp/wt/ayn-66-f6de4bd` by hand.
+   worktree-delta form (base + file sha256s). systemd-ops does not
+   invent a commit sha and does not copy
+   `/home/sf/.omp/wt/ayn-66-f6de4bd` by hand. `omp-vuz.1` uses the
+   commit form after midi picks the revision.
 2. The capability maintainer consumes the desired input and emits a
    READY checkpoint. hera does not cherry-pick.
 3. Runtime compose builds candidate G, notifies midi, does not flip
