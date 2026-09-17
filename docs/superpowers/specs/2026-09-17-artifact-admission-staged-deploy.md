@@ -504,8 +504,13 @@ Two queries, one record:
 - "why can <sha> not be GC'd?" = `retained[sha].reasons`
 
 Canary ACK `generation` / `observed_generation` are this
-identity sha, not `compose_generation`. midi confirms or
-rejects this identity before Task 5/6 land.
+identity sha, not `compose_generation`. midi 2026-09-17
+classified: identity is `output_revision`; actor observation
+and occupancy apply bind the field names above;
+`--generation` takes this sha, never compose. Task 5/6
+land on this record. Midi owns actor observation (beads
+`.92` / `.93` / `.95`); systemd-ops does not implement
+that hop.
 
 
 `runtime-run` after READY postconditions and a successful
