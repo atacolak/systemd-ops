@@ -244,6 +244,10 @@ pub fn fingerprint_path(root: &Path, stem: &str) -> PathBuf {
     operation_home(root, stem).join("state/fingerprint")
 }
 
+pub fn desired_inputs_path(root: &Path, stem: &str) -> PathBuf {
+    operation_home(root, stem).join("state/desired-inputs.json")
+}
+
 fn validate_agent_name(name: &str) -> Result<(), BackendError> {
     let valid = !name.is_empty()
         && name.len() <= 64
@@ -327,8 +331,16 @@ pub fn parse_observer_payload(bytes: &[u8]) -> Result<ObserverPayload, BackendEr
     })
 }
 
-pub fn effective_input_fingerprint(world_fingerprint: &str, brain_revision: &str) -> String {
-    sha256_hex(format!("world={world_fingerprint}\nbrain={brain_revision}\n").as_bytes())
+pub fn effective_input_fingerprint(
+    world_fingerprint: &str,
+    brain_revision: &str,
+    desired_inputs: Option<&[u8]>,
+) -> String {
+    let mut material = format!("world={world_fingerprint}\nbrain={brain_revision}\n");
+    if let Some(bytes) = desired_inputs {
+        material.push_str(&format!("desired={}\n", sha256_hex(bytes)));
+    }
+    sha256_hex(material.as_bytes())
 }
 
 fn normalize_metadata(
@@ -709,11 +721,16 @@ pub fn write_observation(
     generation: Option<&str>,
 ) -> Result<Value, BackendError> {
     let (manifest, stem) = crate::operator::bound_operation_manifest(explicit_root, cwd)?;
+    let desired_bytes = read_optional_bytes(&desired_inputs_path(&manifest.root, &stem))?;
     let observation = Observation {
         version: 1,
         world_fingerprint: validate_observer_value("world_fingerprint", world_fingerprint)?,
         brain_revision: validate_observer_value("brain_revision", brain_revision)?,
-        input_fingerprint: effective_input_fingerprint(world_fingerprint, brain_revision),
+        input_fingerprint: effective_input_fingerprint(
+            world_fingerprint,
+            brain_revision,
+            desired_bytes.as_deref(),
+        ),
         generation: generation
             .map(|value| validate_observer_value("generation", value))
             .transpose()?,
@@ -3144,9 +3161,81 @@ mod tests {
         assert!(
             parse_observer_payload(b"{\"version\":1,\"world_fingerprint\":\"a\\nb\"}").is_err()
         );
-        let first = effective_input_fingerprint("world-a", "brain-a");
-        assert_eq!(first, effective_input_fingerprint("world-a", "brain-a"));
-        assert_ne!(first, effective_input_fingerprint("world-a", "brain-b"));
+        let first = effective_input_fingerprint("world-a", "brain-a", None);
+        assert_eq!(first, effective_input_fingerprint("world-a", "brain-a", None));
+        assert_ne!(first, effective_input_fingerprint("world-a", "brain-b", None));
+    }
+
+    #[test]
+    fn effective_input_without_desired_inputs_matches_world_brain_formula() {
+        let expected = sha256_hex(b"world=world-a\nbrain=brain-a\n");
+        assert_eq!(
+            effective_input_fingerprint("world-a", "brain-a", None),
+            expected
+        );
+    }
+
+    #[test]
+    fn write_observation_hashes_desired_inputs_file_bytes_when_present() {
+        let root = tmp_root("desired-inputs-hash");
+        with_bound_operation(&root, "managed-proof", || {
+            write_parent_fixture(&root, "managed-proof", None);
+            let expected_absent = sha256_hex(b"world=world-a\nbrain=brain-a\n");
+            let absent = write_observation(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                "world-a",
+                "brain-a",
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                absent["observation"]["input_fingerprint"].as_str(),
+                Some(expected_absent.as_str())
+            );
+
+            let desired_path =
+                operation_home(&root, "managed-proof").join("state/desired-inputs.json");
+            let desired_bytes = br#"{"version":1,"inputs":[{"originating_work":"work-a"}]}"#;
+            fs::create_dir_all(desired_path.parent().unwrap()).unwrap();
+            fs::write(&desired_path, desired_bytes).unwrap();
+
+            let present = write_observation(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                "world-a",
+                "brain-a",
+                None,
+            )
+            .unwrap();
+            let present_hex = present["observation"]["input_fingerprint"]
+                .as_str()
+                .expect("input_fingerprint");
+            assert_ne!(present_hex, expected_absent);
+            let expected_present = sha256_hex(
+                format!(
+                    "world=world-a\nbrain=brain-a\ndesired={}\n",
+                    sha256_hex(desired_bytes)
+                )
+                .as_bytes(),
+            );
+            assert_eq!(present_hex, expected_present);
+
+            fs::remove_file(&desired_path).unwrap();
+            let restored = write_observation(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                "world-a",
+                "brain-a",
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                restored["observation"]["input_fingerprint"].as_str(),
+                Some(expected_absent.as_str())
+            );
+        });
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
