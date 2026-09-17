@@ -1883,6 +1883,370 @@ pub fn plan_complete(
     }))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DesiredInputsFile {
+    version: u32,
+    inputs: Vec<DesiredInput>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DesiredInput {
+    originating_work: String,
+    artifact_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta: Option<Vec<DeltaFile>>,
+    artifact_identity: String,
+    admitted_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeltaFile {
+    path: String,
+    sha256: String,
+}
+
+struct AdmitSpec {
+    originating_work: String,
+    capability: String,
+    artifact_kind: String,
+    artifact_identity: String,
+    artifact_revision: Option<String>,
+    base: Option<String>,
+    delta: Option<Vec<DeltaFile>>,
+}
+
+fn lowercase_hex(label: &str, value: &str, len: usize) -> Result<String, BackendError> {
+    let valid = value.len() == len
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    if valid {
+        Ok(value.to_string())
+    } else {
+        Err(BackendError(format!(
+            "{label} must be {len} lowercase hex"
+        )))
+    }
+}
+
+fn validate_originating_work(value: &str) -> Result<String, BackendError> {
+    if value == "overseer" {
+        return Err(BackendError(
+            "overseer is refused as originating_work".into(),
+        ));
+    }
+    let valid = (1..=80).contains(&value.len())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-')
+        });
+    if valid {
+        Ok(value.to_string())
+    } else {
+        Err(BackendError(
+            "originating_work must be 1..80 characters matching [A-Za-z0-9_.:-]".into(),
+        ))
+    }
+}
+
+fn validate_capability_id(value: &str) -> Result<String, BackendError> {
+    if value == "overseer" {
+        return Err(BackendError("overseer is refused as capability".into()));
+    }
+    let valid = (1..=50).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+    if valid {
+        Ok(value.to_string())
+    } else {
+        Err(BackendError(
+            "capability must be 1..50 characters matching [A-Za-z0-9_-]".into(),
+        ))
+    }
+}
+
+fn validate_delta_path(path: &str) -> Result<(), BackendError> {
+    if path.is_empty() || path.len() > 200 {
+        return Err(BackendError("delta path must be 1..200 characters".into()));
+    }
+    if !path.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
+        return Err(BackendError(
+            "delta path must be printable ASCII without NUL".into(),
+        ));
+    }
+    if path.starts_with('/')
+        || path.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(BackendError(
+            "delta path must be relative without a .. component".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn worktree_delta_identity(base: &str, delta: &[DeltaFile]) -> String {
+    let mut files = delta.to_vec();
+    files.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    let mut material = format!("worktree-delta\nbase={base}\n");
+    for file in files {
+        material.push_str(&file.path);
+        material.push('=');
+        material.push_str(&file.sha256);
+        material.push('\n');
+    }
+    sha256_hex(material.as_bytes())
+}
+
+fn parse_admit_spec(spec: &Value) -> Result<AdmitSpec, BackendError> {
+    if !spec.is_object() {
+        return Err(BackendError("admit spec must be an object".into()));
+    }
+    if spec.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err(BackendError("admit spec version must be 1".into()));
+    }
+    let originating_work = spec
+        .get("originating_work")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("missing required argument: originating_work".into()))?;
+    let originating_work = validate_originating_work(originating_work)?;
+    let capability = spec
+        .get("capability")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("missing required argument: capability".into()))?;
+    let capability = validate_capability_id(capability)?;
+    let kind = spec
+        .get("artifact_kind")
+        .and_then(Value::as_str)
+        .unwrap_or("commit");
+    if !matches!(kind, "commit" | "worktree-delta") {
+        return Err(BackendError(
+            "artifact_kind must be commit or worktree-delta".into(),
+        ));
+    }
+    let has_revision = spec
+        .get("artifact_revision")
+        .is_some_and(|value| !value.is_null());
+    let has_base = spec.get("base").is_some_and(|value| !value.is_null());
+    let has_delta = spec.get("delta").is_some_and(|value| !value.is_null());
+    if kind == "worktree-delta" && has_revision || kind == "commit" && (has_base || has_delta) {
+        return Err(BackendError(
+            "admit spec refused: mixed artifact kinds".into(),
+        ));
+    }
+    if kind == "commit" {
+        let revision = spec
+            .get("artifact_revision")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BackendError("missing required argument: artifact_revision".into()))?;
+        let artifact_revision = lowercase_hex("artifact_revision", revision, 40)?;
+        return Ok(AdmitSpec {
+            originating_work,
+            capability,
+            artifact_kind: "commit".into(),
+            artifact_identity: artifact_revision.clone(),
+            artifact_revision: Some(artifact_revision),
+            base: None,
+            delta: None,
+        });
+    }
+    let base = spec
+        .get("base")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("missing required argument: base".into()))?;
+    let base = lowercase_hex("base", base, 40)?;
+    let raw_delta = spec
+        .get("delta")
+        .and_then(Value::as_array)
+        .ok_or_else(|| BackendError("delta must be an array of 1..32 path/sha256 objects".into()))?;
+    if raw_delta.is_empty() || raw_delta.len() > 32 {
+        return Err(BackendError("delta must have 1..32 entries".into()));
+    }
+    let mut delta = Vec::with_capacity(raw_delta.len());
+    let mut seen = BTreeSet::new();
+    for item in raw_delta {
+        let path = item
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BackendError("delta entry path is required".into()))?;
+        validate_delta_path(path)?;
+        if !seen.insert(path.to_string()) {
+            return Err(BackendError("delta paths must be unique".into()));
+        }
+        let sha = item
+            .get("sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BackendError("delta entry sha256 is required".into()))?;
+        let sha256 = lowercase_hex("delta sha256", sha, 64)?;
+        delta.push(DeltaFile {
+            path: path.to_string(),
+            sha256,
+        });
+    }
+    let artifact_identity = worktree_delta_identity(&base, &delta);
+    Ok(AdmitSpec {
+        originating_work,
+        capability,
+        artifact_kind: "worktree-delta".into(),
+        artifact_identity,
+        artifact_revision: None,
+        base: Some(base),
+        delta: Some(delta),
+    })
+}
+
+pub fn plan_admit(
+    args: &Value,
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let spec = args
+        .get("spec")
+        .ok_or_else(|| BackendError("missing required argument: spec".into()))?;
+    let admit = parse_admit_spec(spec)?;
+    let stem = format!("managed-omp-cap-{}", admit.capability);
+    let manifest = resolved_manifest(explicit_root, cwd)?;
+    crate::operator::require_owned(&manifest, &stem)?;
+    load_metadata(&manifest.root, &stem)?.ok_or_else(|| {
+        BackendError(format!(
+            "admit refused: existing capability '{}' has no automation.toml",
+            admit.capability
+        ))
+    })?;
+    let desired_path = desired_inputs_path(&manifest.root, &stem);
+    let desired_snapshot = snapshot(&desired_path);
+    let cfg = crate::config::current_or_load()?;
+    let payload = json!({
+        "action": "admit",
+        "scope_root": manifest.root.to_string_lossy(),
+        "capability": admit.capability,
+        "originating_work": admit.originating_work,
+        "artifact_kind": admit.artifact_kind,
+        "artifact_identity": admit.artifact_identity,
+        "artifact_revision": admit.artifact_revision,
+        "base": admit.base,
+        "delta": admit.delta,
+        "desired_inputs_snapshot": snapshot_json(&desired_snapshot),
+    });
+    let (plan_token, sealed) = token::mint(
+        &cfg,
+        PlanClass::Automation,
+        &stem,
+        cwd.map(str::to_string),
+        payload,
+    )?;
+    Ok(json!({
+        "plan_token": plan_token,
+        "class": "automation",
+        "unit": stem,
+        "action": "admit",
+        "issued_at": crate::config::unix_to_rfc3339(sealed.issued_at),
+        "expires_at": crate::config::unix_to_rfc3339(sealed.expires_at),
+        "capability": admit.capability,
+        "originating_work": admit.originating_work,
+        "artifact_kind": admit.artifact_kind,
+        "artifact_identity": admit.artifact_identity,
+        "note": "nothing has been executed; apply with the plan_token",
+    }))
+}
+
+fn apply_admit(plan: &token::SealedPlan) -> Result<Value, BackendError> {
+    let snapshot = snapshot_from_json(
+        plan.payload
+            .get("desired_inputs_snapshot")
+            .ok_or_else(|| BackendError("invalid automation plan token".into()))?,
+    )?;
+    require_snapshot_fresh(&snapshot)?;
+    let scope_root = plan
+        .payload
+        .get("scope_root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("invalid automation plan token".into()))?;
+    load_metadata(Path::new(scope_root), &plan.unit)?.ok_or_else(|| {
+        BackendError(format!(
+            "admit refused: '{}' has no automation.toml",
+            plan.unit
+        ))
+    })?;
+    let originating_work = plan
+        .payload
+        .get("originating_work")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("invalid automation plan token".into()))?;
+    let artifact_identity = plan
+        .payload
+        .get("artifact_identity")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("invalid automation plan token".into()))?;
+    let path = Path::new(&snapshot.path);
+    let mut desired = match read_optional_bytes(path)? {
+        Some(bytes) => serde_json::from_slice::<DesiredInputsFile>(&bytes).map_err(|error| {
+            BackendError(format!("malformed desired-inputs.json: {error}"))
+        })?,
+        None => DesiredInputsFile {
+            version: 1,
+            inputs: Vec::new(),
+        },
+    };
+    if desired.version != 1 {
+        return Err(BackendError(
+            "desired-inputs.json version must be 1".into(),
+        ));
+    }
+    let duplicate = desired.inputs.iter().any(|input| {
+        input.originating_work == originating_work && input.artifact_identity == artifact_identity
+    });
+    if !duplicate {
+        let artifact_kind = plan
+            .payload
+            .get("artifact_kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BackendError("invalid automation plan token".into()))?
+            .to_string();
+        let artifact_revision = plan
+            .payload
+            .get("artifact_revision")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let base = plan
+            .payload
+            .get("base")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let delta = match plan.payload.get("delta") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(serde_json::from_value(value.clone()).map_err(|_| {
+                BackendError("invalid automation plan token".into())
+            })?),
+        };
+        desired.inputs.push(DesiredInput {
+            originating_work: originating_work.to_string(),
+            artifact_kind,
+            artifact_revision,
+            base,
+            delta,
+            artifact_identity: artifact_identity.to_string(),
+            admitted_at: crate::config::unix_to_rfc3339(crate::config::now_unix()),
+        });
+        atomic_write(path, &serialize_pretty(&desired)?)?;
+    }
+    Ok(json!({
+        "class": "automation",
+        "unit": plan.unit,
+        "action": "admit",
+        "applied": true,
+        "noop": duplicate,
+        "desired_inputs": snapshot.path,
+    }))
+}
+
+
 pub fn apply(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, BackendError> {
     token::require_class(plan, PlanClass::Automation)?;
     let action = plan
@@ -1971,6 +2335,7 @@ pub fn apply(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Backe
                 "history_preserved": true,
             }))
         }
+        "admit" => apply_admit(plan),
         _ => Err(BackendError("invalid automation plan token".into())),
     }
 }
