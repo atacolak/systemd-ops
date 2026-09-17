@@ -579,7 +579,8 @@ candidate. It does not invent a new generation.
           "runtime_generation": {"sha": "<40 hex>", "label": "omp@<8>"},
           "upgrade_target": null,
           "state": "live|stopped|retired",
-          "reason": ""
+          "reason": "",
+          "acked_at": "<RFC3339>"
         }
       ]
     }
@@ -708,7 +709,6 @@ Hermetic proofs, no live oh-my-pi writes:
 
 - `src/automation.rs` unit: fingerprint absent file equals today's
   hash; present file moves the hash; refuse malformed admit spec
-  (bad hex, mixed kinds, empty delta, `..` path); refuse
   `overseer`; duplicate `(originating_work, artifact_identity)` is
   a no-op write
 - `tests/admission.sh`: existing capability desired-inputs write
