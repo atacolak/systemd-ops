@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Existing-capability plan-admit. Throwaway scope; no unit create.
+# Existing-capability plan-admit, then new-capability create. Throwaway scope.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -262,3 +262,207 @@ refuse_unchanged "$(jq -nc --arg cap "$CAP" --arg sha "$DELTA_SHA" '{
   || fail "classified admit home todo-passive-phase exists"
 
 echo "admission existing-capability ok"
+
+# New-capability half. Same throwaway scope; no oh-my-pi writes.
+PARENT=managed-omp-runtime-integrator
+PARENT_HOME=$SCOPE/.systemd-ops/operations/$PARENT
+NEW_CAP=new-cap
+NEW_STEM=managed-omp-cap-$NEW_CAP
+NEW_HOME=$SCOPE/.systemd-ops/operations/$NEW_STEM
+NEW_DESIRED=$NEW_HOME/state/desired-inputs.json
+NEW_UNIT=$UNIT_DIR/$NEW_STEM.service
+NEW_TIMER=$UNIT_DIR/$NEW_STEM.timer
+DELTA_CAP=delta-cap
+DELTA_STEM=managed-omp-cap-$DELTA_CAP
+DELTA_HOME=$SCOPE/.systemd-ops/operations/$DELTA_STEM
+DELTA_DESIRED=$DELTA_HOME/state/desired-inputs.json
+COLLIDE_CAP=taken-cap
+COLLIDE_STEM=managed-omp-cap-$COLLIDE_CAP
+SIBLING=managed-omp-cap-sibling
+CLASSIFIED=$TMP/classified-src
+CANARY_BYTES=classified-canary-bytes
+
+cat >"$SCOPE/.systemd-ops/scope.toml" <<EOF
+[scope]
+id = "proof"
+owned = ["managed-omp-cap-*", "managed-omp-runtime-integrator"]
+
+[automation]
+agent_root = "$AGENT"
+EOF
+
+mkdir -p "$PARENT_HOME" "$CLASSIFIED" "$TMP/enabled"
+printf '%s\n' "$CANARY_BYTES" >"$CLASSIFIED/CANARY"
+cat >"$PARENT_HOME/automation.toml" <<'EOF'
+version = 1
+agent = "capability-maintainer"
+EOF
+cat >"$UNIT_DIR/$PARENT.service" <<EOF
+# Managed by systemd-ops
+[Unit]
+Description=$PARENT
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+WorkingDirectory=$SCOPE
+EOF
+cat >"$UNIT_DIR/$SIBLING.service" <<EOF
+# managed: systemd-ops 1
+# systemd-ops-tags: omp,capability-maintainer,capability:$COLLIDE_CAP,branch:cap/$COLLIDE_CAP
+[Unit]
+Description=sibling collider
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+WorkingDirectory=$SCOPE
+EOF
+
+cat >"$TMP/bin/systemctl" <<EOF
+#!/bin/sh
+log=$TMP/systemctl.log
+unit_dir=$UNIT_DIR
+enabled_dir=$TMP/enabled
+mkdir -p "\$enabled_dir"
+printf '%s\n' "\$*" >>"\$log"
+while [ "\${1:-}" = --user ]; do shift; done
+case " \$* " in
+  *" list-unit-files "*)
+    printf '['
+    sep=
+    for f in "\$unit_dir"/*; do
+      [ -f "\$f" ] || continue
+      printf '%s{"unit_file":"%s","state":"static","preset":"enabled"}' "\$sep" "\$(basename "\$f")"
+      sep=,
+    done
+    printf ']\\n'
+    ;;
+  *" list-units "*|*" list-timers "*)
+    printf '%s\\n' '[]'
+    ;;
+  *" daemon-reload "*)
+    ;;
+  *" enable "*)
+    unit=\${*##* }
+    touch "\$enabled_dir/\$unit"
+    ;;
+  *" start "*|*" stop "*|*" disable "*)
+    ;;
+  *" show "*)
+    unit=\${*##* }
+    printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nFragmentPath=%s/%s\\n' "\$unit_dir" "\$unit"
+    ;;
+  *)
+    printf '%s\\n' '[]'
+    ;;
+esac
+EOF
+chmod 755 "$TMP/bin/systemctl"
+
+cat >"$TMP/bin/git" <<EOF
+#!/bin/sh
+printf '%s\\n' "\$*" >>"$TMP/git.log"
+case " \$* " in
+  *" push "*)
+    echo "git push is forbidden in admission proof" >&2
+    exit 1
+    ;;
+  *" worktree add "*)
+    echo "git worktree add is forbidden in admission proof" >&2
+    exit 1
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+chmod 755 "$TMP/bin/git"
+
+NEW_COMMIT_SPEC=$(jq -nc --arg rev "$COMMIT_REV" --arg cap "$NEW_CAP" '{
+  version: 1,
+  originating_work: "omp-tytn.3",
+  artifact_revision: $rev,
+  capability: $cap
+}')
+[[ ! -e $NEW_HOME/automation.toml ]] || fail "new capability automation.toml existed before admit"
+[[ ! -e $NEW_UNIT ]] || fail "new capability unit existed before admit"
+
+applied=$(admit_apply "$NEW_COMMIT_SPEC")
+ok "$applied"
+[[ -f $NEW_UNIT ]] || fail "new capability did not create $NEW_STEM"
+[[ -f $NEW_HOME/automation.toml ]] || fail "new capability did not write automation.toml"
+[[ -f $NEW_DESIRED ]] || fail "new capability did not write the first desired input"
+[[ -f $NEW_TIMER ]] || fail "new capability did not write a timer"
+[[ -e $TMP/enabled/$NEW_STEM.timer ]] || fail "new capability timer was not enabled"
+grep -q '^agent = "capability-maintainer"$' "$NEW_HOME/automation.toml" \
+  || fail "new capability agent: $(cat "$NEW_HOME/automation.toml")"
+grep -q '^parent = "managed-omp-runtime-integrator"$' "$NEW_HOME/automation.toml" \
+  || fail "new capability parent: $(cat "$NEW_HOME/automation.toml")"
+jq -e --arg rev "$COMMIT_REV" '
+  .version == 1 and
+  (.inputs | length) == 1 and
+  .inputs[0].originating_work == "omp-tytn.3" and
+  .inputs[0].artifact_kind == "commit" and
+  .inputs[0].artifact_revision == $rev
+' "$NEW_DESIRED" >/dev/null || fail "new capability desired-inputs: $(cat "$NEW_DESIRED")"
+
+collide=$(admit "$(jq -nc --arg rev "$COMMIT_REV" --arg cap "$COLLIDE_CAP" '{
+  version: 1,
+  originating_work: "omp-tytn.4",
+  artifact_revision: $rev,
+  capability: $cap
+}')" || true)
+rejected "$collide"
+[[ ! -e $SCOPE/.systemd-ops/operations/$COLLIDE_STEM/automation.toml ]] \
+  || fail "colliding capability wrote automation.toml"
+[[ ! -e $UNIT_DIR/$COLLIDE_STEM.service ]] \
+  || fail "colliding capability created a unit"
+
+DELTA_NEW_SPEC=$(jq -nc --arg cap "$DELTA_CAP" --arg sha "$DELTA_SHA" '{
+  version: 1,
+  originating_work: "omp-tytn.5",
+  capability: $cap,
+  artifact_kind: "worktree-delta",
+  base: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  delta: [{path: "src/foo.rs", sha256: $sha}]
+}')
+before_delta_files=$(find "$SCOPE" "$UNIT_DIR" -type f | sort)
+applied=$(admit_apply "$DELTA_NEW_SPEC")
+ok "$applied"
+[[ -f $DELTA_HOME/automation.toml ]] || fail "worktree-delta new capability did not write automation.toml"
+[[ -f $DELTA_DESIRED ]] || fail "worktree-delta new capability did not write desired-inputs"
+copied=$(find "$SCOPE" "$UNIT_DIR" -type f -exec grep -l "$CANARY_BYTES" {} + 2>/dev/null || true)
+[[ -z $copied ]] || fail "worktree-delta new capability copied classified bytes: $copied"
+if [[ -f $TMP/git.log ]]; then
+  grep -E '(^| )push( |$)' "$TMP/git.log" \
+    && fail "fork/cap/$DELTA_CAP was pushed: $(cat "$TMP/git.log")"
+  grep -F 'worktree add' "$TMP/git.log" \
+    && fail "git worktree add from classified tree: $(cat "$TMP/git.log")"
+fi
+# Expected new files only: delta unit, timer, automation.toml, desired-inputs.
+after_delta_files=$(find "$SCOPE" "$UNIT_DIR" -type f | sort)
+added=$(comm -13 <(printf '%s\n' "$before_delta_files") <(printf '%s\n' "$after_delta_files"))
+printf '%s\n' "$added" | grep -qx "$UNIT_DIR/$DELTA_STEM.service" \
+  || fail "worktree-delta new capability did not add service: $added"
+printf '%s\n' "$added" | grep -qx "$UNIT_DIR/$DELTA_STEM.timer" \
+  || fail "worktree-delta new capability did not add timer: $added"
+printf '%s\n' "$added" | grep -qx "$DELTA_HOME/automation.toml" \
+  || fail "worktree-delta new capability did not add automation.toml: $added"
+printf '%s\n' "$added" | grep -qx "$DELTA_DESIRED" \
+  || fail "worktree-delta new capability did not add desired-inputs: $added"
+extra=$(printf '%s\n' "$added" | grep -vx "$UNIT_DIR/$DELTA_STEM.service" \
+  | grep -vx "$UNIT_DIR/$DELTA_STEM.timer" \
+  | grep -vx "$DELTA_HOME/automation.toml" \
+  | grep -vx "$DELTA_DESIRED" || true)
+[[ -z $extra ]] || fail "worktree-delta new capability wrote extra files: $extra"
+
+if [[ -f $TMP/git.log ]]; then
+  grep -E '(^| )push( |$)' "$TMP/git.log" \
+    && fail "fork/cap/$NEW_CAP was pushed: $(cat "$TMP/git.log")"
+fi
+[[ ! -e /home/sf/worktrees/omp/admit/retry-fallback-unowned ]] \
+  || fail "classified admit home retry-fallback-unowned exists"
+[[ ! -e /home/sf/worktrees/omp/admit/todo-passive-phase ]] \
+  || fail "classified admit home todo-passive-phase exists"
+
+echo "admission new-capability ok"
+echo "admission ok"

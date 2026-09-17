@@ -2101,6 +2101,99 @@ fn parse_admit_spec(spec: &Value) -> Result<AdmitSpec, BackendError> {
     })
 }
 
+
+fn new_capability_create_args(capability: &str, scope_root: &Path) -> Value {
+    let stem = format!("managed-omp-cap-{capability}");
+    json!({
+        "spec": {
+            "unit": stem,
+            "kind": "oneshot",
+            "title": format!("{capability} capability"),
+            "tags": [
+                "omp",
+                "capability-maintainer",
+                format!("capability:{capability}"),
+                format!("branch:cap/{capability}"),
+            ],
+            "exec": { "path": "/bin/true", "argv": [] },
+            "cwd": scope_root.to_string_lossy(),
+            "schedule": {
+                "type": "interval",
+                "on_boot_sec": "5min",
+                "on_unit_inactive_sec": "3min",
+                "persistent": false,
+                "accuracy_sec": "30s",
+            },
+            "enabled": true,
+            "start_now": true,
+            "agent": "capability-maintainer",
+            "parent": "managed-omp-runtime-integrator",
+        }
+    })
+}
+
+fn refuse_capability_tag_collision(stem: &str, capability: &str) -> Result<(), BackendError> {
+    let cap_tag = format!("capability:{capability}");
+    let branch_tag = format!("branch:cap/{capability}");
+    let dir = systemd::unit_file_dir();
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(BackendError(format!(
+                "cannot read unit directory {}: {error}",
+                dir.display()
+            )))
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            BackendError(format!(
+                "cannot read unit directory {}: {error}",
+                dir.display()
+            ))
+        })?;
+        let path = entry.path();
+        let name = match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) if name.ends_with(".service") => name,
+            _ => continue,
+        };
+        let other = name.trim_end_matches(".service");
+        if other == stem {
+            continue;
+        }
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        let tags = unit_file_capability_tags(&text);
+        if tags.iter().any(|tag| tag == &cap_tag || tag == &branch_tag) {
+            return Err(BackendError(format!(
+                "admit refused: capability '{capability}' collides on tag with '{other}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn unit_file_capability_tags(text: &str) -> Vec<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let rest = trimmed
+            .strip_prefix("# systemd-ops-tags:")
+            .or_else(|| trimmed.strip_prefix("# managed-tags:"));
+        if let Some(rest) = rest {
+            return rest
+                .split(',')
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
 pub fn plan_admit(
     args: &Value,
     explicit_root: Option<&str>,
@@ -2113,12 +2206,9 @@ pub fn plan_admit(
     let stem = format!("managed-omp-cap-{}", admit.capability);
     let manifest = resolved_manifest(explicit_root, cwd)?;
     crate::operator::require_owned(&manifest, &stem)?;
-    load_metadata(&manifest.root, &stem)?.ok_or_else(|| {
-        BackendError(format!(
-            "admit refused: existing capability '{}' has no automation.toml",
-            admit.capability
-        ))
-    })?;
+    if load_metadata(&manifest.root, &stem)?.is_none() {
+        refuse_capability_tag_collision(&stem, &admit.capability)?;
+    }
     let desired_path = desired_inputs_path(&manifest.root, &stem);
     let desired_snapshot = snapshot(&desired_path);
     let cfg = crate::config::current_or_load()?;
@@ -2156,7 +2246,7 @@ pub fn plan_admit(
     }))
 }
 
-fn apply_admit(plan: &token::SealedPlan) -> Result<Value, BackendError> {
+fn apply_admit(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, BackendError> {
     let snapshot = snapshot_from_json(
         plan.payload
             .get("desired_inputs_snapshot")
@@ -2168,12 +2258,27 @@ fn apply_admit(plan: &token::SealedPlan) -> Result<Value, BackendError> {
         .get("scope_root")
         .and_then(Value::as_str)
         .ok_or_else(|| BackendError("invalid automation plan token".into()))?;
-    load_metadata(Path::new(scope_root), &plan.unit)?.ok_or_else(|| {
-        BackendError(format!(
-            "admit refused: '{}' has no automation.toml",
-            plan.unit
-        ))
-    })?;
+    if load_metadata(Path::new(scope_root), &plan.unit)?.is_none() {
+        let capability = plan
+            .payload
+            .get("capability")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BackendError("invalid automation plan token".into()))?;
+        refuse_capability_tag_collision(&plan.unit, capability)?;
+        let created = plan_instance(
+            "create",
+            &new_capability_create_args(capability, Path::new(scope_root)),
+            Some(scope_root),
+            cwd,
+        )?;
+        let token = created
+            .get("plan_token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BackendError("automation create plan did not return a plan token".into())
+            })?;
+        crate::write::apply_with_context(token, cwd)?;
+    }
     let originating_work = plan
         .payload
         .get("originating_work")
@@ -2335,7 +2440,7 @@ pub fn apply(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Backe
                 "history_preserved": true,
             }))
         }
-        "admit" => apply_admit(plan),
+        "admit" => apply_admit(plan, cwd),
         _ => Err(BackendError("invalid automation plan token".into())),
     }
 }
