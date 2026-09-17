@@ -240,6 +240,46 @@ write_fake_omp() {
   chmod +x "$SCOPE/fake-omp"
 }
 
+write_desired_worktree_delta() {
+  local path=$1
+  local sha=$2
+  jq -n --arg path "$path" --arg sha "$sha" '{
+    version: 1,
+    inputs: [{
+      originating_work: "proof",
+      artifact_kind: "worktree-delta",
+      base: "0000000000000000000000000000000000000000",
+      delta: [{path: $path, sha256: $sha}],
+      artifact_identity: $sha,
+      admitted_at: "2026-09-01T00:00:00Z"
+    }]
+  }' >"$CAP_STATE/desired-inputs.json"
+}
+
+write_desired_commit() {
+  local rev=$1
+  jq -n --arg rev "$rev" '{
+    version: 1,
+    inputs: [{
+      originating_work: "proof",
+      artifact_kind: "commit",
+      artifact_revision: $rev,
+      artifact_identity: $rev,
+      admitted_at: "2026-09-01T00:00:00Z"
+    }]
+  }' >"$CAP_STATE/desired-inputs.json"
+}
+
+assert_ready_not_certified() {
+  local label=$1
+  if [[ -e $CAP_STATE/processed.json ]]; then
+    jq -e '.outcome != "ready"' "$CAP_STATE/processed.json" >/dev/null \
+      || fail "$label wrote processed.json outcome=ready"
+  fi
+  cmp -s "$TMP/checkpoint-before.json" "$CAP_STATE/checkpoint.json" \
+    || fail "$label replaced checkpoint.json: $(cat "$CAP_STATE/checkpoint.json")"
+}
+
 run_cap_code() {
   local now=$1
   local generation=${2:-$G2}
@@ -292,6 +332,7 @@ set_target "$target"
 write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
 write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
 write_fake_omp ''
+[[ ! -e $CAP_STATE/desired-inputs.json ]] || fail "verified no-op fixture wrote desired-inputs"
 code=$(run_cap_code 1000 "$target" "$TMP/cap-noop.out")
 [[ $code -eq 0 ]] || fail "verified no-op exited $code: $(cat "$TMP/cap-noop.out")"
 grep -q "automation_report is required" "$TMP/cap-noop.out" && fail "verified no-op took the contract-failure path"
@@ -574,5 +615,87 @@ grep -q 'unreadable operational park record' "$TMP/cap-corrupt-park.out" \
   || fail "a corrupt park record was not reported: $(cat "$TMP/cap-corrupt-park.out")"
 grep -q 'jq: ' "$TMP/cap-corrupt-park.out" && fail "a corrupt park record leaked jq's error"
 [[ ! -e $CAP_STATE/operational-park.json ]] || fail "a READY report left the corrupt park record"
+
+# Consume gate: a worktree-delta whose sha256 does not match the bound
+# file must not be READY-certified, even when the agent reports ready.
+make_scope
+printf 'bound-bytes\n' >"$SCOPE/worktree/desired.txt"
+git -C "$SCOPE/worktree" add desired.txt
+git -C "$SCOPE/worktree" commit -qm desired
+git -C "$SCOPE/worktree" push -q fork cap/hindsight:cap/hindsight
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+mismatch=$(printf 'other-bytes\n' | sha256sum | awk '{print $1}')
+actual=$(sha256sum "$SCOPE/worktree/desired.txt" | awk '{print $1}')
+[[ $mismatch != "$actual" ]] || fail "mismatch fixture sha256 equals the bound file"
+write_desired_worktree_delta desired.txt "$mismatch"
+cp "$CAP_STATE/checkpoint.json" "$TMP/checkpoint-before.json"
+code=$(run_cap_code 1000 "$target" "$TMP/cap-unconsumed-delta-ready.out")
+[[ -f $SCOPE/agent-calls ]] || fail "mismatched worktree-delta never invoked the agent: $(cat "$TMP/cap-unconsumed-delta-ready.out")"
+assert_ready_not_certified "mismatched worktree-delta with agent READY"
+
+# Same mismatch also refuses the verified-noop self-report: a silent pass
+# on a clean tree that already carries the target must not close itself
+# while desired-inputs are unconsumed.
+make_scope
+printf 'bound-bytes\n' >"$SCOPE/worktree/desired.txt"
+git -C "$SCOPE/worktree" add desired.txt
+git -C "$SCOPE/worktree" commit -qm desired
+git -C "$SCOPE/worktree" push -q fork cap/hindsight:cap/hindsight
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+mismatch=$(printf 'other-bytes\n' | sha256sum | awk '{print $1}')
+write_desired_worktree_delta desired.txt "$mismatch"
+write_fake_omp ''
+cp "$CAP_STATE/checkpoint.json" "$TMP/checkpoint-before.json"
+code=$(run_cap_code 1000 "$target" "$TMP/cap-unconsumed-delta-noop.out")
+[[ -f $SCOPE/agent-calls ]] || fail "mismatched worktree-delta no-op never invoked the agent: $(cat "$TMP/cap-unconsumed-delta-noop.out")"
+[[ $(grep -c "already correct for" "$SCOPE/ops-argv.log" || true) -eq 0 ]] \
+  || fail "mismatched worktree-delta verified-noop self-reported READY"
+assert_ready_not_certified "mismatched worktree-delta verified-noop"
+
+# Commit kind whose artifact_revision is not an ancestor of HEAD must
+# refuse READY even if the agent reports ready.
+make_scope
+git -C "$SCOPE/worktree" commit --allow-empty -qm ahead
+absent=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+git -C "$SCOPE/worktree" reset -q --hard HEAD~1
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+write_desired_commit "$absent"
+git -C "$SCOPE/worktree" merge-base --is-ancestor "$absent" HEAD \
+  && fail "commit fixture is an ancestor of HEAD"
+cp "$CAP_STATE/checkpoint.json" "$TMP/checkpoint-before.json"
+code=$(run_cap_code 1000 "$target" "$TMP/cap-unconsumed-commit-ready.out")
+[[ -f $SCOPE/agent-calls ]] || fail "unconsumed commit never invoked the agent: $(cat "$TMP/cap-unconsumed-commit-ready.out")"
+assert_ready_not_certified "unconsumed commit with agent READY"
+
+# Matching worktree-delta sha256: an agent READY still certifies consume.
+make_scope
+unset PROOF_FINGERPRINT
+printf 'bound-bytes\n' >"$SCOPE/worktree/desired.txt"
+git -C "$SCOPE/worktree" add desired.txt
+git -C "$SCOPE/worktree" commit -qm desired
+git -C "$SCOPE/worktree" push -q fork cap/hindsight:cap/hindsight
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+matched=$(sha256sum "$SCOPE/worktree/desired.txt" | awk '{print $1}')
+write_desired_worktree_delta desired.txt "$matched"
+code=$(run_cap_code 1000 "$target" "$TMP/cap-consumed-delta-ready.out")
+[[ $code -eq 0 ]] || fail "matching worktree-delta exited $code: $(cat "$TMP/cap-consumed-delta-ready.out")"
+jq -e '.outcome == "ready"' "$CAP_STATE/processed.json" >/dev/null \
+  || fail "matching worktree-delta did not process the input as ready"
+jq -e --arg gen "$target" --arg fp "fp-cap" \
+  '.version == 2 and .generation == $gen and .input_fingerprint == $fp' \
+  "$CAP_STATE/checkpoint.json" >/dev/null \
+  || fail "matching worktree-delta did not write a READY checkpoint: $(cat "$CAP_STATE/checkpoint.json")"
 
 echo "capability-release-run ok"

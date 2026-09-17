@@ -78,6 +78,32 @@ capability_pass_awaiting_report() {
     and (.data.operator.active_iteration.reported_at == null)' <<<"$view" >/dev/null
 }
 
+# True when any admitted desired input is not present in the bound worktree.
+# Absent desired-inputs.json is consumed. A READY certify is forbidden while
+# this returns 0.
+# Commit, or any input with artifact_revision set: revision must be an
+# ancestor of HEAD. Worktree-delta: each named path must exist under
+# WORKTREE and sha256 of the file bytes must equal the admitted 64-lowercase-hex.
+capability_desired_unconsumed() {
+  local file="$STATE_DIR/desired-inputs.json"
+  local kind rev path expected actual
+  [[ -e "$file" ]] || return 1
+  jq -e '.version == 1 and (.inputs | type == "array")' "$file" >/dev/null 2>&1 || return 0
+  while IFS=$'\t' read -r kind rev; do
+    if [[ "$kind" == commit || -n "$rev" ]]; then
+      [[ -n "$rev" ]] || return 0
+      git -C "$WORKTREE" merge-base --is-ancestor "$rev" HEAD || return 0
+    fi
+  done < <(jq -r '.inputs[] | [(.artifact_kind // ""), (.artifact_revision // "")] | @tsv' "$file")
+  while IFS=$'\t' read -r path expected; do
+    [[ -n "$path" ]] || return 0
+    [[ -f "$WORKTREE/$path" ]] || return 0
+    actual=$(sha256sum -- "$WORKTREE/$path" | awk '{print $1}')
+    [[ "$actual" == "$expected" ]] || return 0
+  done < <(jq -r '.inputs[] | select(.artifact_kind == "worktree-delta") | (.delta // [])[] | [(.path // ""), (.sha256 // "")] | @tsv' "$file")
+  return 1
+}
+
 ensure_clean_worktree "$BRANCH" || exit $?
 git -C "$WORKTREE" fetch --quiet fork main || true
 upstream_generation=$(resolve_target_generation) || exit $?
@@ -197,7 +223,8 @@ PR children are publication/review streams, not semaphores. Maintain the local c
   # driver stays silent, and nothing new happens.
   if [[ $omp_code -eq 0 ]] \
     && capability_pass_awaiting_report \
-    && capability_pass_is_verified_noop "$omp_code" "$upstream_generation" "$WORKTREE"; then
+    && capability_pass_is_verified_noop "$omp_code" "$upstream_generation" "$WORKTREE" \
+    && ! capability_desired_unconsumed; then
     # automation report rejects a headline over 80 characters
     # (MAX_AUTOMATION_HEADLINE), and a rejected report would park the run, so
     # the branch field gets the budget left by the fixed tail instead of an
@@ -293,6 +320,12 @@ PR children are publication/review streams, not semaphores. Maintain the local c
     record_blocker postcondition-failed 4 "capability branch did not process required target generation $upstream_generation" "$iteration_id" parent "$post_input" || true
     exit 4
   fi
+  if capability_desired_unconsumed; then
+    echo "desired inputs are unconsumed; refusing READY certify" >&2
+    record_blocker postcondition-failed 4 "desired inputs are unconsumed; refusing READY certify" "$iteration_id" parent "$post_input" || true
+    exit 4
+  fi
+
   mark_processed "$post_input" ready || exit $?
   write_output_checkpoint "$post_input" "$upstream_generation" "$post_head" || {
     echo "structured checkpoint write failed" >&2
