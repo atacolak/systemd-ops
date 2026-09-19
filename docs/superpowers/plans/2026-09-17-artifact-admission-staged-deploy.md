@@ -145,6 +145,45 @@ Landed `e962b5b`. `review-sdo-a89.4` PASS.
 
 ---
 
+### Task 3b: `plan-admit` replaces a superseded identity
+
+**Owner:** builder
+**Depends:** Task 3
+**Files:**
+- Modify: `src/automation.rs` (`parse_admit_spec`, `plan_admit`,
+  `apply_admit`)
+- Modify: `tests/admission.sh` (existing-capability replace proofs)
+
+**Verification:** on a throwaway existing capability with one
+desired input, `plan-admit` + `apply` with `supersedes` naming
+that identity writes exactly one remaining entry (the new
+artifact), moves `input_fingerprint`, and does not rewrite the
+unit. A missing `supersedes` target, a same-identity
+`supersedes`, `supersedes` on a new capability, and a
+replacement that already exists as another entry are refused
+with no write. Overlay/copy/`git worktree add` stay absent.
+
+- [x] **Step 1: Write the failing proof**
+- [x] **Step 2: Make the proof pass**
+- [x] **Step 3: Commit**
+
+`git commit -m "feat: plan-admit supersedes replaces a desired identity"`
+Landed `c517494`. `review-sdo-a89.7` PASS. Hop named callable
+to midi 2026-09-17T19:32Z (repo binary at c517494; live PATH
+still 0.7.0 af1ad5b8). Midi invoked 2026-09-17T19:35:37Z
+(`#100469`). Apply verified: desired-inputs is exactly one
+entry, identity `b52e7cd`, `256625ad` gone (removed, not
+consumed), unit spec-sha still `64ce6bd9`, automation.toml
+mtime still 17:55:33Z. Midi synced live drivers `#100628`
+(4186911 / c3beac6 / runtime-promote). Hera started the
+timer+service 2026-09-18T03:46:33Z. Pass READY 03:51:26Z:
+checkpoint generation `37273117` output `53873e8c`, C still
+an ancestor (consumed), worktree clean, `current` still
+`eb966708`. Integrator compose is in flight as of 03:52:35Z
+and must write a candidate without flipping `current`.
+
+---
+
 ### Task 4: Candidate compose does not flip current
 
 **Owner:** builder
@@ -163,11 +202,12 @@ pointers stay on the previous promoted generation while
 rewrites `published-generation.json`. `prune_runtime_generations` is
 not called from READY compose.
 
-- [ ] **Step 1: Write the failing (rewritten) proof**
-- [ ] **Step 2: Make the proof pass**
-- [ ] **Step 3: Commit**
+- [x] **Step 1: Write the failing (rewritten) proof**
+- [x] **Step 2: Make the proof pass**
+- [x] **Step 3: Commit**
 
 `git commit -m "feat: compose writes a candidate and does not flip current"`
+Landed `c3beac6`. `review-sdo-a89.6` PASS.
 
 ---
 
@@ -179,15 +219,27 @@ not called from READY compose.
 - Modify: `src/automation.rs` (`plan_deploy_canary_ack` / apply)
 - Modify: `src/bin/systemd_ops.rs`
 - Create: `tests/deploy-canary.sh`
+- Modify: `docs/TESTING.md` (name the new proof in Fast gates)
+- Modify: `.github/workflows/ci.yml` (Dogfood proofs step)
 
-**Verification:** fail ACK (`result=fail`, or actor not midi, or
-observed_generation mismatch) leaves `current` and
-`published-generation.json` on the previous promoted generation and
-records `canary.result=fail`. Pass ACK flips exactly once, sets
-phase `rolling_out`, and leaves `current` and
-`published-generation.json` naming the same output revision. A second
-pass ACK against the same candidate is a no-op flip (already
-promoted). systemd-ops does not call `recycle_actor` or `hcom r`.
+**Verification:** fail ACK (`result=fail`, actor not midi,
+observed_generation mismatch, or failed continuity) leaves
+`current` and `published-generation.json` on the previous promoted
+generation, records `canary.result=fail`, writes `recovery.target`
+as that previous promoted identity (`omp@` + first 8), notifies
+midi with that target via the system-notify seam (stubbed; no real
+hcom), preserves the candidate, and does not set phase
+`rolling_out`. Midi is a required recovery occupant: a later
+`result=pass` is refused until `result=recovered` (observed equal
+to `recovery.target.sha`) or an occupancy row `name=midi`
+`state=live` on that sha. Recovered does not flip. Pass after
+recovered flips exactly once, sets phase `rolling_out`, and leaves
+`current` and `published-generation.json` naming the same output
+revision. A second pass ACK against the same candidate is a no-op
+flip (already promoted). systemd-ops does not call `recycle_actor`
+or `hcom r`. Add `tests/deploy-canary.sh` to the Fast gates list in
+`docs/TESTING.md` and the Dogfood proofs step in
+`.github/workflows/ci.yml`.
 
 - [ ] **Step 1: Write the failing proof**
 - [ ] **Step 2: Make the proof pass**

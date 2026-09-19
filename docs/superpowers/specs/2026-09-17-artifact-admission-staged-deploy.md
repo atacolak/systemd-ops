@@ -223,6 +223,24 @@ Worktree-delta form (required for an uncommitted verified delta):
       ]
     }
 
+Optional, existing-capability replace:
+
+      "supersedes": "<artifact_identity>"
+
+`supersedes` names the desired-inputs entry this admit replaces.
+The old identity is removed, not marked consumed. The new artifact
+is a different identity (commit 40-hex or worktree-delta 64-hex).
+Apply does not overlay, does not copy bytes, and does not rewrite
+the unit. A second admit of the same work without this field still
+appends.
+
+Midi #99757: `256625ad` is superseded, not consumed. Product C is
+the named existing commit the cap already carries
+(`b52e7cdabfc2a97ca6f2c70f0796805830854e4d`, chains `ad238315...`,
+test `dcaecaf04...`). The second admit of C uses `supersedes`.
+Rewriting marooned hashes onto `256625ad` is refused (B). Overlay
+of the Sep 15 dirty snapshot is refused (A).
+
 Optional, new-capability only:
 
       "worktree": "<absolute path>"
@@ -239,6 +257,7 @@ Charset:
   no leading `/`, no `..` component
 - each `delta[].sha256`: exactly 64 `[0-9a-f]`
 - `delta`: 1..32 entries, paths unique
+- `supersedes`: exactly 40 or 64 `[0-9a-f]`, existing-capability only
 
 `artifact_identity` is the duplicate key (with `originating_work`):
 
@@ -265,6 +284,8 @@ third write path.
 Existing capability: apply appends the entry to
 `operations/<unit>/state/desired-inputs.json`, refuses a duplicate
 `(originating_work, artifact_identity)`, and does not rewrite the unit.
+When `supersedes` is present, apply replaces that identity in place
+instead of appending. The superseded identity leaves the consume set.
 
 New capability: apply composes, in one `write::apply`:
 
@@ -299,6 +320,13 @@ Refuse:
 - a capability identity that collides on `capability:` or `branch:`
   tags with a live sibling (`runtime-reconcile:28-40` already exits 4)
 - apply without a matching sealed token
+- `supersedes` not 40 or 64 lowercase hex
+- `supersedes` equal to the new `artifact_identity`
+- `supersedes` identity absent from desired-inputs
+- `supersedes` on a new capability (unit or desired-inputs absent)
+- `supersedes` when the replacement
+  `(originating_work, artifact_identity)` already exists as another
+  entry
 
 ### D2. Desired artifacts enter the observation hash
 
@@ -385,6 +413,11 @@ One file on the runtime-integrator:
         "observed_generation": "<40 hex or empty>",
         "continuity": {},
         "recorded_at": "<RFC3339 or empty>"
+      },
+      "recovery": {
+        "target": {"sha": "<40 hex>", "label": "omp@<8>"},
+        "midi_alive_at": "<RFC3339 or empty>",
+        "reason": "<one line>"
       },
       "occupancy": [
         {
@@ -497,6 +530,8 @@ these:
 
 - `promoted`  -  sha is the promoted pointer
 - `candidate`  -  sha is the current candidate
+- `failed-canary`  -  sha is a candidate that failed canary and
+  has not been superseded by a later compose
 - `live-occupancy:<name>`  -  a `state=live` occupancy row names
   that sha
 - `process-executable`  -  a process executable resolves into
@@ -568,11 +603,59 @@ Fail-closed, no flip, previous promoted stays current, when any of:
 - `continuity.session_id` is empty
 - there is no candidate
 
-Pass: apply records canary evidence, then in the same apply promotes
-(D3 flip). systemd-ops does not recycle midi. It notifies and waits.
+Those cases (except a well-formed `result=recovered` ACK below) are
+candidate failure. systemd-ops retains the previous promoted
+generation throughout canary. Apply then:
+
+1. Never promote. `generations/current` and
+   `published-generation.json` stay on the previous promoted
+   generation.
+2. Record `canary.result=fail` and the refuse reason. Keep the
+   candidate object and the generation directory. Phase stays
+   `candidate`.
+3. Write `recovery.target` as the previous promoted identity
+   (`sha` = that generation's output_revision, `label` = `omp@`
+   plus first 8). Midi itself is a required recovery occupant.
+   Candidate failure recovery includes midi, not only the rest of
+   the village.
+4. `system_notify omp-runtime inform` midi, who is the
+   worlds/recycle supervisor for this hop, naming that recovery
+   target as the generation midi must return to. systemd-ops does
+   not call `recycle_actor` or `hcom r`.
+5. Do not emit a village rollout or promoted-generation event.
+6. Retain the failed candidate. `retained[].reasons` includes
+   `candidate` and `failed-canary` until a later compose supersedes
+   the candidate field. GC of that sha is refused while those
+   reasons apply.
+
+Write the durable record first. Notify is transport: a notify
+failure does not roll back the fail record and does not promote.
+
+A later `result=pass` ACK against the same candidate is refused
+until midi has proved alive again on `recovery.target.sha`. Proof
+is one of:
+
+- a `result=recovered` ACK with `actor=midi`, `generation` and
+  `observed_generation` both equal to `recovery.target.sha`, and a
+  non-empty midi continuity (this ACK does not promote)
+- an occupancy row `name=midi` `state=live` whose
+  `runtime_generation.sha` equals `recovery.target.sha`
+
+`result=recovered` is refused when there is no `recovery.target`,
+when `observed_generation` is not that sha, or when actor or
+continuity is not midi. It records `recovery.midi_alive_at` and
+does not flip current.
+
+Pass (only after the recovery hold is clear, or when there was no
+prior fail on this candidate): apply records canary evidence, then
+in the same apply promotes (D3 flip). systemd-ops does not recycle
+midi. It notifies and waits. Phase becomes `rolling_out`. A second
+pass ACK against the same candidate is a no-op flip (already
+promoted).
 
 A failed canary may be retried with a new ACK against the same
-candidate. It does not invent a new generation.
+candidate after midi is alive on the previous promoted generation.
+It does not invent a new generation.
 
 ### D4b. Occupancy and GC
 
@@ -689,6 +772,16 @@ drop that source from runtime membership (the child is gone, so
 `deployment` equal to `deployment.json` (or null if absent) and
 `runtime_generation` equal to the D3c projection (or null if
 neither `published-generation.json` nor `deployment.json` exists).
+Inspect names, in one object: promoted generation, candidate
+generation, occupancy rows per actor, and `retained[].reasons` for
+every kept directory. The operator-visible `deployment.phase` is
+one of `composing|candidate|canary|rolling_out|converged`.
+`composing` is inspect-derived: the runtime-integrator service is
+active and no candidate exists yet. It is not a stored
+`candidate.phase` value. Human label is `omp@` plus first 8 of the
+identity sha; the full sha is machine identity. When
+`recovery.target` is set, inspect shows it and whether midi has
+proved alive on that sha.
 
 `automation inspect --unit managed-omp-cap-<capability>` gains
 `desired_inputs` equal to the file (or null) and
@@ -725,15 +818,24 @@ Hermetic proofs, no live oh-my-pi writes:
   `overseer`; duplicate `(originating_work, artifact_identity)` is
   a no-op write
 - `tests/admission.sh`: existing capability desired-inputs write
-  for both kinds; new capability creates unit + `automation.toml`
+  for both kinds; `supersedes` replaces one identity, moves the
+  fingerprint, and refuses a missing or same-identity target; new
+  capability creates unit + `automation.toml`
   + first input + timer enabled; worktree-delta apply copies no
   bytes and does not `git worktree add`; both through plan/apply
 - `tests/runtime-generation-publish.sh`: rewrite the current-flip
   pins. Candidate READY must leave `generations/current` and the omp
   install on the previous promoted generation. A separate promote
   apply must flip both and rewrite `published-generation.json`.
-- `tests/deploy-canary.sh`: fail ACK keeps promoted; pass ACK flips
-  once and is atomic (current and published-generation match)
+- `tests/deploy-canary.sh`: fail ACK (`result=fail`, actor not midi,
+  observed_generation mismatch, failed continuity) keeps promoted,
+  records `canary.result=fail`, writes `recovery.target` as the
+  previous promoted identity, notifies midi with that target,
+  preserves the candidate, and does not set `rolling_out`.
+  `result=recovered` with observed equal to that target records
+  midi alive and does not flip. Pass before recovered is refused.
+  Pass after recovered flips once and is atomic (current and
+  published-generation match). A second pass is a no-op flip.
 - `tests/deploy-gc.sh`: GC refuses a live occupancy row; GC refuses
   when `current` points at G; GC removes G when occupancy is
   retired/stopped/acked elsewhere and the process check is clean.
@@ -759,10 +861,15 @@ it (named in `docs/TESTING.md` in the same commit that adds them).
 1. midi classifies `.66` and invokes `plan-admit` + `apply` with the
    worktree-delta form (base + file sha256s). systemd-ops does not
    invent a commit sha and does not copy
-   `/home/sf/.omp/wt/ayn-66-f6de4bd` by hand. `omp-vuz.1` uses the
-   commit form after midi picks the revision.
+   `/home/sf/.omp/wt/ayn-66-f6de4bd` by hand. Midi #99757: that
+   first identity (`256625ad`) is superseded, not consumed. The
+   replace hop is `plan-admit` with `supersedes` naming C
+   (`b52e7cdabfc2a97ca6f2c70f0796805830854e4d`). hera names the
+   hop callable; midi invokes. `omp-vuz.1` uses the commit form
+   after midi picks the revision.
 2. The capability maintainer consumes the desired input and emits a
-   READY checkpoint. hera does not cherry-pick.
+   READY checkpoint. hera does not cherry-pick. A READY for
+   `256625ad` while bound sha256s do not match is invalid.
 3. Runtime compose builds candidate G, notifies midi, does not flip
    `current`.
 4. midi canaries onto G and ACKs.
@@ -794,8 +901,13 @@ A change is done when:
    `input_fingerprint`.
 2. A READY runtime compose leaves `generations/current` on the
    previous promoted generation.
-3. A midi canary fail leaves that pointer untouched; a pass flips
-   it exactly once and rewrites `published-generation.json`.
+3. A midi canary fail (including incorrect observed generation or
+   failed continuity) leaves that pointer untouched, records
+   recovery onto the previous promoted generation, requires midi
+   alive on that generation before a later pass, preserves the
+   failed candidate until superseded, and emits no rollout event.
+   A pass flips current exactly once and rewrites
+   `published-generation.json`.
 4. GC cannot delete a generation a live occupancy row still names.
 5. `plan-normalize-pr` + apply removes the PR unit from ScopeView.
 6. `plan-normalize-capability` refuses a non-empty merge-tree and
