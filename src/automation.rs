@@ -2448,6 +2448,594 @@ fn apply_admit(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Bac
     }))
 }
 
+const RUNTIME_INTEGRATOR: &str = "managed-omp-runtime-integrator";
+
+struct CanaryAckSpec {
+    generation: String,
+    actor: String,
+    result: String,
+    observed_generation: String,
+    continuity_actor: String,
+    session_id: String,
+}
+
+enum CanaryAckIntent {
+    Fail { reason: String },
+    Recovered,
+    Pass,
+}
+
+fn deployment_path(root: &Path, stem: &str) -> PathBuf {
+    operation_home(root, stem).join("state/deployment.json")
+}
+
+fn dogfood_lib(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("dogfood/lib")
+        .join(name)
+}
+
+fn runtime_generation_label(sha: &str) -> String {
+    let prefix = sha.get(..8).unwrap_or(sha);
+    format!("omp@{prefix}")
+}
+
+fn parse_canary_ack_spec(spec: &Value) -> Result<CanaryAckSpec, BackendError> {
+    if !spec.is_object() {
+        return Err(BackendError("canary ack spec must be an object".into()));
+    }
+    if spec.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err(BackendError("canary ack spec version must be 1".into()));
+    }
+    let generation = spec
+        .get("generation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("missing required argument: generation".into()))?;
+    let generation = lowercase_hex("generation", generation, 40)?;
+    let observed = spec
+        .get("observed_generation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("missing required argument: observed_generation".into()))?;
+    let observed_generation = lowercase_hex("observed_generation", observed, 40)?;
+    let actor = spec
+        .get("actor")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("missing required argument: actor".into()))?
+        .to_string();
+    let result = spec
+        .get("result")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("missing required argument: result".into()))?;
+    if !matches!(result, "pass" | "fail" | "recovered") {
+        return Err(BackendError(
+            "result must be pass, fail, or recovered".into(),
+        ));
+    }
+    let (continuity_actor, session_id) = match spec.get("continuity") {
+        None | Some(Value::Null) => (String::new(), String::new()),
+        Some(Value::Object(map)) => {
+            let continuity_actor = map
+                .get("actor")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let session_id = map
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if session_id.len() > 80 {
+                return Err(BackendError(
+                    "continuity.session_id must be at most 80 characters".into(),
+                ));
+            }
+            (continuity_actor, session_id)
+        }
+        Some(_) => return Err(BackendError("continuity must be an object".into())),
+    };
+    Ok(CanaryAckSpec {
+        generation,
+        actor,
+        result: result.to_string(),
+        observed_generation,
+        continuity_actor,
+        session_id,
+    })
+}
+
+fn canary_ack_from_plan(plan: &token::SealedPlan) -> Result<CanaryAckSpec, BackendError> {
+    let generation = plan
+        .payload
+        .get("generation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("invalid automation plan token".into()))?
+        .to_string();
+    let actor = plan
+        .payload
+        .get("actor")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("invalid automation plan token".into()))?
+        .to_string();
+    let result = plan
+        .payload
+        .get("result")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("invalid automation plan token".into()))?
+        .to_string();
+    let observed_generation = plan
+        .payload
+        .get("observed_generation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("invalid automation plan token".into()))?
+        .to_string();
+    let continuity = plan.payload.get("continuity");
+    let continuity_actor = continuity
+        .and_then(|value| value.get("actor"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let session_id = continuity
+        .and_then(|value| value.get("session_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok(CanaryAckSpec {
+        generation,
+        actor,
+        result,
+        observed_generation,
+        continuity_actor,
+        session_id,
+    })
+}
+
+fn load_json_object(path: &Path, label: &str) -> Result<Value, BackendError> {
+    let bytes =
+        read_optional_bytes(path)?.ok_or_else(|| BackendError(format!("{label} is missing")))?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| BackendError(format!("malformed {label}: {error}")))?;
+    if !value.is_object() {
+        return Err(BackendError(format!("{label} must be an object")));
+    }
+    Ok(value)
+}
+
+fn candidate_output_revision(deployment: &Value) -> Option<&str> {
+    deployment
+        .get("candidate")
+        .and_then(|value| value.get("output_revision"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn recovery_target_sha(deployment: &Value) -> Option<&str> {
+    deployment
+        .get("recovery")
+        .and_then(|value| value.get("target"))
+        .and_then(|value| value.get("sha"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn midi_alive_on(deployment: &Value, sha: &str) -> bool {
+    if let Some(at) = deployment
+        .get("recovery")
+        .and_then(|value| value.get("midi_alive_at"))
+        .and_then(Value::as_str)
+    {
+        if !at.is_empty() {
+            return true;
+        }
+    }
+    let Some(rows) = deployment.get("occupancy").and_then(Value::as_array) else {
+        return false;
+    };
+    rows.iter().any(|row| {
+        row.get("name").and_then(Value::as_str) == Some("midi")
+            && row.get("state").and_then(Value::as_str) == Some("live")
+            && row
+                .get("runtime_generation")
+                .and_then(|value| value.get("sha"))
+                .and_then(Value::as_str)
+                == Some(sha)
+    })
+}
+
+fn recovery_hold_active(deployment: &Value) -> bool {
+    match recovery_target_sha(deployment) {
+        Some(sha) => !midi_alive_on(deployment, sha),
+        None => false,
+    }
+}
+
+fn fail_closed_reason(spec: &CanaryAckSpec, deployment: &Value) -> Option<String> {
+    if candidate_output_revision(deployment).is_none() {
+        return Some("there is no candidate".into());
+    }
+    if spec.actor != "midi" {
+        return Some("actor is not midi".into());
+    }
+    if spec.result == "fail" {
+        return Some("result=fail".into());
+    }
+    if spec.generation != candidate_output_revision(deployment).unwrap_or("") {
+        return Some("generation is not the current candidate".into());
+    }
+    if spec.observed_generation != spec.generation {
+        return Some("observed_generation mismatch".into());
+    }
+    if spec.continuity_actor != "midi" {
+        return Some("continuity.actor is not midi".into());
+    }
+    if spec.session_id.is_empty() {
+        return Some("empty continuity".into());
+    }
+    None
+}
+
+fn validate_recovered(spec: &CanaryAckSpec, deployment: &Value) -> Result<(), BackendError> {
+    let Some(sha) = recovery_target_sha(deployment) else {
+        return Err(BackendError(
+            "result=recovered refused: no recovery.target".into(),
+        ));
+    };
+    if spec.actor != "midi" {
+        return Err(BackendError(
+            "result=recovered refused: actor is not midi".into(),
+        ));
+    }
+    if spec.continuity_actor != "midi" || spec.session_id.is_empty() {
+        return Err(BackendError(
+            "result=recovered refused: continuity is not midi".into(),
+        ));
+    }
+    if spec.generation != sha || spec.observed_generation != sha {
+        return Err(BackendError(
+            "result=recovered refused: generation must equal recovery.target.sha".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn classify_canary_ack(
+    spec: &CanaryAckSpec,
+    deployment: &Value,
+) -> Result<CanaryAckIntent, BackendError> {
+    if spec.result == "recovered" {
+        validate_recovered(spec, deployment)?;
+        return Ok(CanaryAckIntent::Recovered);
+    }
+    if let Some(reason) = fail_closed_reason(spec, deployment) {
+        return Ok(CanaryAckIntent::Fail { reason });
+    }
+    if recovery_hold_active(deployment) {
+        return Err(BackendError(
+            "canary pass refused until midi recovered on the previous promoted generation".into(),
+        ));
+    }
+    Ok(CanaryAckIntent::Pass)
+}
+
+fn previous_promoted_sha(
+    deployment: &Value,
+    published_path: &Path,
+    gens_root: &str,
+) -> Result<String, BackendError> {
+    if let Ok(published) = load_json_object(published_path, "published-generation.json") {
+        if let Some(sha) = published
+            .get("output_revision")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(sha.to_string());
+        }
+    }
+    if let Some(sha) = deployment
+        .get("promoted")
+        .and_then(|value| value.get("output_revision"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(sha.to_string());
+    }
+    let current = Path::new(gens_root).join("current");
+    if let Ok(target) = fs::canonicalize(&current) {
+        if let Some(name) = target.file_name().and_then(|name| name.to_str()) {
+            return Ok(name.to_string());
+        }
+    }
+    Err(BackendError("no previous promoted generation".into()))
+}
+
+fn already_promoted(deployment: &Value, published_path: &Path, gens_root: &str) -> bool {
+    let Some(cand) = candidate_output_revision(deployment) else {
+        return false;
+    };
+    let current_ok = match (
+        fs::canonicalize(Path::new(gens_root).join("current")),
+        fs::canonicalize(Path::new(gens_root).join(cand)),
+    ) {
+        (Ok(current), Ok(target)) => current == target,
+        _ => false,
+    };
+    let published_ok = load_json_object(published_path, "published-generation.json")
+        .ok()
+        .and_then(|value| {
+            value
+                .get("output_revision")
+                .and_then(Value::as_str)
+                .map(|sha| sha == cand)
+        })
+        .unwrap_or(false);
+    current_ok && published_ok
+}
+
+fn notify_canary_recovery(
+    restored_label: &str,
+    restored_sha: &str,
+    candidate_label: &str,
+    reason: &str,
+    observed_generation: &str,
+) {
+    let message = format!(
+        "canary failed; failed candidate {candidate_label}; restore {restored_label} ({restored_sha}); {reason}; observed_generation={observed_generation}"
+    );
+    if let Some(lib) = std::env::var("SYSTEM_NOTIFY_LIB")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        let _ = Command::new(lib)
+            .args(["omp-runtime", "inform", &message])
+            .status();
+        return;
+    }
+    let lib = dogfood_lib("system-notify");
+    let _ = Command::new("bash")
+        .args([
+            "-c",
+            "source \"$1\"; system_notify omp-runtime inform \"$2\"",
+            "system-notify",
+            lib.to_str().unwrap_or(""),
+            &message,
+        ])
+        .status();
+}
+
+fn promote_runtime_candidate(deployment: &Value, state_dir: &Path) -> Result<(), BackendError> {
+    let compose = deployment
+        .get("candidate")
+        .and_then(|value| value.get("generation"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("candidate.generation is missing".into()))?;
+    let output_revision = candidate_output_revision(deployment)
+        .ok_or_else(|| BackendError("candidate.output_revision is missing".into()))?;
+    let gens_root = deployment
+        .get("generations_root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("deployment.generations_root is missing".into()))?;
+    let promote = std::env::var("RUNTIME_PROMOTE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| dogfood_lib("runtime-promote").display().to_string());
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            "set -euo pipefail; source \"$RUNTIME_PROMOTE\"; promote_runtime_generation \"$1\" \"$2\"",
+            "promote",
+            compose,
+            output_revision,
+        ])
+        .env("RUNTIME_PROMOTE", &promote)
+        .env("GENERATIONS_ROOT", gens_root)
+        .env("STATE_DIR", state_dir)
+        .output()
+        .map_err(|error| BackendError(format!("cannot invoke runtime-promote: {error}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(BackendError(format!(
+        "runtime-promote failed{}{}",
+        if stderr.is_empty() { "" } else { ": " },
+        stderr
+    )))
+}
+
+pub fn plan_deploy_canary_ack(
+    args: &Value,
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let spec = args
+        .get("spec")
+        .ok_or_else(|| BackendError("missing required argument: spec".into()))?;
+    let ack = parse_canary_ack_spec(spec)?;
+    let stem = RUNTIME_INTEGRATOR;
+    let manifest = resolved_manifest(explicit_root, cwd)?;
+    crate::operator::require_owned(&manifest, stem)?;
+    let deploy_path = deployment_path(&manifest.root, stem);
+    let deploy_snapshot = snapshot(&deploy_path);
+    let deployment = load_json_object(&deploy_path, "deployment.json")?;
+    classify_canary_ack(&ack, &deployment)?;
+    let cfg = crate::config::current_or_load()?;
+    let payload = json!({
+        "action": "deploy-canary-ack",
+        "scope_root": manifest.root.to_string_lossy(),
+        "generation": ack.generation,
+        "actor": ack.actor,
+        "result": ack.result,
+        "observed_generation": ack.observed_generation,
+        "continuity": {
+            "actor": ack.continuity_actor,
+            "session_id": ack.session_id,
+        },
+        "deployment_snapshot": snapshot_json(&deploy_snapshot),
+    });
+    let (plan_token, sealed) = token::mint(
+        &cfg,
+        PlanClass::Automation,
+        stem,
+        cwd.map(str::to_string),
+        payload,
+    )?;
+    Ok(json!({
+        "plan_token": plan_token,
+        "class": "automation",
+        "unit": stem,
+        "action": "deploy-canary-ack",
+        "issued_at": crate::config::unix_to_rfc3339(sealed.issued_at),
+        "expires_at": crate::config::unix_to_rfc3339(sealed.expires_at),
+        "generation": ack.generation,
+        "actor": ack.actor,
+        "result": ack.result,
+        "note": "nothing has been executed; apply with the plan_token",
+    }))
+}
+
+fn apply_deploy_canary_ack(
+    plan: &token::SealedPlan,
+    _cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let snapshot = snapshot_from_json(
+        plan.payload
+            .get("deployment_snapshot")
+            .ok_or_else(|| BackendError("invalid automation plan token".into()))?,
+    )?;
+    require_snapshot_fresh(&snapshot)?;
+    let ack = canary_ack_from_plan(plan)?;
+    let path = Path::new(&snapshot.path);
+    let mut deployment = load_json_object(path, "deployment.json")?;
+    let state_dir = path
+        .parent()
+        .ok_or_else(|| BackendError("deployment.json has no parent".into()))?;
+    let published_path = state_dir.join("published-generation.json");
+    let gens_root = deployment
+        .get("generations_root")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    match classify_canary_ack(&ack, &deployment)? {
+        CanaryAckIntent::Fail { reason } => {
+            let prev = previous_promoted_sha(&deployment, &published_path, &gens_root)?;
+            let label = runtime_generation_label(&prev);
+            let now = crate::config::unix_to_rfc3339(crate::config::now_unix());
+            deployment["canary"] = json!({
+                "actor": ack.actor,
+                "result": "fail",
+                "observed_generation": ack.observed_generation,
+                "continuity": {
+                    "actor": ack.continuity_actor,
+                    "session_id": ack.session_id,
+                },
+                "recorded_at": now,
+                "reason": reason,
+            });
+            if let Some(candidate) = deployment.get_mut("candidate") {
+                if candidate.is_object() {
+                    candidate["phase"] = json!("candidate");
+                }
+            }
+            deployment["recovery"] = json!({
+                "target": {"sha": prev, "label": label},
+                "midi_alive_at": "",
+                "reason": reason,
+            });
+            atomic_write(path, &serialize_pretty(&deployment)?)?;
+            let candidate_label = candidate_output_revision(&deployment)
+                .map(runtime_generation_label)
+                .unwrap_or_default();
+            notify_canary_recovery(
+                &label,
+                &prev,
+                &candidate_label,
+                &reason,
+                &ack.observed_generation,
+            );
+            Ok(json!({
+                "class": "automation",
+                "unit": plan.unit,
+                "action": "deploy-canary-ack",
+                "applied": true,
+                "result": "fail",
+                "recovery_target": {"sha": prev, "label": label},
+            }))
+        }
+        CanaryAckIntent::Recovered => {
+            let now = crate::config::unix_to_rfc3339(crate::config::now_unix());
+            match deployment.get_mut("recovery") {
+                Some(Value::Object(map)) => {
+                    map.insert("midi_alive_at".into(), json!(now));
+                }
+                _ => {
+                    return Err(BackendError(
+                        "result=recovered refused: no recovery.target".into(),
+                    ))
+                }
+            }
+            atomic_write(path, &serialize_pretty(&deployment)?)?;
+            Ok(json!({
+                "class": "automation",
+                "unit": plan.unit,
+                "action": "deploy-canary-ack",
+                "applied": true,
+                "result": "recovered",
+                "midi_alive_at": now,
+            }))
+        }
+        CanaryAckIntent::Pass => {
+            if already_promoted(&deployment, &published_path, &gens_root) {
+                return Ok(json!({
+                    "class": "automation",
+                    "unit": plan.unit,
+                    "action": "deploy-canary-ack",
+                    "applied": true,
+                    "result": "pass",
+                    "noop": true,
+                }));
+            }
+            promote_runtime_candidate(&deployment, state_dir)?;
+            let now = crate::config::unix_to_rfc3339(crate::config::now_unix());
+            let cand_sha = candidate_output_revision(&deployment)
+                .ok_or_else(|| BackendError("candidate.output_revision is missing".into()))?
+                .to_string();
+            let cand_gen = deployment
+                .get("candidate")
+                .and_then(|value| value.get("generation"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            deployment["canary"] = json!({
+                "actor": ack.actor,
+                "result": "pass",
+                "observed_generation": ack.observed_generation,
+                "continuity": {
+                    "actor": ack.continuity_actor,
+                    "session_id": ack.session_id,
+                },
+                "recorded_at": now,
+            });
+            if let Some(candidate) = deployment.get_mut("candidate") {
+                if candidate.is_object() {
+                    candidate["phase"] = json!("rolling_out");
+                }
+            }
+            deployment["promoted"] = json!({
+                "generation": cand_gen,
+                "output_revision": cand_sha,
+                "promoted_at": now,
+            });
+            atomic_write(path, &serialize_pretty(&deployment)?)?;
+            Ok(json!({
+                "class": "automation",
+                "unit": plan.unit,
+                "action": "deploy-canary-ack",
+                "applied": true,
+                "result": "pass",
+                "noop": false,
+            }))
+        }
+    }
+}
 
 pub fn apply(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, BackendError> {
     token::require_class(plan, PlanClass::Automation)?;
@@ -2538,6 +3126,7 @@ pub fn apply(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Backe
             }))
         }
         "admit" => apply_admit(plan, cwd),
+        "deploy-canary-ack" => apply_deploy_canary_ack(plan, cwd),
         _ => Err(BackendError("invalid automation plan token".into())),
     }
 }
