@@ -368,11 +368,17 @@ instance names; it describes the two loops from the charter.
 `docs/TESTING.md` names every new `tests/*.sh` added by Tasks 2-8.
 No em dash, no non-ASCII.
 
-- [ ] **Step 1: Write the failing proofs / doc assertions**
-- [ ] **Step 2: Make them pass**
-- [ ] **Step 3: Commit**
+- [x] **Step 1: Write the failing proofs / doc assertions**
+- [x] **Step 2: Make them pass**
+- [x] **Step 3: Commit**
 
 `git commit -m "feat: surface deploy and admission stalls; rewrite topology"`
+Landed `d7a5871` and required-fix `24ea3af`. Isolated
+`review-sdo-a89.12` FAIL on D8 talker get_operation;
+`review-sdo-a89.12b` PASS. leftover: live oh-my-pi topology copy
+is lead-only (applied); deployment_inspect stub when file absent
+and integrator active; hermetic proof does not pin
+runtime_generation/retained/omp@+8; pre-existing tui.rs em dashes.
 
 ---
 
