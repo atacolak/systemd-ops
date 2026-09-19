@@ -442,7 +442,12 @@ fn process_cwd(explicit: Option<String>) -> Result<String, BackendError> {
         .map_err(|e| BackendError(format!("cannot resolve cwd: {e}")))
 }
 
-fn run_inspect(cmd: &str, args: &mut Vec<String>) -> Result<Value, BackendError> {
+fn run_inspect(
+    cmd: &str,
+    args: &mut Vec<String>,
+    scope_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
     match cmd {
         "list-units" => {
             let state = take_opt(args, "--state").map_err(BackendError)?;
@@ -467,7 +472,7 @@ fn run_inspect(cmd: &str, args: &mut Vec<String>) -> Result<Value, BackendError>
         "get-operation" => {
             let unit = require_opt(args, "--unit").map_err(BackendError)?;
             remaining_flags(args).map_err(BackendError)?;
-            operations::get_operation(&unit)
+            automation::inspect_operation_view(&unit, scope_root, cwd)
         }
         "list-timers" => {
             let pattern = take_opt(args, "--pattern").map_err(BackendError)?;
@@ -1046,7 +1051,10 @@ fn main() -> ExitCode {
     }
     let cmd = rest.remove(0);
     match group.as_str() {
-        "inspect" => from_result(json_mode, run_inspect(&cmd, &mut rest)),
+        "inspect" => from_result(
+            json_mode,
+            run_inspect(&cmd, &mut rest, scope_root.as_deref(), cwd_ref),
+        ),
         "control" => from_result(json_mode, run_control(&cmd, &mut rest, cwd_ref)),
         "author" => from_result(json_mode, run_author(&cmd, &mut rest, cwd_ref)),
         "scope" => from_result(

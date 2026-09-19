@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -3559,6 +3559,7 @@ fn git_is_ancestor(worktree: &Path, revision: &str) -> bool {
     };
     Command::new("git")
         .args(["-C", dir, "merge-base", "--is-ancestor", revision, "HEAD"])
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -4771,6 +4772,29 @@ pub fn inspect(
             .unwrap_or(json!(false));
     }
     Ok(payload)
+}
+
+pub fn inspect_operation_view(
+    name: &str,
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let mut view = crate::operations::get_operation(name)?;
+    let stem = view
+        .get("unit")
+        .and_then(Value::as_str)
+        .unwrap_or(name)
+        .to_string();
+    let Ok(manifest) = resolved_manifest(explicit_root, cwd) else {
+        return Ok(view);
+    };
+    let (mut automation, _) = join_operation(&manifest, &stem);
+    let service_active = view.get("state").and_then(Value::as_str) == Some("active");
+    attach_inspect_surfaces(&manifest.root, &stem, service_active, &mut automation);
+    if let Some(object) = view.as_object_mut() {
+        object.insert("automation".into(), automation);
+    }
+    Ok(view)
 }
 
 pub fn complete_now(

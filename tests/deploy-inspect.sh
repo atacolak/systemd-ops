@@ -234,6 +234,11 @@ ok "$SHOW"
 has_attention "$SHOW" canary_pending "$STEM" \
   || fail "missing canary_pending attention: $SHOW"
 
+GET=$(json inspect get-operation --unit "$STEM")
+ok "$GET"
+jq -e --arg phase "$phase" '.data.automation.deployment.phase == $phase' <<<"$GET" >/dev/null \
+  || fail "get-operation phase != inspect '$phase': $GET"
+
 # Fixture 2: stall.reason set => deploy_stalled. Health stays healthy.
 write_deployment candidate pending "canary actor missing" true
 INSPECT=$(json automation inspect --unit "$STEM")
@@ -246,6 +251,11 @@ ok "$SHOW"
   || fail "deploy_stalled degraded health: $SHOW"
 has_attention "$SHOW" deploy_stalled "$STEM" \
   || fail "missing deploy_stalled attention: $SHOW"
+
+GET=$(json inspect get-operation --unit "$STEM")
+ok "$GET"
+jq -e --arg stall "$stall" '.data.automation.deployment.stall.reason == $stall' <<<"$GET" >/dev/null \
+  || fail "get-operation stall != inspect '$stall': $GET"
 
 # Fixture 3: integrator active + no candidate => composing (inspect-derived).
 rm -f "$DEPLOY"
@@ -299,6 +309,17 @@ ok "$SHOW"
   || fail "admission_unconsumed degraded health: $SHOW"
 has_attention "$SHOW" admission_unconsumed "$CAP_STEM" \
   || fail "missing admission_unconsumed attention: $SHOW"
+
+GET_ERR=$TMP/get-operation.err
+GET=$(json inspect get-operation --unit "$CAP_STEM" 2>"$GET_ERR")
+ok "$GET"
+jq -e '.data.automation.desired_unconsumed == true' <<<"$GET" >/dev/null \
+  || fail "get-operation expected desired_unconsumed true: $GET"
+jq -e '.data.automation.desired_inputs | type == "object"' <<<"$GET" >/dev/null \
+  || fail "get-operation expected desired_inputs object: $GET"
+if grep -E 'fatal:|Not a valid commit name' "$GET_ERR"; then
+  fail "get-operation printed git fatal: $(cat "$GET_ERR")"
+fi
 
 # Topology: two loops, no PR numbers, no instance names.
 [[ -f $TOPO ]] || fail "missing $TOPO"

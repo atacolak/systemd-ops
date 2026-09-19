@@ -9,6 +9,7 @@ use std::io::{BufRead, Write};
 
 use serde_json::{json, Value};
 
+use crate::automation;
 use crate::operations;
 use crate::systemd::{self, BackendError, Grants, Scope};
 use crate::write;
@@ -190,7 +191,8 @@ fn catalog() -> &'static [Tool] {
             name: "get_operation",
             scope: Scope::UnitsRead,
             description: "One write-prefix operation by stem (managed-mail-check) or constituent unit \
-                          name. Same fields as list_operations, including editable_spec and health.",
+                          name. Same fields as list_operations, including editable_spec, health, and \
+                          an automation object when the operation has automation state.",
             schema: || {
                 json!({
                     "type": "object",
@@ -583,7 +585,7 @@ fn run_tool(name: &str, args: &Value) -> Result<Value, CallError> {
         )?),
         "failed_units" => Ok(systemd::failed_units()?),
         "list_operations" => Ok(operations::list_operations(pattern_arg(args))?),
-        "get_operation" => Ok(operations::get_operation(required_unit(args)?)?),
+        "get_operation" => Ok(automation::inspect_operation_view(required_unit(args)?, None, None)?),
         "get_unit" => Ok(systemd::get_unit(required_unit(args)?)?),
         "unit_properties" => {
             let select: Vec<String> = args
