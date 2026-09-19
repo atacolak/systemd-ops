@@ -306,11 +306,15 @@ retires the unit (absent from `list-operations`) and emits one
 GitHub call site. Worktree removal runs only when `git worktree list`
 names the operation `cwd`.
 
-- [ ] **Step 1: Write the failing proof**
-- [ ] **Step 2: Make the proof pass**
-- [ ] **Step 3: Commit**
+- [x] **Step 1: Write the failing proof**
+- [x] **Step 2: Make the proof pass**
+- [x] **Step 3: Commit**
 
 `git commit -m "feat: normalize a merged PR out of the organism"`
+Landed `8c2a12c`. `review-sdo-a89.10` PASS. leftover: retired
+automation home remains (existing plan-retire preserves homes);
+merged_at is token metadata, not RFC3339-parsed; github rg in
+the proof is same-run.
 
 ---
 
