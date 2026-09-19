@@ -1,0 +1,16 @@
+OMP
+|
++- capability-maintain                         recurrent
+|      capability publication
+|         +- PR-maintain
+|                upstream merge
+|                   +- capability normalize
+|                          ephemeral machinery retirement
+|
++- runtime                                     recurrent
+       compose
+          candidate
+             canary
+                promote
+                   occupancy
+                      generation GC

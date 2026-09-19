@@ -240,6 +240,7 @@ ScopeView
   watching[]  operation views
   attention[] { operation, relationship, code, reason }
               code: operation_failed | operation_unknown | wanted_inactive
+                    | deploy_stalled | canary_pending | admission_unconsumed
   warnings[]  soft/non-fatal notes (e.g. malformed operator state)
 ```
 
@@ -284,6 +285,9 @@ should notice. No acknowledgement lifecycle.
 | `operation_failed` | owned or watched operation health `failed` | `failed` when owned and critical, else `degraded` |
 | `operation_unknown` | owned critical operation health `unknown` that is not `wanted_inactive` | `unknown` |
 | `wanted_inactive` | owned timer oneshot, enablement on, lifecycle not completed, no future trigger | none on its own; `unknown` only because the unit is critical |
+| `deploy_stalled` | runtime-integrator `deployment.stall.reason` is non-empty | none |
+| `canary_pending` | runtime-integrator phase is `candidate` and canary.result is `pending` | none |
+| `admission_unconsumed` | capability `desired_unconsumed` is true | none |
 
 A lifecycle-completed operation is never listed: completion disables the
 timer on purpose, and completed operations are read as `healthy` during

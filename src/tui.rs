@@ -171,6 +171,8 @@ struct Row {
     checkpoint_generation: String,
     checkpoint_output: String,
     blocker: String,
+    attention_code: String,
+    attention_reason: String,
     depth: usize,
     last_child: bool,
     tree_prefix: String,
@@ -799,6 +801,8 @@ fn row_from_view(v: &Value, relationship: &'static str) -> Option<Row> {
         checkpoint_generation,
         checkpoint_output,
         blocker,
+        attention_code: json_str(v, "attention_code"),
+        attention_reason: json_str(v, "attention_reason"),
         depth: 0,
         last_child: false,
         tree_prefix: String::new(),
@@ -2259,6 +2263,12 @@ fn when_label(r: &Row, now: SystemTime) -> String {
         }
         return "failed".into();
     }
+    if !r.attention_code.is_empty() {
+        if r.attention_reason.is_empty() {
+            return r.attention_code.clone();
+        }
+        return format!("{}: {}", r.attention_code, r.attention_reason);
+    }
     let intelligent_running = r.active_iteration.is_some()
         && (r.state == "active" || r.state == "activating")
         && (r.sub == "running" || r.sub == "start");
@@ -2532,6 +2542,8 @@ mod tests {
             checkpoint_generation: String::new(),
             checkpoint_output: String::new(),
             blocker: String::new(),
+            attention_code: String::new(),
+            attention_reason: String::new(),
             depth: 0,
             last_child: false,
             tree_prefix: String::new(),
@@ -2845,6 +2857,30 @@ mod tests {
         assert_eq!(mark(&row.semantic_state, &row.health, &row.lifecycle), "✓");
 
         assert_eq!(when_label(&row, SystemTime::now()), "completed");
+    }
+
+    #[test]
+    fn reason_column_shows_attention_code_and_stall() {
+        let mut row = dummy("managed-omp-runtime-integrator", "owned");
+        row.health = "healthy".into();
+        row.attention_code = "canary_pending".into();
+        row.attention_reason = "canary result pending".into();
+        assert_eq!(
+            when_label(&row, SystemTime::now()),
+            "canary_pending: canary result pending"
+        );
+        row.attention_code = "deploy_stalled".into();
+        row.attention_reason = "canary actor missing".into();
+        assert_eq!(
+            when_label(&row, SystemTime::now()),
+            "deploy_stalled: canary actor missing"
+        );
+        row.attention_code = "admission_unconsumed".into();
+        row.attention_reason = "desired inputs unconsumed".into();
+        assert_eq!(
+            when_label(&row, SystemTime::now()),
+            "admission_unconsumed: desired inputs unconsumed"
+        );
     }
 
     #[test]

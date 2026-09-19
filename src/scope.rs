@@ -431,6 +431,15 @@ pub fn aggregate(
             json!(crate::automation::operation_home(&manifest.root, &unit).to_string_lossy());
 
         view["automation"] = automation;
+        let service_active = view.get("state").and_then(Value::as_str) == Some("active");
+        if let Some(automation) = view.get_mut("automation") {
+            crate::automation::attach_inspect_surfaces(
+                &manifest.root,
+                &unit,
+                service_active,
+                automation,
+            );
+        }
         if view.get("definition_revision").is_none() {
             view["definition_revision"] = Value::Null;
         }
@@ -499,6 +508,29 @@ pub fn aggregate(
             }
             _ => {}
         }
+        let stem = view
+            .get("unit")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        for (code, reason) in inspect_attention_labels(&view) {
+            attention.push(Attention {
+                operation: stem.clone(),
+                relationship: "owned",
+                code,
+                reason: reason.clone(),
+            });
+            if view
+                .get("attention_code")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty()
+                || code == "deploy_stalled"
+            {
+                view["attention_code"] = json!(code);
+                view["attention_reason"] = json!(reason);
+            }
+        }
         owned.push(view);
     }
     crate::automation::derive_semantic_states(&mut owned);
@@ -550,6 +582,44 @@ pub fn aggregate(
         attention,
         warnings,
     }
+}
+
+fn inspect_attention_labels(view: &Value) -> Vec<(&'static str, String)> {
+    let automation = view.get("automation").unwrap_or(&Value::Null);
+    let mut labels = Vec::new();
+    let stall_reason = automation
+        .get("deployment")
+        .and_then(|deployment| deployment.get("stall"))
+        .and_then(|stall| stall.get("reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !stall_reason.is_empty() {
+        labels.push(("deploy_stalled", stall_reason.to_string()));
+    }
+    let phase = automation
+        .get("deployment")
+        .and_then(|deployment| deployment.get("phase"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let canary_pending = phase == "candidate"
+        && automation
+            .get("deployment")
+            .and_then(|deployment| deployment.get("canary"))
+            .and_then(|canary| canary.get("result"))
+            .and_then(Value::as_str)
+            == Some("pending");
+    if canary_pending {
+        labels.push(("canary_pending", "canary result pending".into()));
+    }
+    if automation
+        .get("desired_unconsumed")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        labels.push(("admission_unconsumed", "desired inputs unconsumed".into()));
+    }
+    labels
 }
 
 fn validate_coordination_lead(value: &str) -> Result<String, BackendError> {

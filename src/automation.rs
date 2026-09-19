@@ -3479,8 +3479,158 @@ fn runtime_generation_projection(root: &Path, stem: &str) -> Value {
     json!({
         "promoted": promoted,
         "candidate": candidate,
+        "cohort": occupancy_cohort(deployment_ref),
         "retained": retained,
     })
+}
+
+fn occupancy_cohort(deployment: &Value) -> Value {
+    let promoted = promoted_output_revision(deployment, None);
+    let mut migrated = Vec::new();
+    let mut pending = Vec::new();
+    let Some(rows) = deployment.get("occupancy").and_then(Value::as_array) else {
+        return json!({ "migrated": migrated, "pending": pending });
+    };
+    for row in rows {
+        let sha = row
+            .get("runtime_generation")
+            .and_then(|value| value.get("sha"))
+            .and_then(Value::as_str);
+        let upgrade = row.get("upgrade_target");
+        let waiting = match upgrade {
+            None | Some(Value::Null) => false,
+            Some(_) => true,
+        };
+        let live_behind = row.get("state").and_then(Value::as_str) == Some("live")
+            && sha.is_some()
+            && sha != promoted;
+        if waiting || live_behind {
+            pending.push(row.clone());
+        } else {
+            migrated.push(row.clone());
+        }
+    }
+    json!({ "migrated": migrated, "pending": pending })
+}
+
+fn operator_deployment_phase(deployment: Option<&Value>, service_active: bool) -> Option<String> {
+    let empty = json!({});
+    let value = deployment.unwrap_or(&empty);
+    if candidate_output_revision(value).is_none() {
+        return service_active.then(|| "composing".into());
+    }
+    let stored = value
+        .get("candidate")
+        .and_then(|candidate| candidate.get("phase"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    Some(match stored {
+        "composed" => "composing".into(),
+        "candidate" | "canary" | "rolling_out" | "converged" => stored.into(),
+        _ => "candidate".into(),
+    })
+}
+
+fn deployment_inspect(root: &Path, stem: &str, service_active: bool) -> Value {
+    let loaded = load_json_object(&deployment_path(root, stem), "deployment.json").ok();
+    let phase = operator_deployment_phase(loaded.as_ref(), service_active);
+    match (loaded, phase) {
+        (Some(mut value), Some(phase)) => {
+            value["phase"] = json!(phase);
+            value
+        }
+        (Some(mut value), None) => {
+            value["phase"] = Value::Null;
+            value
+        }
+        (None, Some(phase)) => json!({
+            "phase": phase,
+            "stall": Value::Null,
+            "occupancy": [],
+            "recovery": Value::Null,
+        }),
+        (None, None) => Value::Null,
+    }
+}
+
+fn git_is_ancestor(worktree: &Path, revision: &str) -> bool {
+    let Some(dir) = worktree.to_str() else {
+        return false;
+    };
+    Command::new("git")
+        .args(["-C", dir, "merge-base", "--is-ancestor", revision, "HEAD"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn desired_input_unconsumed(input: &DesiredInput, worktree: Option<&Path>) -> bool {
+    let Some(worktree) = worktree.filter(|path| path.exists()) else {
+        return true;
+    };
+    match input.artifact_kind.as_str() {
+        "commit" => match input.artifact_revision.as_deref() {
+            Some(revision) if !revision.is_empty() => !git_is_ancestor(worktree, revision),
+            _ => true,
+        },
+        "worktree-delta" => {
+            let Some(delta) = input.delta.as_ref() else {
+                return true;
+            };
+            delta
+                .iter()
+                .any(|file| match fs::read(worktree.join(&file.path)) {
+                    Ok(bytes) => sha256_hex(&bytes) != file.sha256,
+                    Err(_) => true,
+                })
+        }
+        _ => true,
+    }
+}
+
+fn capability_desired_inspect(root: &Path, stem: &str) -> (Value, bool) {
+    let path = desired_inputs_path(root, stem);
+    let Some(bytes) = read_optional_bytes(&path).ok().flatten() else {
+        return (Value::Null, false);
+    };
+    let Ok(desired) = serde_json::from_slice::<DesiredInputsFile>(&bytes) else {
+        return (Value::Null, true);
+    };
+    let worktree = bound_working_directory(stem).map(PathBuf::from);
+    let unconsumed = desired
+        .inputs
+        .iter()
+        .any(|input| desired_input_unconsumed(input, worktree.as_deref()));
+    (
+        serde_json::to_value(&desired).unwrap_or(Value::Null),
+        unconsumed,
+    )
+}
+
+pub(crate) fn attach_inspect_surfaces(
+    root: &Path,
+    stem: &str,
+    service_active: bool,
+    automation: &mut Value,
+) {
+    let Some(object) = automation.as_object_mut() else {
+        return;
+    };
+    if stem == RUNTIME_INTEGRATOR {
+        object.insert(
+            "deployment".into(),
+            deployment_inspect(root, stem, service_active),
+        );
+        object.insert(
+            "runtime_generation".into(),
+            runtime_generation_projection(root, stem),
+        );
+    }
+    if stem.starts_with("managed-omp-cap-") {
+        let (desired_inputs, desired_unconsumed) = capability_desired_inspect(root, stem);
+        object.insert("desired_inputs".into(), desired_inputs);
+        object.insert("desired_unconsumed".into(), json!(desired_unconsumed));
+    }
 }
 
 pub fn plan_deploy_occupancy(
@@ -4594,25 +4744,31 @@ pub fn inspect(
         .find(|operation| operation.get("unit").and_then(Value::as_str) == Some(stem))
         .unwrap_or(Value::Null);
     let mut automation = operation.get("automation").cloned().unwrap_or(Value::Null);
-    let runtime_generation = if stem == RUNTIME_INTEGRATOR {
-        runtime_generation_projection(&manifest.root, stem)
-    } else {
-        Value::Null
-    };
-    if stem == RUNTIME_INTEGRATOR {
-        if let Some(object) = automation.as_object_mut() {
-            object.insert("runtime_generation".into(), runtime_generation.clone());
-        }
-    }
+    let service_active = operation.get("state").and_then(Value::as_str) == Some("active");
+    attach_inspect_surfaces(&manifest.root, stem, service_active, &mut automation);
     let mut payload = json!({
         "unit": stem,
         "metadata_file": metadata_path(&manifest.root, stem),
-        "automation": automation,
+        "automation": automation.clone(),
         "relations": operation.get("relations").cloned().unwrap_or(Value::Null),
         "operation": operation,
     });
     if stem == RUNTIME_INTEGRATOR {
-        payload["runtime_generation"] = runtime_generation;
+        payload["runtime_generation"] = automation
+            .get("runtime_generation")
+            .cloned()
+            .unwrap_or(Value::Null);
+        payload["deployment"] = automation.get("deployment").cloned().unwrap_or(Value::Null);
+    }
+    if stem.starts_with("managed-omp-cap-") {
+        payload["desired_inputs"] = automation
+            .get("desired_inputs")
+            .cloned()
+            .unwrap_or(Value::Null);
+        payload["desired_unconsumed"] = automation
+            .get("desired_unconsumed")
+            .cloned()
+            .unwrap_or(json!(false));
     }
     Ok(payload)
 }
