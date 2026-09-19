@@ -84,6 +84,7 @@ Commands:
   automation plan-deploy-occupancy --spec JSON
   automation plan-deploy-gc --generation SHA
   automation plan-normalize-pr --spec JSON
+  automation plan-normalize-capability --spec JSON
   automation plan-create --spec JSON
   automation plan-update --spec JSON
   automation plan-complete --unit STEM --reason TEXT
@@ -760,6 +761,13 @@ fn run_automation(
                 .ok_or_else(|| BackendError("missing --spec".into()))?;
             remaining_flags(args).map_err(BackendError)?;
             automation::plan_normalize_pr(&json!({ "spec": spec }), scope_root, cwd)
+        }
+        "plan-normalize-capability" => {
+            let spec = json_arg(args, "--spec")
+                .map_err(BackendError)?
+                .ok_or_else(|| BackendError("missing --spec".into()))?;
+            remaining_flags(args).map_err(BackendError)?;
+            automation::plan_normalize_capability(&json!({ "spec": spec }), scope_root, cwd)
         }
 
         "plan-create" | "plan-update" => {

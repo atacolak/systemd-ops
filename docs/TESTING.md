@@ -23,6 +23,7 @@ bash tests/runtime-generation-publish.sh
 bash tests/deploy-canary.sh
 bash tests/deploy-gc.sh
 bash tests/normalize-pr.sh
+bash tests/normalize-capability.sh
 bash tests/runtime-worktree-rebind.sh
 bash tests/pr-settlement.sh
 bash tests/pr-severity.sh

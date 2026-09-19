@@ -3883,6 +3883,256 @@ fn apply_normalize_pr(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Val
     }))
 }
 
+struct NormalizeCapabilitySpec {
+    unit: String,
+}
+
+fn parse_normalize_capability_spec(spec: &Value) -> Result<NormalizeCapabilitySpec, BackendError> {
+    if !spec.is_object() {
+        return Err(BackendError(
+            "normalize-capability spec must be an object".into(),
+        ));
+    }
+    if spec.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err(BackendError(
+            "normalize-capability spec version must be 1".into(),
+        ));
+    }
+    let unit = spec
+        .get("unit")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.contains(['\n', '\r']))
+        .ok_or_else(|| BackendError("spec.unit is required".into()))?;
+    Ok(NormalizeCapabilitySpec {
+        unit: unit.to_string(),
+    })
+}
+
+fn capability_run_lib() -> PathBuf {
+    if let Ok(value) = std::env::var("CAPABILITY_RUN_LIB") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("dogfood/drivers/capability-run")
+}
+
+fn current_upstream_generation(root: &Path) -> Result<String, BackendError> {
+    if let Ok(value) = std::env::var("UPSTREAM_GENERATION") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    let path = operation_home(root, "managed-omp-release-watch").join("state/generation.json");
+    let parsed = load_json_object(&path, "generation.json")?;
+    parsed
+        .get("target_commit")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| BackendError("missing current upstream generation".into()))
+}
+
+fn invoke_capability_pass_is_verified_noop(
+    generation: &str,
+    worktree: &Path,
+) -> Result<bool, BackendError> {
+    let lib = capability_run_lib();
+    let lib = lib
+        .to_str()
+        .ok_or_else(|| BackendError("capability-run path is not utf-8".into()))?;
+    let worktree = worktree
+        .to_str()
+        .ok_or_else(|| BackendError("worktree path is not utf-8".into()))?;
+    // Source only the named predicate. Do not execute capability-run's driver body.
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+set -euo pipefail
+lib=$1
+generation=$2
+worktree=$3
+source /dev/stdin <<<"$(sed -n '/^capability_pass_is_verified_noop()/,/^}/p' "$lib")"
+capability_pass_is_verified_noop 0 "$generation" "$worktree"
+"#,
+            "capability-verified-noop",
+            lib,
+            generation,
+            worktree,
+        ])
+        .output()
+        .map_err(|error| {
+            BackendError(format!(
+                "cannot invoke capability_pass_is_verified_noop: {error}"
+            ))
+        })?;
+    Ok(output.status.success())
+}
+
+fn pr_maintainer_children(
+    manifest: &ScopeManifest,
+    parent: &str,
+) -> Result<Vec<String>, BackendError> {
+    let dir = systemd::unit_file_dir();
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(BackendError(format!(
+                "cannot read unit directory {}: {error}",
+                dir.display()
+            )))
+        }
+    };
+    let mut children = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            BackendError(format!(
+                "cannot read unit directory {}: {error}",
+                dir.display()
+            ))
+        })?;
+        let name = match entry.file_name().to_str() {
+            Some(name) if name.ends_with(".service") => name.to_string(),
+            _ => continue,
+        };
+        let stem = name.trim_end_matches(".service");
+        if stem == parent {
+            continue;
+        }
+        if !manifest
+            .owned
+            .iter()
+            .any(|glob| crate::scope::glob_matches_stem(glob, stem))
+        {
+            continue;
+        }
+        let Some(metadata) = load_metadata(&manifest.root, stem)? else {
+            continue;
+        };
+        if metadata.agent == "pr-maintainer" && metadata.parent.as_deref() == Some(parent) {
+            children.push(stem.to_string());
+        }
+    }
+    children.sort();
+    Ok(children)
+}
+
+fn notify_normalize_capability(unit: &str) {
+    let message = format!("unit={unit}");
+    if let Some(lib) = std::env::var("SYSTEM_NOTIFY_LIB")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        let _ = Command::new(lib)
+            .args(["omp-runtime", "inform", &message])
+            .status();
+        return;
+    }
+    let lib = dogfood_lib("system-notify");
+    let _ = Command::new("bash")
+        .args([
+            "-c",
+            "source \"$1\"; system_notify omp-runtime inform \"$2\"",
+            "system-notify",
+            lib.to_str().unwrap_or(""),
+            &message,
+        ])
+        .status();
+}
+
+pub fn plan_normalize_capability(
+    args: &Value,
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let spec = args
+        .get("spec")
+        .ok_or_else(|| BackendError("missing required argument: spec".into()))?;
+    let parsed = parse_normalize_capability_spec(spec)?;
+    let manifest = resolved_manifest(explicit_root, cwd)?;
+    crate::operator::require_owned(&manifest, &parsed.unit)?;
+    let bound_cwd = bound_working_directory(&parsed.unit)
+        .ok_or_else(|| BackendError("capability has no WorkingDirectory to verify".into()))?;
+    let generation = current_upstream_generation(&manifest.root)?;
+    if !invoke_capability_pass_is_verified_noop(&generation, Path::new(&bound_cwd))? {
+        return Err(BackendError(
+            "verified_noop failed against the current upstream generation".into(),
+        ));
+    }
+    let children = pr_maintainer_children(&manifest, &parsed.unit)?;
+    if !children.is_empty() {
+        return Err(BackendError(format!(
+            "pr-maintainer child remains: {}",
+            children.join(", ")
+        )));
+    }
+    let nested = plan_retire(&parsed.unit, explicit_root, cwd)?;
+    let retire_plan_token = nested
+        .get("plan_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("automation retire plan did not return a plan token".into()))?;
+    let cfg = crate::config::current_or_load()?;
+    let payload = json!({
+        "action": "normalize-capability",
+        "retire_plan_token": retire_plan_token,
+        "scope_root": manifest.root.to_string_lossy(),
+        "bound_cwd": bound_cwd,
+    });
+    let (plan_token, sealed) = token::mint(
+        &cfg,
+        PlanClass::Automation,
+        &parsed.unit,
+        cwd.map(str::to_string),
+        payload,
+    )?;
+    Ok(json!({
+        "plan_token": plan_token,
+        "class": "automation",
+        "unit": parsed.unit,
+        "action": "normalize-capability",
+        "issued_at": crate::config::unix_to_rfc3339(sealed.issued_at),
+        "expires_at": crate::config::unix_to_rfc3339(sealed.expires_at),
+        "systemd": nested,
+        "note": "nothing has been executed; apply with the plan_token",
+    }))
+}
+
+fn apply_normalize_capability(
+    plan: &token::SealedPlan,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let scope_root = plan
+        .payload
+        .get("scope_root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("invalid automation plan token".into()))?;
+    let retire_plan_token = plan
+        .payload
+        .get("retire_plan_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("invalid automation plan token".into()))?;
+    notify_normalize_capability(&plan.unit);
+    let systemd_result = crate::write::apply_with_context(retire_plan_token, cwd)?;
+    let worktree_removed = match plan.payload.get("bound_cwd").and_then(Value::as_str) {
+        Some(bound) => remove_registered_worktree(Path::new(scope_root), Path::new(bound))?,
+        None => false,
+    };
+    Ok(json!({
+        "class": "automation",
+        "unit": plan.unit,
+        "action": "normalize-capability",
+        "applied": true,
+        "worktree_removed": worktree_removed,
+        "systemd": systemd_result,
+    }))
+}
+
 pub fn apply(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, BackendError> {
     token::require_class(plan, PlanClass::Automation)?;
     let action = plan
@@ -3976,6 +4226,7 @@ pub fn apply(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Backe
         "deploy-occupancy" => apply_deploy_occupancy(plan, cwd),
         "deploy-gc" => apply_deploy_gc(plan, cwd),
         "normalize-pr" => apply_normalize_pr(plan, cwd),
+        "normalize-capability" => apply_normalize_capability(plan, cwd),
         _ => Err(BackendError("invalid automation plan token".into())),
     }
 }
