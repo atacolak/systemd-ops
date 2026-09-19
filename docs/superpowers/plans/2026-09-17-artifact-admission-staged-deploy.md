@@ -227,9 +227,11 @@ observed_generation mismatch, or failed continuity) leaves
 `current` and `published-generation.json` on the previous promoted
 generation, records `canary.result=fail`, writes `recovery.target`
 as that previous promoted identity (`omp@` + first 8), notifies
-midi with that target via the system-notify seam (stubbed; no real
-hcom), preserves the candidate, and does not set phase
-`rolling_out`. Midi is a required recovery occupant: a later
+midi via the system-notify seam (stubbed; no real hcom) with a
+message that names the failed candidate `omp@`+8, the restored
+`omp@`+8, and the refuse reason, preserves the candidate, and does
+not set phase `rolling_out`. Pass notify keeps the existing
+success note. Midi is a required recovery occupant: a later
 `result=pass` is refused until `result=recovered` (observed equal
 to `recovery.target.sha`) or an occupancy row `name=midi`
 `state=live` on that sha. Recovered does not flip. Pass after
@@ -269,6 +271,9 @@ it, and removes it when both checks pass.
 kept directory with at least one of the five reasons; a leftover
 with empty reasons is GC-eligible.
 `rg prune_runtime_generations dogfood/drivers/runtime-run` is empty.
+Already-live rows keep their recorded generation until a later
+occupancy apply. A live row is not a kill. New launches bind to
+promoted current; systemd-ops does not author them.
 
 - [ ] **Step 1: Write the failing proof**
 - [ ] **Step 2: Make the proof pass**

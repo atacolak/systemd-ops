@@ -31,6 +31,8 @@ not replace the charter. It names who invokes which verb:
 - midi: classify existing-vs-new capability; invoke admission (not
   cherry-pick); generation-targeted recycle; canary self-recycle onto G;
   occupancy and ACK state; one typed generation-upgrade event after promote.
+  midi/ayn.96 classifies and invokes admission for `omp-vuz.1` and
+  `omp-vuz.3`. livu does not author systemd-ops units.
 
 ## Mapping onto the current system
 
@@ -585,7 +587,7 @@ Promote is not a timer side effect.
       "version": 1,
       "generation": "<40 hex>",
       "actor": "midi",
-      "result": "pass|fail",
+      "result": "pass|fail|recovered",
       "observed_generation": "<40 hex>",
       "continuity": {
         "actor": "midi",
@@ -619,10 +621,14 @@ generation throughout canary. Apply then:
    Candidate failure recovery includes midi, not only the rest of
    the village.
 4. `system_notify omp-runtime inform` midi, who is the
-   worlds/recycle supervisor for this hop, naming that recovery
-   target as the generation midi must return to. systemd-ops does
-   not call `recycle_actor` or `hcom r`.
+   worlds/recycle supervisor for this hop. The message body MUST
+   contain three facts: failed candidate `omp@` plus first 8 of
+   the candidate identity sha; restored `omp@` plus first 8 of
+   `recovery.target.sha`; concrete evidence (the refuse reason
+   and `observed_generation`, or empty). systemd-ops does not
+   call `recycle_actor` or `hcom r`.
 5. Do not emit a village rollout or promoted-generation event.
+   Do not broadcast the candidate before a midi (ayn.94) pass.
 6. Retain the failed candidate. `retained[].reasons` includes
    `candidate` and `failed-canary` until a later compose supersedes
    the candidate field. GC of that sha is refused while those
@@ -649,9 +655,10 @@ does not flip current.
 Pass (only after the recovery hold is clear, or when there was no
 prior fail on this candidate): apply records canary evidence, then
 in the same apply promotes (D3 flip). systemd-ops does not recycle
-midi. It notifies and waits. Phase becomes `rolling_out`. A second
-pass ACK against the same candidate is a no-op flip (already
-promoted).
+midi. It notifies and waits. Pass notify keeps the existing
+success note; do not invent a second success template. Phase
+becomes `rolling_out`. A second pass ACK against the same
+candidate is a no-op flip (already promoted).
 
 A failed canary may be retried with a new ACK against the same
 candidate after midi is alive on the previous promoted generation.
@@ -686,6 +693,14 @@ After promote, phase becomes `rolling_out`. It becomes `converged`
 when every occupancy row is either acked on the promoted generation
 or `state=retired` / `state=stopped`.
 Stopped and retired are not eternal blockers.
+
+Already-live occupancy rows keep their recorded
+`runtime_generation` until midi publishes a later occupancy apply
+(recycle). systemd-ops does not recycle them. Leftover panes stay:
+a live occupancy row is not a kill or GC trigger. New actor
+launches are midi/worlds and bind to the promoted `current`
+pointer. systemd-ops does not author units and does not ask livu
+to author units.
 
     automation plan-deploy-gc --generation <40 hex>
     automation apply --plan-token <token>
@@ -830,8 +845,10 @@ Hermetic proofs, no live oh-my-pi writes:
 - `tests/deploy-canary.sh`: fail ACK (`result=fail`, actor not midi,
   observed_generation mismatch, failed continuity) keeps promoted,
   records `canary.result=fail`, writes `recovery.target` as the
-  previous promoted identity, notifies midi with that target,
-  preserves the candidate, and does not set `rolling_out`.
+  previous promoted identity, notifies midi with a system message
+  that names the failed candidate `omp@`+8, the restored `omp@`+8,
+  and the refuse reason, preserves the candidate, and does not set
+  `rolling_out`.
   `result=recovered` with observed equal to that target records
   midi alive and does not flip. Pass before recovered is refused.
   Pass after recovered flips once and is atomic (current and
@@ -872,11 +889,19 @@ it (named in `docs/TESTING.md` in the same commit that adds them).
    `256625ad` while bound sha256s do not match is invalid.
 3. Runtime compose builds candidate G, notifies midi, does not flip
    `current`.
-4. midi canaries onto G and ACKs.
+4. midi (ayn.94) dogfoods the exact candidate generation in a
+   disposable herdr pane, leaves a visible review pane for ata,
+   and ACKs. systemd-ops does not village-broadcast the candidate
+   before that pass. A fail ACK recovers midi onto the previous
+   promoted generation and injects the D4 fail system message.
 5. Promote flips `current`. midi emits the generation-upgrade event.
-   Occupancy ACKs roll the fleet. GC waits.
+   Occupancy ACKs roll the fleet. Already-live actors stay on their
+   immutable generation until recycle. New actors launch on
+   promoted current. Leftover panes stay. GC waits.
 6. Only then is `.66` product-closed.
-7. Repeat immediately with `omp-vuz.1`.
+7. Repeat immediately with `omp-vuz.1`, then `omp-vuz.3`. midi/ayn.96
+   classifies and invokes admit; hera composes. livu does not
+   author units.
 
 Hand-author of livu's three (now four) proposed units, hand-merge
 onto fork/runtime, and hand-repoint of `~/.bun/bin/omp` are
