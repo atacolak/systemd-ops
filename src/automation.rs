@@ -3671,6 +3671,218 @@ fn apply_deploy_gc(plan: &token::SealedPlan, _cwd: Option<&str>) -> Result<Value
     }))
 }
 
+struct NormalizePrSpec {
+    unit: String,
+    pr: String,
+    merge_sha: String,
+    merged_at: String,
+}
+
+fn parse_normalize_pr_spec(spec: &Value) -> Result<NormalizePrSpec, BackendError> {
+    if !spec.is_object() {
+        return Err(BackendError("normalize-pr spec must be an object".into()));
+    }
+    if spec.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err(BackendError("normalize-pr spec version must be 1".into()));
+    }
+    let unit = spec
+        .get("unit")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("spec.unit is required".into()))?;
+    let merge_sha = match spec.get("merge_sha") {
+        None | Some(Value::Null) => {
+            return Err(BackendError("missing required argument: merge_sha".into()))
+        }
+        Some(Value::String(value)) if value.is_empty() => {
+            return Err(BackendError("missing required argument: merge_sha".into()))
+        }
+        Some(Value::String(value)) => lowercase_hex("merge_sha", value, 40)?,
+        Some(_) => return Err(BackendError("merge_sha must be 40 lowercase hex".into())),
+    };
+    let pr = match spec.get("pr") {
+        Some(Value::String(value)) if !value.is_empty() && !value.contains(['\n', '\r']) => {
+            value.clone()
+        }
+        Some(Value::Number(value)) => value.to_string(),
+        _ => return Err(BackendError("pr is required".into())),
+    };
+    let merged_at = spec
+        .get("merged_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.contains(['\n', '\r']))
+        .ok_or_else(|| BackendError("merged_at is required".into()))?
+        .to_string();
+    Ok(NormalizePrSpec {
+        unit: unit.to_string(),
+        pr,
+        merge_sha,
+        merged_at,
+    })
+}
+
+fn bound_working_directory(stem: &str) -> Option<String> {
+    let path = systemd::unit_file_dir().join(format!("{stem}.service"));
+    let text = fs::read_to_string(path).ok()?;
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("WorkingDirectory=")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn worktree_is_registered(scope_root: &Path, cwd: &Path) -> bool {
+    let Some(root) = scope_root.to_str() else {
+        return false;
+    };
+    let Ok(output) = Command::new("git")
+        .args(["-C", root, "worktree", "list", "--porcelain"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let wanted = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .any(|listed| listed.canonicalize().unwrap_or(listed) == wanted)
+}
+
+fn notify_normalize_pr(pr: &str, merge_sha: &str, unit: &str) {
+    let message = format!("pr={pr} merge_sha={merge_sha} unit={unit}");
+    if let Some(lib) = std::env::var("SYSTEM_NOTIFY_LIB")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        let _ = Command::new(lib)
+            .args(["omp-runtime", "inform", &message])
+            .status();
+        return;
+    }
+    let lib = dogfood_lib("system-notify");
+    let _ = Command::new("bash")
+        .args([
+            "-c",
+            "source \"$1\"; system_notify omp-runtime inform \"$2\"",
+            "system-notify",
+            lib.to_str().unwrap_or(""),
+            &message,
+        ])
+        .status();
+}
+
+fn remove_registered_worktree(scope_root: &Path, cwd: &Path) -> Result<bool, BackendError> {
+    if !cwd.exists() || !worktree_is_registered(scope_root, cwd) {
+        return Ok(false);
+    }
+    let Some(root) = scope_root.to_str() else {
+        return Ok(false);
+    };
+    let _ = Command::new("git")
+        .args(["-C", root, "worktree", "remove", "--force"])
+        .arg(cwd)
+        .status();
+    if cwd.exists() {
+        fs::remove_dir_all(cwd).map_err(|error| {
+            BackendError(format!("cannot remove worktree {}: {error}", cwd.display()))
+        })?;
+    }
+    Ok(!cwd.exists())
+}
+
+pub fn plan_normalize_pr(
+    args: &Value,
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let spec = args
+        .get("spec")
+        .ok_or_else(|| BackendError("missing required argument: spec".into()))?;
+    let parsed = parse_normalize_pr_spec(spec)?;
+    let manifest = resolved_manifest(explicit_root, cwd)?;
+    crate::operator::require_owned(&manifest, &parsed.unit)?;
+    let nested = plan_retire(&parsed.unit, explicit_root, cwd)?;
+    let retire_plan_token = nested
+        .get("plan_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("automation retire plan did not return a plan token".into()))?;
+    let bound_cwd = bound_working_directory(&parsed.unit);
+    let cfg = crate::config::current_or_load()?;
+    let payload = json!({
+        "action": "normalize-pr",
+        "retire_plan_token": retire_plan_token,
+        "scope_root": manifest.root.to_string_lossy(),
+        "pr": parsed.pr,
+        "merge_sha": parsed.merge_sha,
+        "merged_at": parsed.merged_at,
+        "bound_cwd": bound_cwd,
+    });
+    let (plan_token, sealed) = token::mint(
+        &cfg,
+        PlanClass::Automation,
+        &parsed.unit,
+        cwd.map(str::to_string),
+        payload,
+    )?;
+    Ok(json!({
+        "plan_token": plan_token,
+        "class": "automation",
+        "unit": parsed.unit,
+        "action": "normalize-pr",
+        "issued_at": crate::config::unix_to_rfc3339(sealed.issued_at),
+        "expires_at": crate::config::unix_to_rfc3339(sealed.expires_at),
+        "pr": parsed.pr,
+        "merge_sha": parsed.merge_sha,
+        "systemd": nested,
+        "note": "nothing has been executed; apply with the plan_token",
+    }))
+}
+
+fn apply_normalize_pr(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, BackendError> {
+    let pr = plan
+        .payload
+        .get("pr")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("invalid automation plan token".into()))?;
+    let merge_sha = plan
+        .payload
+        .get("merge_sha")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("invalid automation plan token".into()))?;
+    let scope_root = plan
+        .payload
+        .get("scope_root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("invalid automation plan token".into()))?;
+    let retire_plan_token = plan
+        .payload
+        .get("retire_plan_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("invalid automation plan token".into()))?;
+    notify_normalize_pr(pr, merge_sha, &plan.unit);
+    let systemd_result = crate::write::apply_with_context(retire_plan_token, cwd)?;
+    let worktree_removed = match plan.payload.get("bound_cwd").and_then(Value::as_str) {
+        Some(bound) => remove_registered_worktree(Path::new(scope_root), Path::new(bound))?,
+        None => false,
+    };
+    Ok(json!({
+        "class": "automation",
+        "unit": plan.unit,
+        "action": "normalize-pr",
+        "applied": true,
+        "pr": pr,
+        "merge_sha": merge_sha,
+        "worktree_removed": worktree_removed,
+        "systemd": systemd_result,
+    }))
+}
+
 pub fn apply(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, BackendError> {
     token::require_class(plan, PlanClass::Automation)?;
     let action = plan
@@ -3763,6 +3975,7 @@ pub fn apply(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Backe
         "deploy-canary-ack" => apply_deploy_canary_ack(plan, cwd),
         "deploy-occupancy" => apply_deploy_occupancy(plan, cwd),
         "deploy-gc" => apply_deploy_gc(plan, cwd),
+        "normalize-pr" => apply_normalize_pr(plan, cwd),
         _ => Err(BackendError("invalid automation plan token".into())),
     }
 }

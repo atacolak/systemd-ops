@@ -83,6 +83,7 @@ Commands:
   automation plan-deploy-canary-ack --spec JSON
   automation plan-deploy-occupancy --spec JSON
   automation plan-deploy-gc --generation SHA
+  automation plan-normalize-pr --spec JSON
   automation plan-create --spec JSON
   automation plan-update --spec JSON
   automation plan-complete --unit STEM --reason TEXT
@@ -752,6 +753,13 @@ fn run_automation(
             let generation = require_opt(args, "--generation").map_err(BackendError)?;
             remaining_flags(args).map_err(BackendError)?;
             automation::plan_deploy_gc(&json!({ "generation": generation }), scope_root, cwd)
+        }
+        "plan-normalize-pr" => {
+            let spec = json_arg(args, "--spec")
+                .map_err(BackendError)?
+                .ok_or_else(|| BackendError("missing --spec".into()))?;
+            remaining_flags(args).map_err(BackendError)?;
+            automation::plan_normalize_pr(&json!({ "spec": spec }), scope_root, cwd)
         }
 
         "plan-create" | "plan-update" => {
