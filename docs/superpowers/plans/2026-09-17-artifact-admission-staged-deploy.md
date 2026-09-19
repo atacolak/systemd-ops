@@ -249,8 +249,8 @@ or `hcom r`. Add `tests/deploy-canary.sh` to the Fast gates list in
 
 `git commit -m "feat: midi canary ACK is the only promote"`
 Landed `86cb28a`. `review-sdo-a89.8` PASS. leftover: occupancy
-hold-clear unproven (Task 6); pass no-op does not heal a missed
-post-promote deployment.json write.
+hold-clear proven in Task 6 (`f13e963`); pass no-op does not heal
+a missed post-promote deployment.json write.
 
 ---
 
@@ -278,11 +278,14 @@ Already-live rows keep their recorded generation until a later
 occupancy apply. A live row is not a kill. New launches bind to
 promoted current; systemd-ops does not author them.
 
-- [ ] **Step 1: Write the failing proof**
-- [ ] **Step 2: Make the proof pass**
-- [ ] **Step 3: Commit**
+- [x] **Step 1: Write the failing proof**
+- [x] **Step 2: Make the proof pass**
+- [x] **Step 3: Commit**
 
 `git commit -m "feat: generation GC uses published occupancy"`
+Landed `f13e963`. `review-sdo-a89.9` PASS. leftover: inspect
+cohort/pending and attaching occupancy rows is Task 9.
+Occupancy midi-live hold-clear for canary pass is proven.
 
 ---
 
