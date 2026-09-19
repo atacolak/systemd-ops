@@ -243,11 +243,14 @@ or `hcom r`. Add `tests/deploy-canary.sh` to the Fast gates list in
 `docs/TESTING.md` and the Dogfood proofs step in
 `.github/workflows/ci.yml`.
 
-- [ ] **Step 1: Write the failing proof**
-- [ ] **Step 2: Make the proof pass**
-- [ ] **Step 3: Commit**
+- [x] **Step 1: Write the failing proof**
+- [x] **Step 2: Make the proof pass**
+- [x] **Step 3: Commit**
 
 `git commit -m "feat: midi canary ACK is the only promote"`
+Landed `86cb28a`. `review-sdo-a89.8` PASS. leftover: occupancy
+hold-clear unproven (Task 6); pass no-op does not heal a missed
+post-promote deployment.json write.
 
 ---
 
