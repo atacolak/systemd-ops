@@ -1955,9 +1955,7 @@ fn lowercase_hex(label: &str, value: &str, len: usize) -> Result<String, Backend
     if valid {
         Ok(value.to_string())
     } else {
-        Err(BackendError(format!(
-            "{label} must be {len} lowercase hex"
-        )))
+        Err(BackendError(format!("{label} must be {len} lowercase hex")))
     }
 }
 
@@ -1968,9 +1966,9 @@ fn validate_originating_work(value: &str) -> Result<String, BackendError> {
         ));
     }
     let valid = (1..=80).contains(&value.len())
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-')
-        });
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'));
     if valid {
         Ok(value.to_string())
     } else {
@@ -2007,7 +2005,9 @@ fn validate_delta_path(path: &str) -> Result<(), BackendError> {
         ));
     }
     if path.starts_with('/')
-        || path.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
     {
         return Err(BackendError(
             "delta path must be relative without a .. component".into(),
@@ -2089,10 +2089,9 @@ fn parse_admit_spec(spec: &Value) -> Result<AdmitSpec, BackendError> {
         .and_then(Value::as_str)
         .ok_or_else(|| BackendError("missing required argument: base".into()))?;
     let base = lowercase_hex("base", base, 40)?;
-    let raw_delta = spec
-        .get("delta")
-        .and_then(Value::as_array)
-        .ok_or_else(|| BackendError("delta must be an array of 1..32 path/sha256 objects".into()))?;
+    let raw_delta = spec.get("delta").and_then(Value::as_array).ok_or_else(|| {
+        BackendError("delta must be an array of 1..32 path/sha256 objects".into())
+    })?;
     if raw_delta.is_empty() || raw_delta.len() > 32 {
         return Err(BackendError("delta must have 1..32 entries".into()));
     }
@@ -2130,7 +2129,6 @@ fn parse_admit_spec(spec: &Value) -> Result<AdmitSpec, BackendError> {
         supersedes,
     })
 }
-
 
 fn new_capability_create_args(capability: &str, scope_root: &Path) -> Value {
     let stem = format!("managed-omp-cap-{capability}");
@@ -2248,12 +2246,10 @@ pub fn plan_admit(
                 "supersedes is existing-capability only".into(),
             ));
         }
-        let bytes = read_optional_bytes(&desired_path)?.ok_or_else(|| {
-            BackendError("supersedes is existing-capability only".into())
-        })?;
-        let desired = serde_json::from_slice::<DesiredInputsFile>(&bytes).map_err(|error| {
-            BackendError(format!("malformed desired-inputs.json: {error}"))
-        })?;
+        let bytes = read_optional_bytes(&desired_path)?
+            .ok_or_else(|| BackendError("supersedes is existing-capability only".into()))?;
+        let desired = serde_json::from_slice::<DesiredInputsFile>(&bytes)
+            .map_err(|error| BackendError(format!("malformed desired-inputs.json: {error}")))?;
         if !desired
             .inputs
             .iter()
@@ -2320,7 +2316,12 @@ fn apply_admit(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Bac
         .get("scope_root")
         .and_then(Value::as_str)
         .ok_or_else(|| BackendError("invalid automation plan token".into()))?;
-    if plan.payload.get("supersedes").and_then(Value::as_str).is_some() {
+    if plan
+        .payload
+        .get("supersedes")
+        .and_then(Value::as_str)
+        .is_some()
+    {
         let unit_path = systemd::unit_file_dir().join(format!("{}.service", plan.unit));
         let desired_path = Path::new(&snapshot.path);
         if !unit_path.is_file() || !desired_path.is_file() {
@@ -2362,18 +2363,15 @@ fn apply_admit(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Bac
         .ok_or_else(|| BackendError("invalid automation plan token".into()))?;
     let path = Path::new(&snapshot.path);
     let mut desired = match read_optional_bytes(path)? {
-        Some(bytes) => serde_json::from_slice::<DesiredInputsFile>(&bytes).map_err(|error| {
-            BackendError(format!("malformed desired-inputs.json: {error}"))
-        })?,
+        Some(bytes) => serde_json::from_slice::<DesiredInputsFile>(&bytes)
+            .map_err(|error| BackendError(format!("malformed desired-inputs.json: {error}")))?,
         None => DesiredInputsFile {
             version: 1,
             inputs: Vec::new(),
         },
     };
     if desired.version != 1 {
-        return Err(BackendError(
-            "desired-inputs.json version must be 1".into(),
-        ));
+        return Err(BackendError("desired-inputs.json version must be 1".into()));
     }
     let supersedes = match plan.payload.get("supersedes") {
         None | Some(Value::Null) => None,
@@ -2384,9 +2382,15 @@ fn apply_admit(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Bac
         input.originating_work == originating_work && input.artifact_identity == artifact_identity
     });
     let replace_at = if let Some(supersedes) = supersedes {
-        Some(desired.inputs.iter().position(|input| input.artifact_identity == supersedes).ok_or_else(
-            || BackendError("supersedes identity is absent from desired-inputs".into()),
-        )?)
+        Some(
+            desired
+                .inputs
+                .iter()
+                .position(|input| input.artifact_identity == supersedes)
+                .ok_or_else(|| {
+                    BackendError("supersedes identity is absent from desired-inputs".into())
+                })?,
+        )
     } else {
         None
     };
@@ -2409,9 +2413,10 @@ fn apply_admit(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Bac
             .map(str::to_string);
         let delta = match plan.payload.get("delta") {
             None | Some(Value::Null) => None,
-            Some(value) => Some(serde_json::from_value(value.clone()).map_err(|_| {
-                BackendError("invalid automation plan token".into())
-            })?),
+            Some(value) => Some(
+                serde_json::from_value(value.clone())
+                    .map_err(|_| BackendError("invalid automation plan token".into()))?,
+            ),
         };
         let entry = DesiredInput {
             originating_work: originating_work.to_string(),
@@ -3037,6 +3042,635 @@ fn apply_deploy_canary_ack(
     }
 }
 
+struct OccupancyRow {
+    name: String,
+    sha: String,
+    label: String,
+    upgrade_target: Option<(String, String)>,
+    state: String,
+    reason: String,
+    acked_at: String,
+}
+
+fn published_generation_path(root: &Path, stem: &str) -> PathBuf {
+    operation_home(root, stem).join("state/published-generation.json")
+}
+
+fn occupancy_row_value(row: &OccupancyRow) -> Value {
+    json!({
+        "name": row.name,
+        "runtime_generation": {"sha": row.sha, "label": row.label},
+        "upgrade_target": match &row.upgrade_target {
+            None => Value::Null,
+            Some((sha, label)) => json!({"sha": sha, "label": label}),
+        },
+        "state": row.state,
+        "reason": row.reason,
+        "acked_at": row.acked_at,
+    })
+}
+
+fn parse_generation_record(value: &Value, field: &str) -> Result<(String, String), BackendError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| BackendError(format!("{field} must be an object")))?;
+    let sha = object
+        .get("sha")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError(format!("{field}.sha is required")))?;
+    let sha = lowercase_hex(&format!("{field}.sha"), sha, 40)?;
+    let expected = runtime_generation_label(&sha);
+    let label = match object.get("label") {
+        None | Some(Value::Null) => expected.clone(),
+        Some(Value::String(label)) if label == &expected => expected,
+        Some(Value::String(_)) => {
+            return Err(BackendError(format!("{field}.label must be {expected}")));
+        }
+        Some(_) => return Err(BackendError(format!("{field}.label must be a string"))),
+    };
+    Ok((sha, label))
+}
+
+fn validate_occupancy_name(name: &str) -> Result<String, BackendError> {
+    if name.is_empty()
+        || name.len() > 64
+        || name
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch == '/' || ch == ':')
+    {
+        return Err(BackendError("occupancy actor name is invalid".into()));
+    }
+    Ok(name.to_string())
+}
+
+fn parse_occupancy_row(value: &Value) -> Result<OccupancyRow, BackendError> {
+    if !value.is_object() {
+        return Err(BackendError("occupancy actor must be an object".into()));
+    }
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("occupancy actor name is required".into()))?;
+    let name = validate_occupancy_name(name)?;
+    let runtime = value
+        .get("runtime_generation")
+        .ok_or_else(|| BackendError("occupancy runtime_generation is required".into()))?;
+    let (sha, label) = parse_generation_record(runtime, "runtime_generation")?;
+    let upgrade_target = match value.get("upgrade_target") {
+        None | Some(Value::Null) => None,
+        Some(target) => Some(parse_generation_record(target, "upgrade_target")?),
+    };
+    let state = value
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("occupancy state is required".into()))?;
+    if !matches!(state, "live" | "stopped" | "retired") {
+        return Err(BackendError(
+            "occupancy state must be live, stopped, or retired".into(),
+        ));
+    }
+    let reason = value
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if reason.len() > MAX_REASON {
+        return Err(BackendError("occupancy reason is too long".into()));
+    }
+    let acked_at = value
+        .get("acked_at")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("occupancy acked_at is required".into()))?;
+    if acked_at.is_empty() {
+        return Err(BackendError("occupancy acked_at is required".into()));
+    }
+    Ok(OccupancyRow {
+        name,
+        sha,
+        label,
+        upgrade_target,
+        state: state.to_string(),
+        reason,
+        acked_at: acked_at.to_string(),
+    })
+}
+
+fn parse_occupancy_spec(spec: &Value) -> Result<(String, Vec<OccupancyRow>), BackendError> {
+    if !spec.is_object() {
+        return Err(BackendError("occupancy spec must be an object".into()));
+    }
+    if spec.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err(BackendError("occupancy spec version must be 1".into()));
+    }
+    let generation = spec
+        .get("generation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("missing required argument: generation".into()))?;
+    let generation = lowercase_hex("generation", generation, 40)?;
+    let actors = spec
+        .get("actors")
+        .and_then(Value::as_array)
+        .ok_or_else(|| BackendError("occupancy actors must be an array".into()))?;
+    let mut rows = Vec::with_capacity(actors.len());
+    let mut seen = BTreeSet::new();
+    for actor in actors {
+        let row = parse_occupancy_row(actor)?;
+        if !seen.insert(row.name.clone()) {
+            return Err(BackendError(format!(
+                "duplicate occupancy actor {}",
+                row.name
+            )));
+        }
+        rows.push(row);
+    }
+    Ok((generation, rows))
+}
+
+fn occupancy_from_plan(plan: &token::SealedPlan) -> Result<Vec<OccupancyRow>, BackendError> {
+    let actors = plan
+        .payload
+        .get("actors")
+        .and_then(Value::as_array)
+        .ok_or_else(|| BackendError("invalid automation plan token".into()))?;
+    actors.iter().map(parse_occupancy_row).collect()
+}
+
+fn occupancy_row_settled(row: &Value, promoted: &str) -> bool {
+    match row.get("state").and_then(Value::as_str) {
+        Some("stopped" | "retired") => true,
+        _ => {
+            row.get("runtime_generation")
+                .and_then(|value| value.get("sha"))
+                .and_then(Value::as_str)
+                == Some(promoted)
+        }
+    }
+}
+
+fn maybe_set_converged(deployment: &mut Value) {
+    let phase = deployment
+        .get("candidate")
+        .and_then(|value| value.get("phase"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if phase != "rolling_out" && phase != "converged" {
+        return;
+    }
+    let Some(promoted) = deployment
+        .get("promoted")
+        .and_then(|value| value.get("output_revision"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let occupancy = deployment
+        .get("occupancy")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let settled = occupancy
+        .iter()
+        .all(|row| occupancy_row_settled(row, &promoted));
+    if let Some(candidate) = deployment.get_mut("candidate") {
+        if candidate.is_object() {
+            candidate["phase"] = json!(if settled { "converged" } else { "rolling_out" });
+        }
+    }
+}
+
+fn generations_root_of(deployment: &Value) -> Option<PathBuf> {
+    deployment
+        .get("generations_root")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("GENERATIONS_ROOT")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
+fn generation_directories(gens_root: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(gens_root) else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name == "current" || lowercase_hex("generation", name, 40).is_err() {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            dirs.push((name.to_string(), path));
+        }
+    }
+    dirs.sort_by(|left, right| left.0.cmp(&right.0));
+    dirs
+}
+
+fn current_points_at(gens_root: &Path, sha: &str) -> bool {
+    let current = fs::canonicalize(gens_root.join("current")).ok();
+    let target = fs::canonicalize(gens_root.join(sha)).ok();
+    match (current, target) {
+        (Some(current), Some(target)) => current == target,
+        _ => false,
+    }
+}
+
+fn process_executable_resolves_into(gen_dir: &Path) -> bool {
+    let Ok(root) = fs::canonicalize(gen_dir) else {
+        return false;
+    };
+    let Ok(proc) = fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in proc.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let exe = entry.path().join("exe");
+        let target = fs::canonicalize(&exe).or_else(|_| fs::read_link(&exe));
+        if let Ok(target) = target {
+            if target.starts_with(&root) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn live_occupancy_names(deployment: &Value, sha: &str) -> Vec<String> {
+    let Some(rows) = deployment.get("occupancy").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = rows
+        .iter()
+        .filter_map(|row| {
+            if row.get("state").and_then(Value::as_str) != Some("live") {
+                return None;
+            }
+            let row_sha = row.get("runtime_generation")?.get("sha")?.as_str()?;
+            if row_sha != sha {
+                return None;
+            }
+            row.get("name")?.as_str().map(str::to_string)
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn promoted_output_revision<'a>(
+    deployment: &'a Value,
+    published: Option<&'a Value>,
+) -> Option<&'a str> {
+    published
+        .and_then(|value| value.get("output_revision"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            deployment
+                .get("promoted")
+                .and_then(|value| value.get("output_revision"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn retained_reasons(
+    sha: &str,
+    gen_dir: &Path,
+    deployment: &Value,
+    published: Option<&Value>,
+    gens_root: &Path,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if promoted_output_revision(deployment, published) == Some(sha) {
+        reasons.push("promoted".into());
+    }
+    if candidate_output_revision(deployment) == Some(sha) {
+        reasons.push("candidate".into());
+        if deployment
+            .get("canary")
+            .and_then(|value| value.get("result"))
+            .and_then(Value::as_str)
+            == Some("fail")
+        {
+            reasons.push("failed-canary".into());
+        }
+    }
+    for name in live_occupancy_names(deployment, sha) {
+        reasons.push(format!("live-occupancy:{name}"));
+    }
+    if process_executable_resolves_into(gen_dir) {
+        reasons.push("process-executable".into());
+    }
+    if current_points_at(gens_root, sha) {
+        reasons.push("current-symlink".into());
+    }
+    reasons
+}
+
+fn gc_refuse_message(
+    sha: &str,
+    deployment: &Value,
+    published: Option<&Value>,
+    gens_root: &Path,
+) -> Option<String> {
+    let gen_dir = gens_root.join(sha);
+    if !gen_dir.is_dir() {
+        return Some(format!("GC refused: no such generation {sha}"));
+    }
+    let reasons = retained_reasons(sha, &gen_dir, deployment, published, gens_root);
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(format!("GC refused: {}", reasons.join(", ")))
+    }
+}
+
+fn runtime_generation_projection(root: &Path, stem: &str) -> Value {
+    let deploy_path = deployment_path(root, stem);
+    let published_path = published_generation_path(root, stem);
+    let deployment = load_json_object(&deploy_path, "deployment.json").ok();
+    let published = load_json_object(&published_path, "published-generation.json").ok();
+    if deployment.is_none() && published.is_none() {
+        return Value::Null;
+    }
+    let empty = json!({});
+    let deployment_ref = deployment.as_ref().unwrap_or(&empty);
+    let gens_root = generations_root_of(deployment_ref);
+    let mut retained = Vec::new();
+    if let Some(gens_root) = gens_root.as_ref() {
+        for (sha, path) in generation_directories(gens_root) {
+            let reasons =
+                retained_reasons(&sha, &path, deployment_ref, published.as_ref(), gens_root);
+            let resolved = fs::canonicalize(&path).unwrap_or(path);
+            retained.push(json!({
+                "sha": sha,
+                "label": runtime_generation_label(&sha),
+                "path": resolved.to_string_lossy(),
+                "reasons": reasons,
+            }));
+        }
+    }
+    let promoted = promoted_output_revision(deployment_ref, published.as_ref()).map(|sha| {
+        let compose = published
+            .as_ref()
+            .and_then(|value| value.get("generation"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                deployment_ref
+                    .get("promoted")
+                    .and_then(|value| value.get("generation"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("");
+        let promoted_at = published
+            .as_ref()
+            .and_then(|value| value.get("published_at"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                deployment_ref
+                    .get("promoted")
+                    .and_then(|value| value.get("promoted_at"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("");
+        let path = gens_root
+            .as_ref()
+            .and_then(|root| fs::canonicalize(root.join(sha)).ok())
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        json!({
+            "sha": sha,
+            "label": runtime_generation_label(sha),
+            "compose_generation": compose,
+            "promoted_at": promoted_at,
+            "path": path,
+        })
+    });
+    let candidate = candidate_output_revision(deployment_ref).map(|sha| {
+        let cand = deployment_ref
+            .get("candidate")
+            .cloned()
+            .unwrap_or(Value::Null);
+        json!({
+            "sha": sha,
+            "label": runtime_generation_label(sha),
+            "compose_generation": cand.get("generation").and_then(Value::as_str).unwrap_or(""),
+            "phase": cand.get("phase").and_then(Value::as_str).unwrap_or(""),
+            "composed_at": cand.get("composed_at").and_then(Value::as_str).unwrap_or(""),
+        })
+    });
+    json!({
+        "promoted": promoted,
+        "candidate": candidate,
+        "retained": retained,
+    })
+}
+
+pub fn plan_deploy_occupancy(
+    args: &Value,
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let spec = args
+        .get("spec")
+        .ok_or_else(|| BackendError("missing required argument: spec".into()))?;
+    let (generation, rows) = parse_occupancy_spec(spec)?;
+    let stem = RUNTIME_INTEGRATOR;
+    let manifest = resolved_manifest(explicit_root, cwd)?;
+    crate::operator::require_owned(&manifest, stem)?;
+    let deploy_path = deployment_path(&manifest.root, stem);
+    let deploy_snapshot = snapshot(&deploy_path);
+    let _deployment = load_json_object(&deploy_path, "deployment.json")?;
+    let cfg = crate::config::current_or_load()?;
+    let actors: Vec<Value> = rows.iter().map(occupancy_row_value).collect();
+    let payload = json!({
+        "action": "deploy-occupancy",
+        "scope_root": manifest.root.to_string_lossy(),
+        "generation": generation,
+        "actors": actors,
+        "deployment_snapshot": snapshot_json(&deploy_snapshot),
+    });
+    let (plan_token, sealed) = token::mint(
+        &cfg,
+        PlanClass::Automation,
+        stem,
+        cwd.map(str::to_string),
+        payload,
+    )?;
+    Ok(json!({
+        "plan_token": plan_token,
+        "class": "automation",
+        "unit": stem,
+        "action": "deploy-occupancy",
+        "issued_at": crate::config::unix_to_rfc3339(sealed.issued_at),
+        "expires_at": crate::config::unix_to_rfc3339(sealed.expires_at),
+        "generation": generation,
+        "occupancy": actors.len(),
+        "note": "nothing has been executed; apply with the plan_token",
+    }))
+}
+
+fn apply_deploy_occupancy(
+    plan: &token::SealedPlan,
+    _cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let snapshot = snapshot_from_json(
+        plan.payload
+            .get("deployment_snapshot")
+            .ok_or_else(|| BackendError("invalid automation plan token".into()))?,
+    )?;
+    require_snapshot_fresh(&snapshot)?;
+    let rows = occupancy_from_plan(plan)?;
+    let path = Path::new(&snapshot.path);
+    let mut deployment = load_json_object(path, "deployment.json")?;
+    let occupancy: Vec<Value> = rows.iter().map(occupancy_row_value).collect();
+    deployment["occupancy"] = json!(occupancy);
+    maybe_set_converged(&mut deployment);
+    atomic_write(path, &serialize_pretty(&deployment)?)?;
+    Ok(json!({
+        "class": "automation",
+        "unit": plan.unit,
+        "action": "deploy-occupancy",
+        "applied": true,
+        "phase": deployment
+            .get("candidate")
+            .and_then(|value| value.get("phase"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "occupancy": occupancy,
+    }))
+}
+
+pub fn plan_deploy_gc(
+    args: &Value,
+    explicit_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Value, BackendError> {
+    let generation = args
+        .get("generation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("missing required argument: generation".into()))?;
+    let generation = lowercase_hex("generation", generation, 40)?;
+    let stem = RUNTIME_INTEGRATOR;
+    let manifest = resolved_manifest(explicit_root, cwd)?;
+    crate::operator::require_owned(&manifest, stem)?;
+    let deploy_path = deployment_path(&manifest.root, stem);
+    let deploy_snapshot = snapshot(&deploy_path);
+    let deployment = load_json_object(&deploy_path, "deployment.json")?;
+    let published = load_json_object(
+        &published_generation_path(&manifest.root, stem),
+        "published-generation.json",
+    )
+    .ok();
+    let gens_root = generations_root_of(&deployment)
+        .ok_or_else(|| BackendError("deployment.generations_root is missing".into()))?;
+    if let Some(reason) =
+        gc_refuse_message(&generation, &deployment, published.as_ref(), &gens_root)
+    {
+        return Err(BackendError(reason));
+    }
+    let cfg = crate::config::current_or_load()?;
+    let payload = json!({
+        "action": "deploy-gc",
+        "scope_root": manifest.root.to_string_lossy(),
+        "generation": generation,
+        "deployment_snapshot": snapshot_json(&deploy_snapshot),
+    });
+    let (plan_token, sealed) = token::mint(
+        &cfg,
+        PlanClass::Automation,
+        stem,
+        cwd.map(str::to_string),
+        payload,
+    )?;
+    Ok(json!({
+        "plan_token": plan_token,
+        "class": "automation",
+        "unit": stem,
+        "action": "deploy-gc",
+        "issued_at": crate::config::unix_to_rfc3339(sealed.issued_at),
+        "expires_at": crate::config::unix_to_rfc3339(sealed.expires_at),
+        "generation": generation,
+        "note": "nothing has been executed; apply with the plan_token",
+    }))
+}
+
+fn apply_deploy_gc(plan: &token::SealedPlan, _cwd: Option<&str>) -> Result<Value, BackendError> {
+    let snapshot = snapshot_from_json(
+        plan.payload
+            .get("deployment_snapshot")
+            .ok_or_else(|| BackendError("invalid automation plan token".into()))?,
+    )?;
+    require_snapshot_fresh(&snapshot)?;
+    let generation = plan
+        .payload
+        .get("generation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BackendError("invalid automation plan token".into()))?
+        .to_string();
+    let path = Path::new(&snapshot.path);
+    let mut deployment = load_json_object(path, "deployment.json")?;
+    let state_dir = path
+        .parent()
+        .ok_or_else(|| BackendError("deployment.json has no parent".into()))?;
+    let published = load_json_object(
+        &state_dir.join("published-generation.json"),
+        "published-generation.json",
+    )
+    .ok();
+    let gens_root = generations_root_of(&deployment)
+        .ok_or_else(|| BackendError("deployment.generations_root is missing".into()))?;
+    if let Some(reason) =
+        gc_refuse_message(&generation, &deployment, published.as_ref(), &gens_root)
+    {
+        return Err(BackendError(reason));
+    }
+    let gen_dir = gens_root.join(&generation);
+    fs::remove_dir_all(&gen_dir).map_err(|error| {
+        BackendError(format!(
+            "cannot remove generation {}: {error}",
+            gen_dir.display()
+        ))
+    })?;
+    if let Some(Value::Array(rows)) = deployment.get_mut("occupancy") {
+        rows.retain(|row| {
+            let sha = row
+                .get("runtime_generation")
+                .and_then(|value| value.get("sha"))
+                .and_then(Value::as_str);
+            sha.map(|value| value != generation.as_str())
+                .unwrap_or(true)
+        });
+    }
+    maybe_set_converged(&mut deployment);
+    atomic_write(path, &serialize_pretty(&deployment)?)?;
+    Ok(json!({
+        "class": "automation",
+        "unit": plan.unit,
+        "action": "deploy-gc",
+        "applied": true,
+        "generation": generation,
+        "removed": true,
+    }))
+}
+
 pub fn apply(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, BackendError> {
     token::require_class(plan, PlanClass::Automation)?;
     let action = plan
@@ -3127,6 +3761,8 @@ pub fn apply(plan: &token::SealedPlan, cwd: Option<&str>) -> Result<Value, Backe
         }
         "admit" => apply_admit(plan, cwd),
         "deploy-canary-ack" => apply_deploy_canary_ack(plan, cwd),
+        "deploy-occupancy" => apply_deploy_occupancy(plan, cwd),
+        "deploy-gc" => apply_deploy_gc(plan, cwd),
         _ => Err(BackendError("invalid automation plan token".into())),
     }
 }
@@ -3493,13 +4129,28 @@ pub fn inspect(
         .into_iter()
         .find(|operation| operation.get("unit").and_then(Value::as_str) == Some(stem))
         .unwrap_or(Value::Null);
-    Ok(json!({
+    let mut automation = operation.get("automation").cloned().unwrap_or(Value::Null);
+    let runtime_generation = if stem == RUNTIME_INTEGRATOR {
+        runtime_generation_projection(&manifest.root, stem)
+    } else {
+        Value::Null
+    };
+    if stem == RUNTIME_INTEGRATOR {
+        if let Some(object) = automation.as_object_mut() {
+            object.insert("runtime_generation".into(), runtime_generation.clone());
+        }
+    }
+    let mut payload = json!({
         "unit": stem,
         "metadata_file": metadata_path(&manifest.root, stem),
-        "automation": operation.get("automation").cloned().unwrap_or(Value::Null),
+        "automation": automation,
         "relations": operation.get("relations").cloned().unwrap_or(Value::Null),
         "operation": operation,
-    }))
+    });
+    if stem == RUNTIME_INTEGRATOR {
+        payload["runtime_generation"] = runtime_generation;
+    }
+    Ok(payload)
 }
 
 pub fn complete_now(
@@ -4318,8 +4969,14 @@ mod tests {
             parse_observer_payload(b"{\"version\":1,\"world_fingerprint\":\"a\\nb\"}").is_err()
         );
         let first = effective_input_fingerprint("world-a", "brain-a", None);
-        assert_eq!(first, effective_input_fingerprint("world-a", "brain-a", None));
-        assert_ne!(first, effective_input_fingerprint("world-a", "brain-b", None));
+        assert_eq!(
+            first,
+            effective_input_fingerprint("world-a", "brain-a", None)
+        );
+        assert_ne!(
+            first,
+            effective_input_fingerprint("world-a", "brain-b", None)
+        );
     }
 
     #[test]

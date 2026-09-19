@@ -139,34 +139,6 @@ write_deployment_candidate() {
   mv -T "$tmp" "$out"
 }
 
-prune_runtime_generations() {
-  local d resolved current_target=""
-  local -A keep=()
-  [[ -d "$GENERATIONS_ROOT" ]] || return 0
-  if [[ -L "$GENERATIONS_ROOT/current" || -e "$GENERATIONS_ROOT/current" ]]; then
-    current_target=$(readlink -f "$GENERATIONS_ROOT/current" 2>/dev/null || true)
-  fi
-  if [[ -n "$current_target" && -d "$current_target" ]]; then
-    keep["$current_target"]=1
-  fi
-  while IFS= read -r d; do
-    [[ -n "$d" ]] || continue
-    resolved=$(readlink -f "$d" 2>/dev/null || true)
-    [[ -n "$resolved" ]] || continue
-    if [[ -n "${keep[$resolved]:-}" ]]; then
-      continue
-    fi
-    if (( ${#keep[@]} < 3 )); then
-      keep["$resolved"]=1
-      continue
-    fi
-    if ! git -C "$WORKTREE" worktree remove --force "$d"; then
-      echo "generation prune warning: could not remove $d" >&2
-    fi
-  done < <(find "$GENERATIONS_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@\t%p\n' | sort -nr | cut -f2-)
-  return 0
-}
-
 publish_runtime_generation() {
   local generation=$1 output_revision=$2
   local gen_dir

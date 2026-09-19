@@ -81,6 +81,8 @@ Commands:
   automation inspect --unit STEM
   automation plan-admit --spec JSON
   automation plan-deploy-canary-ack --spec JSON
+  automation plan-deploy-occupancy --spec JSON
+  automation plan-deploy-gc --generation SHA
   automation plan-create --spec JSON
   automation plan-update --spec JSON
   automation plan-complete --unit STEM --reason TEXT
@@ -738,6 +740,18 @@ fn run_automation(
                 .ok_or_else(|| BackendError("missing --spec".into()))?;
             remaining_flags(args).map_err(BackendError)?;
             automation::plan_deploy_canary_ack(&json!({ "spec": spec }), scope_root, cwd)
+        }
+        "plan-deploy-occupancy" => {
+            let spec = json_arg(args, "--spec")
+                .map_err(BackendError)?
+                .ok_or_else(|| BackendError("missing --spec".into()))?;
+            remaining_flags(args).map_err(BackendError)?;
+            automation::plan_deploy_occupancy(&json!({ "spec": spec }), scope_root, cwd)
+        }
+        "plan-deploy-gc" => {
+            let generation = require_opt(args, "--generation").map_err(BackendError)?;
+            remaining_flags(args).map_err(BackendError)?;
+            automation::plan_deploy_gc(&json!({ "generation": generation }), scope_root, cwd)
         }
 
         "plan-create" | "plan-update" => {
