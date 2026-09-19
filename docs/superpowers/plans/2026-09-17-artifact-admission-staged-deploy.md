@@ -333,11 +333,14 @@ tree; a fixture with no PR child and empty merge-tree retires the
 unit. The empty-delta command is the existing
 `capability_pass_is_verified_noop` (sourced, not copied).
 
-- [ ] **Step 1: Write the failing proof**
-- [ ] **Step 2: Make the proof pass**
-- [ ] **Step 3: Commit**
+- [x] **Step 1: Write the failing proof**
+- [x] **Step 2: Make the proof pass**
+- [x] **Step 3: Commit**
 
 `git commit -m "feat: retire a capability only on empty delta and no PR children"`
+Landed `e1e6b20`. `review-sdo-a89.11` PASS. leftover: predicate is
+sed-sourced from capability-run (capability-run has no
+CAPABILITY_RUN_LIB=1 guard); not a copied body.
 
 ---
 
