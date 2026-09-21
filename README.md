@@ -3,6 +3,8 @@
 Inspect, control, and author systemd operations. Direct CLI by default;
 optional MCP frontend. Writes exist only through plan/apply.
 
+<img width="1605" height="923" alt="image" src="https://github.com/user-attachments/assets/17824cc7-6efb-4975-8046-681da27265db" />
+
 Written in Rust. Core dependencies are serde, serde_json, and toml. The
 optional TUI adds ratatui. No libsystemd linkage, no D-Bus library, no
 async runtime.
