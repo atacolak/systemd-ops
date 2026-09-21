@@ -48,6 +48,15 @@ write_output_checkpoint() {
   local args=(automation checkpoint --input-fingerprint "$input_fingerprint")
   [[ -n "$generation" ]] && args+=(--generation "$generation")
   [[ -n "$output_revision" ]] && args+=(--output-revision "$output_revision")
+  # A READY checkpoint certifies consume: name every admitted identity
+  # the pass was gated on, so the integrator observes what this READY
+  # covers (spec D1a/D2). Absent file means nothing was admitted.
+  local desired="$STATE_DIR/desired-inputs.json" identity
+  if [[ -r "$desired" ]]; then
+    while IFS= read -r identity; do
+      [[ -n "$identity" ]] && args+=(--admitted "$identity")
+    done < <(jq -r '.inputs[]? | .artifact_identity // empty' "$desired")
+  fi
   ops "${args[@]}" >/dev/null
 }
 
@@ -168,10 +177,34 @@ capability_sources_ready_for_generation() {
         and ((.checkpoint.generation // "") == $gen)
         and ((.checkpoint.output_revision // "") != "")
       )
-  ' "$tmp" >/dev/null
-  local rc=$?
+  ' "$tmp" >/dev/null || { rm -f "$tmp"; return 1; }
+  # Admitted-coverage (spec D1a/D2): a READY checkpoint certifies
+  # consume only when it names every identity the child currently
+  # desires. A checkpoint from before a new admit does not certify.
+  # SCOPE_ROOT may be unset: tests/runtime-wave.sh runs this gate
+  # under set -euo pipefail without one. No scope root means no
+  # desired-inputs files are in play, exactly as for a child whose
+  # desired-inputs file is absent, so the loop is skipped.
+  if [[ -n ${SCOPE_ROOT:-} ]]; then
+    local unit desired
+    while IFS= read -r unit; do
+      [[ -n $unit ]] || continue
+      desired="$SCOPE_ROOT/.systemd-ops/operations/$unit/state/desired-inputs.json"
+      [[ -r $desired ]] || continue
+      jq -e --arg unit "$unit" '
+        [.inputs[].artifact_identity] as $want
+        | ([input.data.relations.children[]?
+            | select(.unit == $unit)
+            | (.checkpoint.admitted // [])[]]) as $have
+        | ([$want[] | . as $identity | ($have | index($identity)) != null] | all)
+      ' "$desired" "$tmp" >/dev/null || { rm -f "$tmp"; return 1; }
+    done < <(jq -r '.data.relations.children[]?
+      | select((.lifecycle // "active") != "completed")
+      | select((.agent // "") == "capability-maintainer")
+      | .unit' "$tmp")
+  fi
   rm -f "$tmp"
-  return "$rc"
+  return 0
 }
 
 
@@ -607,16 +640,29 @@ ensure_clean_worktree() {
     summary=$(printf '%s\n' "$kind_summary" | sed -n '2p')
     recover_worktree "$expected_branch" "$kind" "$summary" || return 4
   fi
-  git -C "$WORKTREE" fetch --quiet fork "$expected_branch" || return $?
-  local local_head remote_head
-  local_head=$(git -C "$WORKTREE" rev-parse HEAD) || return $?
-  remote_head=$(git -C "$WORKTREE" rev-parse "fork/$expected_branch") || return $?
-  if [[ "$local_head" != "$remote_head" ]]; then
-    if git -C "$WORKTREE" merge-base --is-ancestor "$local_head" "$remote_head"; then
-      git -C "$WORKTREE" merge --ff-only "fork/$expected_branch" || return $?
-    else
-      recover_worktree "$expected_branch" worktree-diverged \
-        "dedicated worktree diverged from fork/$expected_branch" || return 4
+  local fetch_rc=0
+  git -C "$WORKTREE" fetch --quiet fork "$expected_branch" || fetch_rc=$?
+  if [[ $fetch_rc -ne 0 ]]; then
+    # A resolvable remote-tracking ref means the fetch failure is
+    # transient; return it unchanged. An absent ref means fork never
+    # received this branch: push stays the operator's gate, and a
+    # capability with admitted desired inputs bootstraps locally
+    # (spec D1a).
+    if git -C "$WORKTREE" rev-parse --verify -q "fork/$expected_branch" >/dev/null 2>&1; then
+      return "$fetch_rc"
+    fi
+    capability_bootstrap_local_branch "$expected_branch" "$fetch_rc" || return $?
+  else
+    local local_head remote_head
+    local_head=$(git -C "$WORKTREE" rev-parse HEAD) || return $?
+    remote_head=$(git -C "$WORKTREE" rev-parse "fork/$expected_branch") || return $?
+    if [[ "$local_head" != "$remote_head" ]]; then
+      if git -C "$WORKTREE" merge-base --is-ancestor "$local_head" "$remote_head"; then
+        git -C "$WORKTREE" merge --ff-only "fork/$expected_branch" || return $?
+      else
+        recover_worktree "$expected_branch" worktree-diverged \
+          "dedicated worktree diverged from fork/$expected_branch" || return 4
+      fi
     fi
   fi
   if ! provision_native_addon; then
@@ -629,6 +675,74 @@ ensure_clean_worktree() {
     record_blocker native-provisioning 4 "node_modules missing in $WORKTREE" "" parent || true
     return 4
   fi
+}
+
+# First-capability bootstrap (spec D1a). Runs only when
+# fork/$expected_branch does not exist. desired-inputs.json is the
+# authority for what the capability must contain; the absent remote
+# ref and any pre-admission local tip are not. Never pushes.
+# Idempotent: once any admitted commit is an ancestor of HEAD, a
+# structured checkpoint names every admitted identity, or this
+# helper's own bootstrap.json marker exists, the branch is never
+# reset again. A checkpoint that does not name the admitted set is
+# not evidence and does not preserve a pre-admission tip.
+# $2 is the fetch exit code, preserved when there is no bootstrap
+# authority.
+capability_bootstrap_local_branch() {
+  local expected_branch=$1
+  local no_authority_rc=${2:-1}
+  local desired="$STATE_DIR/desired-inputs.json"
+  if [[ ! -r $desired ]] \
+    || ! jq -e '.version == 1 and (.inputs | type == "array" and length > 0)' "$desired" >/dev/null 2>&1; then
+    echo "fork/$expected_branch is absent and $desired names no admitted input; no bootstrap authority" >&2
+    return "$no_authority_rc"
+  fi
+  local rev
+  while IFS= read -r rev; do
+    [[ -n $rev ]] || continue
+    if ! git -C "$WORKTREE" cat-file -e "$rev^{commit}" 2>/dev/null; then
+      echo "admitted artifact $rev does not resolve in the local object store" >&2
+      record_blocker artifact-unresolvable 4 \
+        "admitted artifact $rev is not present in the local object store" "" parent || true
+      return 4
+    fi
+  done < <(jq -r '.inputs[] | .artifact_revision // empty' "$desired")
+  while IFS= read -r rev; do
+    [[ -n $rev ]] || continue
+    if git -C "$WORKTREE" merge-base --is-ancestor "$rev" HEAD 2>/dev/null; then
+      return 0
+    fi
+  done < <(jq -r '.inputs[] | .artifact_revision // empty' "$desired")
+  if jq -n -e --slurpfile cp "$STATE_DIR/checkpoint.json" --slurpfile di "$desired" '
+      ($cp[0].input_fingerprint != null)
+      and ([$di[0].inputs[].artifact_identity] as $want
+        | ([$cp[0].admitted[]?]) as $have
+        | ($want | all(. as $id | ($have | index($id)) != null)))
+    ' >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ -r $STATE_DIR/bootstrap.json ]]; then
+    return 0
+  fi
+  local baseline old_head stamp archived_ref
+  baseline=$(resolve_target_generation) || return $?
+  if ! git -C "$WORKTREE" cat-file -e "$baseline^{commit}" 2>/dev/null; then
+    echo "baseline $baseline does not resolve in the local object store" >&2
+    return 4
+  fi
+  old_head=$(git -C "$WORKTREE" rev-parse HEAD) || return $?
+  archived_ref=
+  if [[ $old_head != "$baseline" ]]; then
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    archived_ref="archive/$expected_branch-pre-bootstrap-$stamp"
+    git -C "$WORKTREE" branch -f "$archived_ref" "$old_head" || return $?
+    git -C "$WORKTREE" reset --hard "$baseline" || return $?
+  fi
+  jq -n --arg baseline "$baseline" --arg ref "$archived_ref" \
+    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{version:1,baseline:$baseline,archived_ref:$ref,bootstrapped_at:$at}' \
+    >"$STATE_DIR/bootstrap.json" || return $?
+  return 0
 }
 
 

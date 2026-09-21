@@ -30,6 +30,8 @@ source "$SCOPE_ROOT/.systemd-ops/lib/automation-wrapper"
 source "$SCOPE_ROOT/.systemd-ops/lib/pr-settlement"
 # shellcheck source=../lib/pr-review-state
 source "$SCOPE_ROOT/.systemd-ops/lib/pr-review-state"
+# shellcheck source=../lib/omp-session
+source "$SCOPE_ROOT/.systemd-ops/lib/omp-session"
 
 # A capability pass that exits 0 without calling automation_report is normally a
 # contract failure, and the run parks on it. When the driver can machine-verify
@@ -104,7 +106,15 @@ capability_desired_unconsumed() {
   return 1
 }
 
+pre_clean_worktree=$WORKTREE
 ensure_clean_worktree "$BRANCH" || exit $?
+# A rebind abandons the old tree. When the abandoned tree is itself a
+# recovered tree, its default-root session bucket is a recovered-tree
+# session and is not left behind. Original-tree buckets stay: they hold
+# capability history and possibly human sessions.
+if [[ $WORKTREE != "$pre_clean_worktree" ]]; then
+  gc_recovered_tree_session_bucket "$pre_clean_worktree" || true
+fi
 git -C "$WORKTREE" fetch --quiet fork main || true
 upstream_generation=$(resolve_target_generation) || exit $?
 

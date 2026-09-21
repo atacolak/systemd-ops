@@ -11,8 +11,14 @@ ensure_omp_points_at_current() {
     return 1
   fi
   desired=$(readlink -f "$target") || return 1
-  resolved=$(readlink -f "$omp") || return 1
+  if [[ ! -e "$omp" && ! -L "$omp" ]]; then
+    return 0
+  fi
+  resolved=$(readlink -f "$omp") || return 0
   if [[ "$resolved" == "$desired" ]]; then
+    return 0
+  fi
+  if [[ "$resolved" != "$gens" && "$resolved" != "$gens"/* ]]; then
     return 0
   fi
   tmp="$omp.tmp.$$"

@@ -77,6 +77,7 @@ EOF
   chmod +x "$scope/.systemd-ops/drivers/pr-run"
   cp "$SOURCE_LIB" "$scope/.systemd-ops/lib/automation-wrapper"
   cp "$DOGFOOD_ROOT/lib/pr-attempt" "$scope/.systemd-ops/lib/pr-attempt"
+  cp "$DOGFOOD_ROOT/lib/omp-session" "$scope/.systemd-ops/lib/omp-session"
   cat >"$scope/.systemd-ops/operations/$STEM/run" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -101,6 +102,34 @@ while (( i < \${#args[@]} )); do
   i=\$((i+1))
 done
 [[ -n "\$cwd" ]] && cd "\$cwd"
+$body
+EOF
+  chmod +x "$path"
+}
+
+write_omp_session() {
+  local path=$1 body=$2
+  cat >"$path" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+args=("\$@")
+cwd=""
+i=0
+while (( i < \${#args[@]} )); do
+  if [[ "\${args[\$i]}" == --cwd ]]; then
+    cwd=\${args[\$((i+1))]}
+  fi
+  i=\$((i+1))
+done
+printf '%s\n' "\${args[@]}" >"\${SYSTEMD_OPS_SCOPE_ROOT}/omp-argv"
+[[ -n "\$cwd" ]] && cd "\$cwd"
+# shellcheck source=/dev/null
+source "\$SYSTEMD_OPS_SCOPE_ROOT/.systemd-ops/lib/omp-session"
+bucket=\$(omp_session_bucket_for_cwd "\$cwd")
+mkdir -p "\$bucket/2026-09-22T00-00-00-000Z_proof"
+echo transcript >"\$bucket/2026-09-22T00-00-00-000Z_proof.jsonl"
+echo bash-output >"\$bucket/2026-09-22T00-00-00-000Z_proof/0.bash.log"
+printf '%s\n' "\$bucket" >"\$SYSTEMD_OPS_SCOPE_ROOT/omp-session-bucket"
 $body
 EOF
   chmod +x "$path"
@@ -140,6 +169,31 @@ head_a=$(git -C "$scope/user-worktree" rev-parse HEAD)
 [[ -f $scope/user-worktree/user-dirty.txt ]] || fail "user dirty worktree was destroyed"
 [[ -f $scope/.systemd-ops/operations/$STEM/state/checkpoint.json ]] || fail "success did not checkpoint"
 [[ $(find "$scope/attempts" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l) -eq 0 ]] || fail "attempt leak after success"
+
+# --- post-pass session GC: READY pass deletes the attempt bucket ---
+scope=$(make_scope session-ready)
+export OMP_SESSIONS_ROOT=$TMP/sessions-ready
+write_omp_session "$scope/fake-omp" '"$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "proof current" --summary '\''["report accepted"]'\'' --outcome ready >/dev/null'
+run_pr "$scope" >"$TMP/pr-session-ready.out" 2>"$TMP/pr-session-ready.err" \
+  || fail "session-gc READY failed: $(cat "$TMP/pr-session-ready.err")"
+bucket=$(cat "$scope/omp-session-bucket")
+[[ $bucket == "$OMP_SESSIONS_ROOT"/* ]] || fail "fake omp wrote outside the test root: $bucket"
+[[ ! -e $bucket ]] || fail "READY pass left the attempt session bucket: $bucket"
+[[ -f $scope/.systemd-ops/operations/$STEM/state/checkpoint.json ]] \
+  || fail "session-gc READY did not checkpoint"
+
+# --- post-pass session GC: a timed-out pass deletes the attempt bucket ---
+scope=$(make_scope session-timeout)
+export OMP_SESSIONS_ROOT=$TMP/sessions-timeout
+write_omp_session "$scope/fake-omp" 'exit 124'
+set +e
+run_pr "$scope" >"$TMP/pr-session-timeout.out" 2>"$TMP/pr-session-timeout.err"
+code=$?
+set -e
+[[ $code -eq 124 ]] || fail "session timeout exited $code"
+bucket=$(cat "$scope/omp-session-bucket")
+[[ ! -e $bucket ]] || fail "timed-out pass left the attempt session bucket: $bucket"
+unset OMP_SESSIONS_ROOT
 
 # --- dirty READY rejected ---
 scope=$(make_scope dirty-ready)

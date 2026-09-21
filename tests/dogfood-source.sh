@@ -10,7 +10,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 for f in pr-run pr-observe capability-run capability-observe runtime-run runtime-observe runtime-reconcile omp-release-watch project-lead-watch fork-main-sync; do
   [[ -f $ROOT/dogfood/drivers/$f ]] || fail "missing driver $f"
 done
-for f in automation-wrapper pr-attempt pr-settlement pr-review-state system-notify; do
+for f in automation-wrapper pr-attempt pr-settlement pr-review-state system-notify omp-session; do
   [[ -f $ROOT/dogfood/lib/$f ]] || fail "missing lib $f"
 done
 [[ ! -e $ROOT/dogfood/lib/verify-merged-pr ]] || fail "imported out-of-scope verify-merged-pr"

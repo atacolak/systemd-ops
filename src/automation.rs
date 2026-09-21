@@ -41,6 +41,7 @@ const BLOCKER_KINDS: &[&str] = &[
     "worktree-detached",
     "worktree-missing",
     "native-provisioning",
+    "artifact-unresolvable",
     "contract-failure",
     "stale-generation",
     "postcondition-failed",
@@ -88,6 +89,8 @@ pub struct Checkpoint {
     pub generation: Option<String>,
     #[serde(default)]
     pub output_revision: Option<String>,
+    #[serde(default)]
+    pub admitted: Vec<String>,
     pub checkpointed_at: String,
 }
 
@@ -545,6 +548,18 @@ fn validate_checkpoint(checkpoint: Checkpoint) -> Result<Checkpoint, BackendErro
         Some(value) => optional_opaque("checkpoint output_revision", Some(&value))?,
         None => None,
     };
+    for identity in &checkpoint.admitted {
+        match identity.len() {
+            40 | 64 => {
+                lowercase_hex("checkpoint admitted", identity, identity.len())?;
+            }
+            _ => {
+                return Err(BackendError(
+                    "checkpoint admitted entries must be 40 or 64 lowercase hex".into(),
+                ));
+            }
+        }
+    }
     let checkpointed_at =
         crate::operator::strict_line("checkpointed_at", &checkpoint.checkpointed_at, MAX_OPAQUE)?;
     Ok(Checkpoint {
@@ -552,6 +567,7 @@ fn validate_checkpoint(checkpoint: Checkpoint) -> Result<Checkpoint, BackendErro
         input_fingerprint,
         generation,
         output_revision,
+        admitted: checkpoint.admitted,
         checkpointed_at,
     })
 }
@@ -777,6 +793,7 @@ pub fn write_checkpoint(
     input_fingerprint: &str,
     generation: Option<&str>,
     output_revision: Option<&str>,
+    admitted: &[String],
 ) -> Result<Value, BackendError> {
     let (manifest, stem) = crate::operator::bound_operation_manifest(explicit_root, cwd)?;
     let checkpoint = validate_checkpoint(Checkpoint {
@@ -784,6 +801,7 @@ pub fn write_checkpoint(
         input_fingerprint: input_fingerprint.to_string(),
         generation: generation.map(str::to_string),
         output_revision: output_revision.map(str::to_string),
+        admitted: admitted.to_vec(),
         checkpointed_at: crate::config::unix_to_rfc3339(crate::config::now_unix()),
     })?;
     atomic_write(
@@ -884,6 +902,7 @@ fn checkpoint_json(checkpoint: Option<&Checkpoint>) -> Value {
             "fingerprint": checkpoint.input_fingerprint,
             "generation": checkpoint.generation,
             "output_revision": checkpoint.output_revision,
+            "admitted": checkpoint.admitted,
             "checkpointed_at": checkpoint.checkpointed_at,
         }),
         None => json!({
@@ -894,6 +913,7 @@ fn checkpoint_json(checkpoint: Option<&Checkpoint>) -> Value {
             "fingerprint": Value::Null,
             "generation": Value::Null,
             "output_revision": Value::Null,
+            "admitted": [],
             "checkpointed_at": Value::Null,
         }),
     }
@@ -986,6 +1006,10 @@ fn child_revision(input: ChildRevisionInput<'_>) -> String {
         buf.push(0);
         if let Some(output_revision) = &checkpoint.output_revision {
             buf.extend_from_slice(output_revision.as_bytes());
+        }
+        for identity in &checkpoint.admitted {
+            buf.extend_from_slice(identity.as_bytes());
+            buf.push(0);
         }
     }
     buf.push(0);
@@ -1271,6 +1295,17 @@ fn relation_summary(operation: &Value) -> Value {
                 .get("output_revision")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            admitted: checkpoint
+                .get("admitted")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
             checkpointed_at: checkpoint
                 .get("checkpointed_at")
                 .and_then(Value::as_str)
@@ -2822,6 +2857,10 @@ fn promote_runtime_candidate(deployment: &Value, state_dir: &Path) -> Result<(),
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| dogfood_lib("runtime-promote").display().to_string());
+    let omp_install = std::env::var("OMP_INSTALL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/home/sf/.bun/bin/omp".to_string());
     let output = Command::new("bash")
         .args([
             "-c",
@@ -2833,6 +2872,7 @@ fn promote_runtime_candidate(deployment: &Value, state_dir: &Path) -> Result<(),
         .env("RUNTIME_PROMOTE", &promote)
         .env("GENERATIONS_ROOT", gens_root)
         .env("STATE_DIR", state_dir)
+        .env("OMP_INSTALL", omp_install)
         .output()
         .map_err(|error| BackendError(format!("cannot invoke runtime-promote: {error}")))?;
     if output.status.success() {
@@ -5246,6 +5286,7 @@ mod tests {
                 "fp-a",
                 Some("gen-a"),
                 Some("out-a"),
+                &[],
             )
             .unwrap();
             assert_eq!(written["checkpoint"]["generation"], "gen-a");
@@ -5260,6 +5301,68 @@ mod tests {
             assert_eq!(mode, 0o600);
         });
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_admitted_round_trips_and_validates() {
+        let root = tmp_root("checkpoint-admitted");
+        with_bound_operation(&root, "managed-child", || {
+            write_parent_fixture(&root, "managed-child", None);
+            let admitted = vec![
+                "76643a6871e1a17c4a199564df95e73490b1060a".to_string(),
+                "a94bf2596c9533e313250b9e79680da3de25187e28ee79e7bf43d88a7571020d".to_string(),
+            ];
+            let written = write_checkpoint(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                "fp-a",
+                Some("gen-a"),
+                Some("out-a"),
+                &admitted,
+            )
+            .unwrap();
+            assert_eq!(
+                written["checkpoint"]["admitted"],
+                serde_json::json!(admitted)
+            );
+            let loaded = load_checkpoint(&root, "managed-child").unwrap().unwrap();
+            assert_eq!(loaded.admitted, admitted);
+        });
+    }
+
+    #[test]
+    fn checkpoint_admitted_rejects_non_lowercase_hex() {
+        for bad in [
+            "76643a68", // too short
+            "76643A6871e1a17c4a199564df95e73490b1060a", // uppercase
+            "zz643a6871e1a17c4a199564df95e73490b1060a", // non-hex
+        ] {
+            assert!(validate_checkpoint(Checkpoint {
+                version: 2,
+                input_fingerprint: "fp-a".to_string(),
+                generation: None,
+                output_revision: None,
+                admitted: vec![bad.to_string()],
+                checkpointed_at: "2026-09-22T00:00:00Z".to_string(),
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn checkpoint_without_admitted_loads_with_empty_list() {
+        let root = tmp_root("checkpoint-legacy");
+        let path = checkpoint_path(&root, "managed-child");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            br#"{"version":2,"input_fingerprint":"fp-old","generation":"gen-a","output_revision":"out-a","checkpointed_at":"2026-09-17T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let loaded = load_checkpoint(&root, "managed-child").unwrap().unwrap();
+        assert!(loaded.admitted.is_empty());
+        let projected = checkpoint_json(Some(&loaded));
+        assert_eq!(projected["admitted"], serde_json::json!([]));
     }
 
     #[test]
@@ -5289,6 +5392,7 @@ mod tests {
                 "fp-a",
                 Some("gen-a"),
                 Some("out-a"),
+                &[],
             )
             .unwrap_err();
             assert!(error.0.contains("symlink"), "{}", error.0);
@@ -5321,6 +5425,7 @@ mod tests {
                 "fp-a",
                 Some("gen-a"),
                 Some("out-a"),
+                &[],
             )
             .unwrap();
             let before = fs::read(checkpoint_path(&root, "managed-child")).unwrap();
@@ -5356,6 +5461,7 @@ mod tests {
                 "fp-b",
                 Some("gen-b"),
                 Some("out-b"),
+                &[],
             )
             .unwrap();
             assert!(load_blocker(&root, "managed-child").unwrap().is_none());
@@ -5398,6 +5504,28 @@ mod tests {
     }
 
     #[test]
+    fn artifact_unresolvable_is_a_known_blocker_kind() {
+        let root = tmp_root("artifact-unresolvable-kind");
+        with_bound_operation(&root, "managed-child", || {
+            write_parent_fixture(&root, "managed-child", None);
+            let written = write_blocker(
+                Some(root.to_str().unwrap()),
+                Some(root.to_str().unwrap()),
+                "artifact-unresolvable",
+                Some("parent"),
+                Some("fp-boot"),
+                None,
+                Some(4),
+                "admitted artifact is not present in the local object store",
+            )
+            .unwrap();
+            assert_eq!(written["changed"], true);
+            assert_eq!(written["blocker"]["kind"], "artifact-unresolvable");
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn notify_parent_requires_structured_checkpoint() {
         let root = tmp_root("notify");
         let error = with_user_unit_dir(&root, &["managed-child", "managed-parent"], || {
@@ -5432,6 +5560,7 @@ mod tests {
                 "fp-a",
                 Some("gen-a"),
                 Some("out-a"),
+                &[],
             )
             .unwrap();
             notify_parent(
