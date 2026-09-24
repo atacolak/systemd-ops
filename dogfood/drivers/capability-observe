@@ -20,7 +20,11 @@ GEN_FILE="$SCOPE_ROOT/.systemd-ops/operations/managed-omp-release-watch/state/ge
 target_generation=$(jq -er '.target_commit' "$GEN_FILE")
 
 local_head=$(git -C "$WORKTREE" rev-parse HEAD)
-remote_head=$(git -C "$WORKTREE" rev-parse "fork/$BRANCH")
+# fork/$BRANCH may not exist: push is the operator's gate and a new
+# capability bootstraps locally with desired-inputs as authority
+# (spec D1a). An absent remote ref hashes as empty, not as an
+# observer failure.
+remote_head=$(git -C "$WORKTREE" rev-parse --verify -q "fork/$BRANCH" || true)
 dirty=$(git -C "$WORKTREE" status --porcelain=v1 --untracked-files=normal | sha256sum | cut -d' ' -f1)
 
 # Include a critical-cleared digest only when a direct PR child has one.

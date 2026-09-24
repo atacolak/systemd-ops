@@ -71,7 +71,7 @@ Commands:
   automation list-requests
   automation inspect-request --id ID
   automation resolve-request --id ID --resolution TEXT
-  automation checkpoint --input-fingerprint HASH [--generation VALUE] [--output-revision VALUE]
+  automation checkpoint --input-fingerprint HASH [--generation VALUE] [--output-revision VALUE] [--admitted HEX]...
   automation blocker --kind KIND --summary TEXT [--route self|parent|lead] [--input-fingerprint HASH] [--iteration ID] [--code N]
   automation clear-blocker
   automation release-park --unit STEM
@@ -857,6 +857,10 @@ fn run_automation(
                 .map_err(BackendError)?;
             let generation = take_opt(args, "--generation").map_err(BackendError)?;
             let output_revision = take_opt(args, "--output-revision").map_err(BackendError)?;
+            let mut admitted = Vec::new();
+            while let Some(value) = take_opt(args, "--admitted").map_err(BackendError)? {
+                admitted.push(value);
+            }
             remaining_flags(args).map_err(BackendError)?;
             automation::write_checkpoint(
                 scope_root,
@@ -864,6 +868,7 @@ fn run_automation(
                 &input_fingerprint,
                 generation.as_deref(),
                 output_revision.as_deref(),
+                &admitted,
             )
         }
 

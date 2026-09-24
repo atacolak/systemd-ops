@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# OMP session bucket location and post-pass GC. Sourced, never executed.
+#
+# Layout (scout /tmp/sdo-evx-session-identity.md §1): sessions live under
+# ~/.omp/agent/sessions/<encoded-cwd>/<fileSafeTimestamp>_<sessionId>.jsonl
+# with a sibling artifact dir holding <artifactId>.bash.log. pr-run
+# deletes its per-attempt bucket after the pass (the attempt cwd is
+# unique per attempt, so the bucket is exclusive to it). capability-run
+# deletes the bucket of a recovered worktree it has rebound away from.
+# The live capability bucket is never deleted. A capability pass session
+# is a separate directory under the operation state dir; the driver
+# creates it for the invocation and deletes it after the pass.
+
+OMP_SESSIONS_ROOT=${OMP_SESSIONS_ROOT:-$HOME/.omp/agent/sessions}
+
+# / \ : -> -. ${s//[\\/:]/-} does not replace / on bash 5.2: the slash
+# is the ${//} pattern delimiter, so each character is substituted alone.
+_omp_session_encode() {
+  local s=$1
+  s=${s//\//-}
+  s=${s//\\/-}
+  s=${s//:/-}
+  printf '%s' "$s"
+}
+
+# Default-root session bucket for a cwd, per the scout §1 formula:
+# under $HOME: "-" + home-relative with / \ : -> "-"; under the temp
+# root: "-tmp-" + temp-relative encoded; any other absolute path:
+# "--" + path without its leading slash, encoded, + "--".
+omp_session_bucket_for_cwd() {
+  local cwd=${1:?} home tmp rel enc
+  [[ $cwd == /* ]] || return 1
+  cwd=$(readlink -f -- "$cwd") || return 1
+  home=$(readlink -f -- "$HOME") || return 1
+  tmp=$(readlink -f -- "${TMPDIR:-/tmp}") || return 1
+  if [[ $cwd == "$home" ]]; then
+    enc="-"
+  elif [[ $cwd == "$home/"* ]]; then
+    rel=${cwd#"$home"/}
+    enc="-$( _omp_session_encode "$rel" )"
+  elif [[ $cwd == "$tmp" ]]; then
+    enc="-tmp"
+  elif [[ $cwd == "$tmp/"* ]]; then
+    rel=${cwd#"$tmp"/}
+    enc="-tmp-$( _omp_session_encode "$rel" )"
+  else
+    rel=${cwd#/}
+    enc="--$( _omp_session_encode "$rel" )--"
+  fi
+  printf '%s/%s\n' "$OMP_SESSIONS_ROOT" "$enc"
+}
+
+# True when a path basename carries the recovery marker
+# replacement_worktree_path stamps (automation-wrapper:312-323),
+# including a stacked -recovered-<stamp> suffix.
+worktree_path_is_recovered() {
+  local base
+  base=$(basename -- "$1")
+  [[ $base =~ -recovered-[0-9]{8}T[0-9]{6}Z$ ]]
+}
+
+# Shared guards for the deleters: refuse an ambiguous bucket name or a
+# path outside the sessions root.
+_omp_session_bucket_guard() {
+  local bucket=$1 name
+  name=$(basename -- "$bucket")
+  case $name in
+    ""|-|--)
+      echo "refusing ambiguous session bucket: $bucket" >&2
+      return 1
+      ;;
+  esac
+  case $bucket in
+    "$OMP_SESSIONS_ROOT"/*) ;;
+    *)
+      echo "refusing session bucket outside $OMP_SESSIONS_ROOT: $bucket" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Delete the default-root session bucket of a cwd the caller owns
+# exclusively (a pr-run attempt worktree: unique per attempt, disposed
+# with the pass). Best-effort at the call site; a missing bucket is a
+# no-op.
+gc_exclusive_session_bucket() {
+  local cwd=${1:?} bucket
+  bucket=$(omp_session_bucket_for_cwd "$cwd") || return 1
+  _omp_session_bucket_guard "$bucket" || return 1
+  if [[ -d $bucket ]]; then
+    rm -rf -- "$bucket"
+    echo "deleted attempt session bucket $bucket" >&2
+  fi
+}
+
+# Delete the default-root session bucket of an abandoned recovered tree.
+# A path without the recovered marker is a no-op success: original-tree
+# buckets hold capability history and possibly human sessions, and the
+# epic names recovered trees only.
+gc_recovered_tree_session_bucket() {
+  local old=${1:?} bucket name
+  worktree_path_is_recovered "$old" || return 0
+  bucket=$(omp_session_bucket_for_cwd "$old") || return 1
+  _omp_session_bucket_guard "$bucket" || return 1
+  name=$(basename -- "$bucket")
+  case $name in
+    *-recovered-*) ;;
+    *)
+      echo "refusing session bucket without a recovered marker: $bucket" >&2
+      return 1
+      ;;
+  esac
+  if [[ -d $bucket ]]; then
+    rm -rf -- "$bucket"
+    echo "deleted recovered-tree session bucket $bucket" >&2
+  fi
+}
+
+# Empty and recreate the per-pass session directory so a previous pass's
+# transcript and bash.log cannot leak into the next invocation.
+prepare_omp_pass_session() {
+  local dir=${1:?}
+  rm -rf -- "$dir"
+  mkdir -p -- "$dir"
+}
+
+# Remove the per-pass session directory when it exists. A missing path is
+# a no-op. A delete error is swallowed so this never fails the caller;
+# call sites still use `|| true`.
+cleanup_omp_pass_session() {
+  local dir=${1:-}
+  [[ -n $dir ]] || return 0
+  if [[ -e $dir || -L $dir ]]; then
+    rm -rf -- "$dir" || true
+  fi
+  return 0
+}

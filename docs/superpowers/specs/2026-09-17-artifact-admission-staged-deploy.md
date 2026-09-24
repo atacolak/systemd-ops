@@ -4,6 +4,8 @@
 **Peer product epic:** `omp-tytn` (livu). Product classification is midi's. This spec owns the machine.
 **Status:** sound
 **Repo:** `/home/sf/workspace/systemd-ops`
+**Amended:** 2026-09-22, bead `sdo-a89.14`: D1a first-capability
+bootstrap; D2/D5/D8/D9/Acceptance additions it implies.
 
 ## Intent (from the Brief - do not rewrite)
 
@@ -155,18 +157,19 @@ manually rescue it. Then `omp-vuz.1` on the same path.
   `76643a6871e1a17c4a199564df95e73490b1060a`. Observed
   `feat/todo-passive-phase` HEAD at record time
   `95fba1fc88f5999730a76d57963d99f7956dbb48` (classified tip is an
-  ancestor). This spec does not pick the sha. The second specimen
-  waits until `.66` proves candidate -> canary -> promote ->
-  rollout -> live-proof.
+  ancestor). The sha is since settled: D1a (2026-09-22) names the
+  specimen `76643a6871e1a17c4a199564df95e73490b1060a`, admitted
+  2026-09-22T06:30:18Z. The second specimen waits until `.66`
+  proves candidate -> canary -> promote -> rollout -> live-proof.
 
 **Observed** - midi #98865 classified capability homes (not created,
 not invented here). `scope.toml` has no `capability_worktree_root`,
-so new-cap admit requires `worktree`. These are the homes:
+so new-cap admit requires `worktree`. The classified paths:
 
 - `.66`: `/home/sf/worktrees/omp/admit/retry-fallback-unowned`
 - `omp-vuz.1`: `/home/sf/worktrees/omp/admit/todo-passive-phase`
 
-Rejected as the home:
+Rejected at classify time as the home:
 
 - `/home/sf/worktrees/omp/cap/retry-fallback-unowned` (livu, HEAD
   `b5a0e2264b`)
@@ -175,9 +178,18 @@ Rejected as the home:
 - `/home/sf/worktrees/omp/cap/todo-passive-phase` (livu,
   `4517803da2`)
 
-midi will not `mkdir` these and will not `git worktree add`.
-systemd-ops will not create them ahead of apply. Worktree-delta
-apply does not create a git worktree and does not copy bytes.
+D1a (2026-09-22) settles the path question: the capability home is
+the unit's bound cwd, whichever path apply bound. Live,
+`managed-omp-cap-todo-passive-phase` binds
+`/home/sf/worktrees/omp/cap/todo-passive-phase`, and that path is
+its home. What remains refused is not a path but an authority: no
+pre-admission local tip (livu `b5a0e2264b`, livu `4517803da2`) is
+ever what the capability must contain. Bootstrap archives that tip
+under a local `archive/` ref (D1a step 4); it is never consulted.
+The `admit/<id>` paths above are still not created: midi will not
+`mkdir` them and will not `git worktree add`, and systemd-ops will
+not create them ahead of apply. Worktree-delta apply does not
+create a git worktree and does not copy bytes.
 
 **Observed** - livu `/tmp/tytn-t4-hera-request.md` prepared local
 `cap/*` branches and proposed `author plan-create` packets. Those hops
@@ -308,9 +320,9 @@ apply does not create a git worktree and does not copy file bytes
 from the classified tree or from `worktree`. It writes the unit
 (when new), `automation.toml`, `desired-inputs.json`, and starts
 the timer. The maintainer reconciles HOW. It does not push
-`fork/cap/<capability>`. Push remains Ata's product gate; a child
-whose `capability-observe` cannot resolve `fork/$BRANCH` stays
-unready, which is existing observer behaviour, not a new rule.
+`fork/cap/<capability>`. Push remains Ata's product gate. An absent
+`fork/$BRANCH` remote ref on a capability with admitted desired
+inputs is a maintainer bootstrap (D1a), not an operator-push gate.
 
 Refuse:
 
@@ -329,6 +341,151 @@ Refuse:
 - `supersedes` when the replacement
   `(originating_work, artifact_identity)` already exists as another
   entry
+
+### D1a. First-capability bootstrap when `fork/cap/<id>` is absent
+
+(sdo-a89.14, 2026-09-22.) A NEW capability whose branch was never
+pushed to fork is a maintainer bootstrap, not an operator-push gate.
+`desired-inputs.json` (D2) is the authority for what the capability
+must contain. The absent remote ref is not. A pre-admission local
+tip is not.
+
+**Observed** - live 2026-09-22: `managed-omp-cap-todo-passive-phase`
+exists with exactly one desired input, commit identity
+`76643a6871e1a17c4a199564df95e73490b1060a` (Ata's named specimen,
+admitted 2026-09-22T06:30:18Z). Its bound worktree is
+`/home/sf/worktrees/omp/cap/todo-passive-phase`, on branch
+`cap/todo-passive-phase` at livu tip
+`4517803da2b7c3c4a1e344c0f1d258cb3df17830`. The specimen commit
+exists in the local object store and is NOT an ancestor of that tip.
+`fork/cap/todo-passive-phase` does not exist.
+`/home/sf/worktrees/omp/admit/` does not exist.
+
+**Observed** - three hard stops gate that child on an operator push
+the Brief forbids the machine to require:
+
+- `dogfood/drivers/capability-observe:23` `git rev-parse
+  "fork/$BRANCH"` fails under `set -e` when the remote ref is
+  absent: no observation, the child stays unready.
+- `dogfood/lib/automation-wrapper:610` (`ensure_clean_worktree`)
+  `git fetch --quiet fork "$expected_branch"` exits 128
+  ("couldn't find remote ref"): the tick dies before the maintainer
+  runs.
+- `dogfood/lib/automation-wrapper:613` `rev-parse
+  "fork/$expected_branch"` fails for the same reason.
+
+Amendments:
+
+**Observer.** When `fork/$BRANCH` does not resolve,
+`capability-observe` emits `remote_head` as the empty string instead
+of failing (`git rev-parse --verify -q "fork/$BRANCH" || true`). A
+capability whose remote ref exists hashes byte-identically to today.
+When the ref later appears the fingerprint moves, which is a true
+world change.
+
+**Driver.** `ensure_clean_worktree` keeps today's
+fetch-compare-ff-only path when the fetch succeeds. On fetch failure
+it probes `git rev-parse --verify -q "fork/$expected_branch"`:
+resolvable means a transient fetch error and returns the fetch exit
+code unchanged; absent means the remote ref does not exist and runs
+the bootstrap helper `capability_bootstrap_local_branch` (same lib).
+The helper:
+
+1. Requires `$STATE_DIR/desired-inputs.json` version 1 with at least
+   one input. Without it there is no bootstrap authority and the
+   tick fails with the original fetch exit code, as today. (A new
+   capability always has a first input, D1.)
+2. Requires every admitted commit revision to resolve in the local
+   object store (`git cat-file -e <rev>^{commit}`). An unresolvable
+   revision records blocker kind `artifact-unresolvable` and exits
+   4. It never exits 128 and never fetches the artifact from a
+   remote. The kind is added to `BLOCKER_KINDS`
+   (`src/automation.rs:37-48`); today `write_blocker` rejects it as
+   unknown.
+3. Idempotency: the capability has bootstrapped, and the helper
+   returns without touching the branch, when any of:
+   - any admitted commit revision is already an ancestor of HEAD
+     (the admitted set is already consumed), or
+   - a structured `checkpoint.json` exists whose `admitted` list
+     covers every current desired-inputs `artifact_identity` (a
+     READY certifying exactly this set), or
+   - `$STATE_DIR/bootstrap.json` exists (the helper's own durable
+     marker, written in step 4, that the bootstrap already ran; a
+     later tick must not reset reconciliation that is in progress
+     toward the admitted set).
+   A fingerprint-only checkpoint, or a checkpoint whose `admitted`
+   does not cover the current desired set, is not bootstrap
+   evidence: it must not preserve a pre-admission tip as authority.
+4. Otherwise it resets the local branch to the current baseline:
+   `baseline=$(resolve_target_generation)`; when HEAD differs from
+   the baseline it first creates the local-only ref
+   `archive/<branch>-pre-bootstrap-<UTC>` at the old HEAD (repo
+   precedent: `archive/pr-*-pre-force-push`; never pushed), then
+   `git reset --hard "$baseline"`. The worktree stays on
+   `cap/<id>`; the tree was verified clean and on-branch by the
+   invariant check that runs first. Whether or not a reset was
+   needed, the helper then writes `$STATE_DIR/bootstrap.json`
+   (`{"version":1,"baseline","archived_ref","bootstrapped_at"}`,
+   with `archived_ref` empty when HEAD already equalled the
+   baseline). That marker is what step 3 checks, so a pre-READY
+   rerun never discards in-progress maintainer commits.
+5. Native/node_modules provisioning then runs unchanged.
+
+The maintainer pass reconciles desired-inputs onto the baseline; HOW
+is the maintainer's (D2). The machine never cherry-picks and never
+pushes. For a worktree-delta-only capability no admitted commit can
+anchor step 3; the `bootstrap.json` marker is what keeps a pre-READY
+rerun from re-resetting in-progress reconciliation. Only a crash
+between the reset and the marker write can still re-reset, and the
+pre-reset tip is preserved under the archive ref. That is an
+implementation consequence, not a requirement.
+
+**What the local branch becomes.** `cap/<id>` at
+`<target generation> + maintainer reconciliation` with every admitted
+identity consumed under the D2 rules. Live: the livu tip
+`4517803da2` moves to a local `archive/` ref and is never authority.
+
+**What READY certifies.** The existing postconditions (target
+generation an ancestor of HEAD, `capability_desired_unconsumed`
+false) plus the checkpoint names the admitted set (D2 amendment). A
+READY checkpoint for `todo-passive-phase` contains
+`76643a6871e1a17c4a199564df95e73490b1060a`.
+
+**Integrator.** Every checkpoint projection gains `admitted`
+(`checkpoint_json`, therefore inspect, context, and relations
+children). `capability_sources_ready_for_generation` additionally
+requires, for each active capability-maintainer child with a
+readable desired-inputs file, that every current `artifact_identity`
+appears in that child checkpoint's `admitted`. A checkpoint written
+before a new admit no longer certifies for compose. The coverage
+check locates desired-inputs files under `$SCOPE_ROOT`; a caller
+that does not export `SCOPE_ROOT` (the pre-existing
+`tests/runtime-wave.sh` invokes this gate under `set -euo pipefail`
+without one) exercises only the existing jq predicate, exactly as
+for a child with no desired-inputs file. On pass the
+integrator composes the next candidate exactly as D3; compose is
+unchanged.
+
+**Rerun idempotent.** With the remote ref still absent, the first
+tick archives any pre-admission tip and resets once (step 4) unless
+the admitted set is already consumed. Later ticks hit step 3 - a
+consumed admitted revision, a covering READY checkpoint, or the
+`bootstrap.json` marker - and never reset in-progress
+reconciliation again. After READY, `input_is_processed` no-op-skips
+an unchanged fingerprint as today.
+
+**Stays refused:**
+
+- operator push: the maintainer never `git push`es `cap/*`; push
+  remains Ata's product gate; bootstrap never requires the remote
+  ref to exist
+- livu `4517803da2` (any pre-admission local tip) as capability
+  authority
+- `mkdir /home/sf/worktrees/omp/admit/<id>` as the home: the
+  capability home is the unit's bound cwd; D1 worktree creation at
+  apply is unchanged
+- hand or machine cherry-pick of classified trees: reconciliation
+  is the maintainer pass
 
 ### D2. Desired artifacts enter the observation hash
 
@@ -384,6 +541,15 @@ not verified-noop self-report READY. An agent `automation_report`
 outcome=ready does not override the predicate. Midi #99663: consume
 must reconcile `desired-inputs`, not treat a later thinking-level
 commit as already having consumed a mismatched worktree-delta.
+
+A READY checkpoint also names what it certifies. `checkpoint.json`
+gains `admitted`: the list of `artifact_identity` values from
+`desired-inputs.json` at certify time, passed by `capability-run`
+through `automation checkpoint --admitted <40-or-64-hex>`
+(repeatable). The field defaults to an empty list, so checkpoints
+written before this amendment still load. A READY for `omp-vuz.1`
+contains `76643a6871e1a17c4a199564df95e73490b1060a`. The integrator
+observes this set (D1a) before composing a candidate.
 
 Upstream generation changes still come from the observer's
 `world_fingerprint` / `generation`. Desired artifacts stay constant
@@ -725,7 +891,8 @@ channel.
 
 New capability: author apply enables the timer. First tick observes
 the new fingerprint and must not treat a missing checkpoint as a
-verified no-op.
+verified no-op. When `fork/<branch>` is absent, that first tick
+bootstraps per D1a instead of failing the fetch.
 
 Admission does not `hcom send` to the maintainer. The timer is the
 wake.
@@ -798,6 +965,10 @@ identity sha; the full sha is machine identity. When
 `recovery.target` is set, inspect shows it and whether midi has
 proved alive on that sha.
 
+Every checkpoint projection (`automation inspect`, `automation
+context`, relations children) includes `admitted`, the certified
+identity list, empty when the checkpoint names nothing.
+
 `automation inspect --unit managed-omp-cap-<capability>` gains
 `desired_inputs` equal to the file (or null) and
 `desired_unconsumed` true when any admitted commit revision is not
@@ -865,6 +1036,26 @@ Hermetic proofs, no live oh-my-pi writes:
 - `tests/normalize-capability.sh`: refuse when merge-tree is
   non-empty; refuse when a pr-maintainer child remains; pass
   retires the unit
+- `src/automation.rs` unit: checkpoint `admitted` round-trips
+  through validate/write/load; entries must be 40 or 64 lowercase
+  hex; a checkpoint written before the field existed loads with an
+  empty list; `checkpoint_json` projects the list;
+  `artifact-unresolvable` is a known blocker kind (`write_blocker`
+  accepts it)
+- `tests/capability-bootstrap.sh`: absent `fork/<branch>` plus
+  desired-inputs plus a never-consumed branch resets the branch to
+  the target generation and archives the old tip under a local
+  `archive/` ref; a rerun with an admitted revision an ancestor of
+  HEAD does not reset; an absent remote ref with no desired-inputs
+  fails with the fetch exit code and does not reset; an admitted
+  revision that does not resolve locally records blocker kind
+  `artifact-unresolvable` and exits 4, never 128;
+  `capability-observe` with an absent `fork/<branch>` exits 0 and
+  still emits a world fingerprint; `write_output_checkpoint` passes
+  every desired-inputs identity as `--admitted`;
+  `capability_sources_ready_for_generation` refuses a child whose
+  checkpoint `admitted` does not cover its current desired-inputs
+  identities and passes when it does
 - `tests/docs.sh` / a topology proof: the committed topology file
   contains no `PR <digits>` and no `managed-omp-pr-` / concrete
   capability instance names
@@ -942,6 +1133,34 @@ A change is done when:
 8. `.66` then `omp-vuz.1` have each travelled admit -> consume ->
    compose -> candidate -> canary -> promote -> rollout without a
    hand-moved commit.
+9. A capability whose `fork/cap/<id>` remote ref has never existed
+   reaches READY without an operator push: the first maintainer
+   tick bootstraps from the current target generation plus
+   desired-inputs (no git-128), and its READY checkpoint names the
+   admitted identity (for `omp-vuz.1`,
+   `76643a6871e1a17c4a199564df95e73490b1060a`).
 
 Every phase and stall reason is present on `automation inspect` /
 `scope show` so a talker can name the stall without a journal.
+
+## Open questions
+
+Product intent the machine does not decide (reported per
+sdo-a89.14; none of these change the behaviour specified above, so
+this spec stays sound while they are open):
+
+- Whether `fork/cap/<id>` is ever created. Push remains Ata's
+  product gate. While the ref is absent, ticks bootstrap per D1a.
+  If the ref later appears, the fetch succeeds and the existing
+  fetch-compare-ff-only path runs; content the local branch does
+  not contain is the `worktree-diverged` recovery in
+  `ensure_clean_worktree`. Those are different mechanisms:
+  bootstrap never runs once the ref resolves, and recovery never
+  runs while it does not.
+- Which remote, if any, a maintainer may fetch an admitted artifact
+  from when the 40-hex does not resolve in the local object store.
+  Today that case is blocker `artifact-unresolvable`, not a fetch.
+- Which sha: settled for the specimen. Ata named
+  `76643a6871e1a17c4a199564df95e73490b1060a` and live
+  `desired-inputs.json` carries it. Future artifacts are midi's
+  classify-and-invoke, unchanged.

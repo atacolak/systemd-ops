@@ -36,6 +36,10 @@ FIRST_PREV=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 FIRST_CAND=ffffffffffffffffffffffffffffffffffffffff
 FIRST_PREV_COMPOSE=1111111111111111111111111111111111111111
 FIRST_CAND_COMPOSE=2222222222222222222222222222222222222222
+UNSET_PREV=3333333333333333333333333333333333333333
+UNSET_CAND=4444444444444444444444444444444444444444
+UNSET_PREV_COMPOSE=5555555555555555555555555555555555555555
+UNSET_CAND_COMPOSE=6666666666666666666666666666666666666666
 
 LIVE_GENS=/home/sf/worktrees/omp/generations
 LIVE_OMP=/home/sf/.bun/bin/omp
@@ -193,6 +197,10 @@ ack() {
 
 apply_token() {
   json automation apply --plan-token "$1"
+}
+
+apply_token_without_omp_install() {
+  env -u OMP_INSTALL "$BIN" --json --manager user --write-prefix 'managed-*' --scope-root "$SCOPE" automation apply --plan-token "$1"
 }
 
 ack_apply() {
@@ -368,6 +376,23 @@ jq -e --arg sha "$FIRST_CAND" --arg gen "$FIRST_CAND_COMPOSE" '
   .output_revision == $sha and .generation == $gen
 ' "$PUBLISHED" >/dev/null \
   || fail "first-try published-generation.json: $(cat "$PUBLISHED")"
+
+seed_promoted_and_candidate "$UNSET_PREV" "$UNSET_CAND" "$UNSET_PREV_COMPOSE" "$UNSET_CAND_COMPOSE"
+assert_pointers "$UNSET_PREV" "pass without parent OMP_INSTALL seed"
+before_published=$(cat "$PUBLISHED")
+planned=$(ack "$(midi_pass_spec "$UNSET_CAND" "$UNSET_CAND")")
+ok "$planned"
+applied=$(apply_token_without_omp_install "$(jq -er '.data.plan_token' <<<"$planned")" || true)
+ok "$applied"
+[[ $(cat "$PUBLISHED") != "$before_published" ]] \
+  || fail "pass without parent OMP_INSTALL did not rewrite published-generation.json"
+assert_pointers "$UNSET_CAND" "pass without parent OMP_INSTALL"
+jq -e --arg sha "$UNSET_CAND" --arg gen "$UNSET_CAND_COMPOSE" '
+  .output_revision == $sha and .generation == $gen
+' "$PUBLISHED" >/dev/null \
+  || fail "published-generation.json after pass without parent OMP_INSTALL: $(cat "$PUBLISHED")"
+live_omp_mid=$(readlink -f "$LIVE_OMP" 2>/dev/null || true)
+[[ $live_omp_mid == "$live_omp_before" ]] || fail "pass without parent OMP_INSTALL mutated live omp"
 
 live_gens_after=$(readlink -f "$LIVE_GENS/current" 2>/dev/null || true)
 live_omp_after=$(readlink -f "$LIVE_OMP" 2>/dev/null || true)

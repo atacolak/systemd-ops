@@ -9,12 +9,13 @@ SOURCE_DRIVER=${SOURCE_DRIVER:-$DOGFOOD_ROOT/drivers/capability-run}
 SOURCE_LIB=${SOURCE_LIB:-$DOGFOOD_ROOT/lib/automation-wrapper}
 SETTLE_LIB=${SETTLE_LIB:-$DOGFOOD_ROOT/lib/pr-settlement}
 REVIEW_LIB=${REVIEW_LIB:-$DOGFOOD_ROOT/lib/pr-review-state}
+SESSION_LIB=${SESSION_LIB:-$DOGFOOD_ROOT/lib/omp-session}
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 command -v jq >/dev/null || fail "jq required"
 [[ -x $BIN ]] || fail "missing $BIN"
 [[ -x $SOURCE_DRIVER ]] || fail "missing $SOURCE_DRIVER"
-[[ -r $SOURCE_LIB && -r $SETTLE_LIB && -r $REVIEW_LIB ]] || fail "missing libs"
+[[ -r $SOURCE_LIB && -r $SETTLE_LIB && -r $REVIEW_LIB && -r $SESSION_LIB ]] || fail "missing libs"
 
 G1=generation-G1
 G2=generation-G2
@@ -110,6 +111,7 @@ EOF
   cp "$SOURCE_LIB" "$SCOPE/.systemd-ops/lib/automation-wrapper"
   cp "$SETTLE_LIB" "$SCOPE/.systemd-ops/lib/pr-settlement"
   cp "$REVIEW_LIB" "$SCOPE/.systemd-ops/lib/pr-review-state"
+  cp "$SESSION_LIB" "$SCOPE/.systemd-ops/lib/omp-session"
   cat >"$SCOPE/.systemd-ops/drivers/capability-observe" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -238,6 +240,51 @@ write_fake_omp() {
     [[ -n $body ]] && printf '%s\n' "$body"
   } >"$SCOPE/fake-omp"
   chmod +x "$SCOPE/fake-omp"
+}
+
+# Fake omp parses --session-dir, writes one uniquely named file under that
+# directory when it exists, and records the directory outside the tree the
+# driver is expected to delete. $1 is the tail that decides the pass outcome.
+write_session_fake() {
+  local tail=$1
+  local parser
+  parser=$(cat <<'EOF'
+session_dir=""
+session_args=("$@")
+session_i=0
+while (( session_i < ${#session_args[@]} )); do
+  if [[ ${session_args[$session_i]} == --session-dir ]]; then
+    session_dir=${session_args[$((session_i+1))]}
+  fi
+  session_i=$((session_i+1))
+done
+if [[ -n $session_dir && -d $session_dir ]]; then
+  marker="pass-$(grep -c . "${SYSTEMD_OPS_SCOPE_ROOT}/agent-calls" || true)"
+  leftover=$(find "$session_dir" -mindepth 1 -print -quit 2>/dev/null || true)
+  if [[ -n $leftover ]]; then
+    printf '%s\n' "$marker saw $leftover" >>"${SYSTEMD_OPS_SCOPE_ROOT}/session-leftovers"
+  fi
+  printf 'marker\n' >"$session_dir/$marker"
+  printf '%s\n' "$session_dir" >>"${SYSTEMD_OPS_SCOPE_ROOT}/session-dirs-used"
+fi
+EOF
+)
+  write_fake_omp "$parser"$'\n'"$tail"
+}
+
+assert_omp_pass_session_removed() {
+  local label=$1
+  local expected="$SCOPE/.systemd-ops/operations/$CAP/state/omp-session"
+  local argv=$SCOPE/agent-argv.log
+  [[ -f $argv ]] || fail "$label did not record omp argv"
+  awk -v path="$expected" '
+    $0 == "--session-dir" { getline nxt; seen++; if (nxt != path) bad++ }
+    END { if (seen < 1 || bad) exit 1 }
+  ' "$argv" || fail "$label argv missing --session-dir $expected: $(tr '\n' ' ' <"$argv")"
+  [[ -s $SCOPE/session-dirs-used ]] || fail "$label fake omp did not write under --session-dir"
+  grep -qx -- "$expected" "$SCOPE/session-dirs-used" \
+    || fail "$label wrote under $(tr '\n' ' ' <"$SCOPE/session-dirs-used"), want $expected"
+  [[ ! -e $expected ]] || fail "$label left $expected"
 }
 
 write_desired_worktree_delta() {
@@ -697,5 +744,57 @@ jq -e --arg gen "$target" --arg fp "fp-cap" \
   '.version == 2 and .generation == $gen and .input_fingerprint == $fp' \
   "$CAP_STATE/checkpoint.json" >/dev/null \
   || fail "matching worktree-delta did not write a READY checkpoint: $(cat "$CAP_STATE/checkpoint.json")"
+
+# Pass sessions live under the operation state dir for the OMP invocation
+# and are gone when the driver returns: a READY report, a crash, and a
+# wake that reevaluates until MAX_INTELLIGENT_PASSES.
+make_scope
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+write_session_fake '"$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "cap ready" --summary '\''["ok"]'\'' --outcome ready >/dev/null'
+code=$(run_cap_code 1000 "$target" "$TMP/cap-session-ready.out")
+[[ $code -eq 0 ]] || fail "session READY exited $code: $(cat "$TMP/cap-session-ready.out")"
+jq -e '.outcome == "ready"' "$CAP_STATE/processed.json" >/dev/null \
+  || fail "session READY did not process the input as ready"
+assert_omp_pass_session_removed "session READY"
+
+make_scope
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+write_session_fake 'exit 7'
+code=$(run_cap_code 1000 "$target" "$TMP/cap-session-crash.out")
+[[ $code -eq 7 ]] || fail "session crash exited $code, want 7: $(cat "$TMP/cap-session-crash.out")"
+assert_omp_pass_session_removed "session crash"
+
+# Child revision changes during each pass, so the driver reevaluates instead
+# of certifying. The release gate still launches because the checkpoint
+# generation is the target. Three passes, then no session directory.
+make_scope
+target=$(git -C "$SCOPE/worktree" rev-parse HEAD)
+set_target "$target"
+write_child "$PRA" false obs-a "$target" obs-a blocked "2026-09-01T00:01:00Z"
+write_child "$PRB" false obs-b "$target" obs-b ready "2026-09-01T00:01:00Z"
+write_session_fake "$(cat <<'EOF'
+n=$(grep -c . "${SYSTEMD_OPS_SCOPE_ROOT}/agent-calls" || true)
+jq --arg t "pass-${n}" \
+  '.data.relations.children[0].latest_iteration.finished_at = $t' \
+  "${SYSTEMD_OPS_SCOPE_ROOT}/context.json" >"${SYSTEMD_OPS_SCOPE_ROOT}/context.json.tmp"
+mv "${SYSTEMD_OPS_SCOPE_ROOT}/context.json.tmp" "${SYSTEMD_OPS_SCOPE_ROOT}/context.json"
+"$SYSTEMD_OPS_BIN" --json --manager user automation report --headline "cap ready" --summary '["ok"]' --outcome ready >/dev/null
+EOF
+)"
+code=$(MAX_INTELLIGENT_PASSES=3 run_cap_code 1000 "$target" "$TMP/cap-session-loop.out")
+[[ $code -eq 0 ]] || fail "session loop exited $code: $(cat "$TMP/cap-session-loop.out")"
+[[ $(grep -c . "$SCOPE/agent-calls" || true) -eq 3 ]] \
+  || fail "session loop did not invoke OMP three times: $(cat "$SCOPE/agent-calls" 2>/dev/null || true)"
+[[ ! -e $CAP_STATE/processed.json ]] || fail "session loop certified the input"
+[[ ! -s $SCOPE/session-leftovers ]] || fail "a later pass saw a previous session file: $(cat "$SCOPE/session-leftovers")"
+[[ $(grep -c . "$SCOPE/session-dirs-used" || true) -eq 3 ]] \
+  || fail "session loop did not write a session file on every pass"
+assert_omp_pass_session_removed "session loop"
 
 echo "capability-release-run ok"

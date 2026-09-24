@@ -30,6 +30,8 @@ source "$SCOPE_ROOT/.systemd-ops/lib/automation-wrapper"
 source "$SCOPE_ROOT/.systemd-ops/lib/pr-settlement"
 # shellcheck source=../lib/pr-review-state
 source "$SCOPE_ROOT/.systemd-ops/lib/pr-review-state"
+# shellcheck source=../lib/omp-session
+source "$SCOPE_ROOT/.systemd-ops/lib/omp-session"
 
 # A capability pass that exits 0 without calling automation_report is normally a
 # contract failure, and the run parks on it. When the driver can machine-verify
@@ -104,7 +106,15 @@ capability_desired_unconsumed() {
   return 1
 }
 
+pre_clean_worktree=$WORKTREE
 ensure_clean_worktree "$BRANCH" || exit $?
+# A rebind abandons the old tree. When the abandoned tree is itself a
+# recovered tree, its default-root session bucket is a recovered-tree
+# session and is not left behind. Original-tree buckets stay: they hold
+# capability history and possibly human sessions.
+if [[ $WORKTREE != "$pre_clean_worktree" ]]; then
+  gc_recovered_tree_session_bucket "$pre_clean_worktree" || true
+fi
 git -C "$WORKTREE" fetch --quiet fork main || true
 upstream_generation=$(resolve_target_generation) || exit $?
 
@@ -133,6 +143,10 @@ exec 9>"$STATE_DIR/.wake.lock"
 if ! flock -n 9; then
   exit 0
 fi
+
+# STATE_DIR is already set. The trap closes over it so an exit that skips
+# the post-pass cleanup still removes this wake's session directory.
+trap 'cleanup_omp_pass_session "$STATE_DIR/omp-session"' EXIT
 
 passes=0
 while (( passes < MAX_INTELLIGENT_PASSES )); do
@@ -200,8 +214,9 @@ while (( passes < MAX_INTELLIGENT_PASSES )); do
     extra_prompt="This is a release-generation pass. Consume the target generation, the known-good local capability, and accumulated useful PR-child improvements. Do not require every PR READY. Do not blindly merge every PR head."
   fi
 
+  prepare_omp_pass_session "$STATE_DIR/omp-session"
   "$OMP_BIN" -p --agent capability-maintainer --agent-cwd "$AGENT_CWD" \
-    --cwd "$WORKTREE" --approval-mode yolo --max-time 60m \
+    --cwd "$WORKTREE" --session-dir "$STATE_DIR/omp-session" --approval-mode yolo --max-time 60m \
     "Repository: atacolak/oh-my-pi
 Capability branch: $BRANCH
 Operation stem: $OPERATION_STEM
@@ -213,6 +228,7 @@ BLOCKED reports require route=self|parent.
 PR children are publication/review streams, not semaphores. Maintain the local capability against the target generation even if a child PR is BLOCKED. Only BLOCKED if the LOCAL capability cannot be made correct. $extra_prompt Perform exactly one capability maintenance pass, then exit."
 
   omp_code=$?
+  cleanup_omp_pass_session "$STATE_DIR/omp-session" || true
 
   # A verified no-op pass that never called automation_report would otherwise
   # burn a contract-failure park, so the driver emits that READY report itself

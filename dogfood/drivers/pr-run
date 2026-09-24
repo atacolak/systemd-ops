@@ -29,6 +29,8 @@ export PATH="/home/sf/.bun/bin:/home/sf/.local/bin:/usr/local/bin:/usr/bin:/bin"
 source "$SCOPE_ROOT/.systemd-ops/lib/automation-wrapper"
 # shellcheck source=../lib/pr-attempt
 source "$SCOPE_ROOT/.systemd-ops/lib/pr-attempt"
+# shellcheck source=../lib/omp-session
+source "$SCOPE_ROOT/.systemd-ops/lib/omp-session"
 
 current_input=$(observe_input) || exit $?
 if input_is_processed "$current_input"; then
@@ -87,7 +89,15 @@ WORKTREE=$ATTEMPT_WORKTREE
 export WORKTREE
 
 cleanup_attempt() {
+  # dispose_pr_attempt blanks ATTEMPT_WORKTREE, so keep the path first.
+  local attempt=${ATTEMPT_WORKTREE:-}
   dispose_pr_attempt
+  # The attempt cwd is unique per attempt, so its default-root session
+  # bucket is exclusive to this pass; the session and its bash.log go
+  # with the attempt. Best-effort: GC failure never fails the pass.
+  if [[ -n $attempt ]]; then
+    gc_exclusive_session_bucket "$attempt" || true
+  fi
 }
 trap cleanup_attempt EXIT
 
