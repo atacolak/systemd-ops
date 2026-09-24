@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use serde_json::{json, Value};
 use systemd_ops::automation;
 use systemd_ops::config::OpsConfig;
+use systemd_ops::invariant;
 use systemd_ops::json;
 use systemd_ops::operations;
 use systemd_ops::operator;
@@ -51,6 +52,8 @@ Commands:
 
   scope show
   scope validate
+
+  invariant check [--invariants PATH]
 
   operator show --unit STEM
   operator set --unit STEM [--about TEXT] [--headline TEXT] [--body TEXT]
@@ -139,6 +142,24 @@ fn from_result(json_mode: bool, result: Result<Value, BackendError>) -> ExitCode
             }
             ExitCode::FAILURE
         }
+    }
+}
+
+fn print_invariant_human(data: &Value) {
+    let status = data
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    println!("invariant {status}");
+    let Some(checks) = data.get("checks").and_then(Value::as_array) else {
+        println!("{data}");
+        return;
+    };
+    for check in checks {
+        let id = check.get("id").and_then(Value::as_str).unwrap_or("?");
+        let check_status = check.get("status").and_then(Value::as_str).unwrap_or("?");
+        let summary = check.get("summary").and_then(Value::as_str).unwrap_or("");
+        println!("{check_status}  {id}  {summary}");
     }
 }
 
@@ -405,6 +426,18 @@ fn spec_from_flat(args: &mut Vec<String>) -> Result<Value, String> {
             "nice".into(),
             json!(v.parse::<i64>().map_err(|_| "nice must be an integer")?),
         );
+    }
+    for (flag, key) in [
+        ("--restart-sec", "restart_sec"),
+        ("--start-limit-interval-sec", "start_limit_interval_sec"),
+        ("--start-limit-burst", "start_limit_burst"),
+    ] {
+        if let Some(v) = take_opt(args, flag)? {
+            let n = v
+                .parse::<u64>()
+                .map_err(|_| format!("{flag} must be an integer"))?;
+            spec.insert(key.into(), json!(n));
+        }
     }
     if let Some(v) = take_opt(args, "--enabled")? {
         spec.insert("enabled".into(), json!(v == "true" || v == "1"));
@@ -1042,6 +1075,24 @@ fn main() -> ExitCode {
             Err(e) => fail(json_mode, "error", &e.0),
         };
     }
+    if group == "invariant" {
+        return match invariant::run(&mut rest, scope_root.as_deref(), cwd_ref) {
+            Ok((data, blocked)) => {
+                let code = if blocked {
+                    ExitCode::from(1)
+                } else {
+                    ExitCode::SUCCESS
+                };
+                if json_mode {
+                    println!("{}", json::ok(data));
+                } else {
+                    print_invariant_human(&data);
+                }
+                code
+            }
+            Err(e) => fail(json_mode, "invalid_argument", &e.0),
+        };
+    }
     if rest.is_empty() {
         return fail(
             json_mode,
@@ -1072,7 +1123,7 @@ fn main() -> ExitCode {
         other => fail(
             json_mode,
             "invalid_argument",
-            &format!("unknown command '{other}' (inspect, control, author, scope, operator, automation, tui)"),
+            &format!("unknown command '{other}' (inspect, control, author, scope, invariant, operator, automation, tui)"),
         ),
     }
 }
@@ -1107,5 +1158,29 @@ mod tests {
             "operator report --unit STEM --headline TEXT --summary JSON_ARRAY --outcome ready|blocked"
         ));
         assert!(USAGE.contains("automation release-park --unit STEM"));
+        assert!(USAGE.contains("invariant check [--invariants PATH]"));
+    }
+
+    #[test]
+    fn flat_spec_parses_restart_circuit_breaker_integers() {
+        let mut args = vec![
+            "--unit".into(),
+            "managed-test".into(),
+            "--kind".into(),
+            "simple".into(),
+            "--restart".into(),
+            "on-failure".into(),
+            "--restart-sec".into(),
+            "45".into(),
+            "--start-limit-interval-sec=600".into(),
+            "--start-limit-burst".into(),
+            "5".into(),
+        ];
+        let spec = spec_from_flat(&mut args).unwrap();
+        assert_eq!(spec["restart"], json!("on-failure"));
+        assert_eq!(spec["restart_sec"], json!(45));
+        assert_eq!(spec["start_limit_interval_sec"], json!(600));
+        assert_eq!(spec["start_limit_burst"], json!(5));
+        assert!(args.is_empty());
     }
 }

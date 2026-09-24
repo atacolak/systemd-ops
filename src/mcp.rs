@@ -107,6 +107,9 @@ fn spec_schema() -> Value {
             "after": { "type": "array", "items": { "type": "string" } },
             "wants_network_online": { "type": "boolean" },
             "restart": { "type": "string", "enum": ["no", "on-failure", "always"] },
+            "restart_sec": { "type": "integer", "minimum": 1, "maximum": 86400, "description": "RestartSec for simple operations with restart on-failure or always. Default 30." },
+            "start_limit_interval_sec": { "type": "integer", "minimum": 1, "maximum": 604800, "description": "StartLimitIntervalSec under [Unit]. Default 300 when restart is not no." },
+            "start_limit_burst": { "type": "integer", "minimum": 1, "maximum": 100, "description": "StartLimitBurst under [Unit]. Default 3 when restart is not no." },
             "nice": { "type": "integer" },
             "schedule": {
                 "type": "object",
@@ -585,7 +588,11 @@ fn run_tool(name: &str, args: &Value) -> Result<Value, CallError> {
         )?),
         "failed_units" => Ok(systemd::failed_units()?),
         "list_operations" => Ok(operations::list_operations(pattern_arg(args))?),
-        "get_operation" => Ok(automation::inspect_operation_view(required_unit(args)?, None, None)?),
+        "get_operation" => Ok(automation::inspect_operation_view(
+            required_unit(args)?,
+            None,
+            None,
+        )?),
         "get_unit" => Ok(systemd::get_unit(required_unit(args)?)?),
         "unit_properties" => {
             let select: Vec<String> = args

@@ -7,6 +7,7 @@
 
 pub mod automation;
 pub mod config;
+pub mod invariant;
 pub mod json;
 pub mod mcp;
 pub mod operations;

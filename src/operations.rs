@@ -104,6 +104,9 @@ pub struct NormalizedSpec {
     pub after: Vec<String>,
     pub wants_network_online: bool,
     pub restart: Option<String>,
+    pub restart_sec: Option<u32>,
+    pub start_limit_interval_sec: Option<u32>,
+    pub start_limit_burst: Option<u32>,
     pub nice: Option<i32>,
     pub schedule: Option<Schedule>,
     pub enabled: bool,
@@ -206,6 +209,9 @@ struct FileMeta {
     after: Vec<String>,
     wants_network_online: bool,
     restart: Option<String>,
+    restart_sec: Option<u32>,
+    start_limit_interval_sec: Option<u32>,
+    start_limit_burst: Option<u32>,
     nice: Option<i32>,
 }
 
@@ -558,6 +564,75 @@ fn parse_schedule(v: Option<&Value>, kind: Kind) -> Result<Option<Schedule>, Bac
     }
 }
 
+const RESTART_SEC_MAX: u32 = 86_400;
+const START_LIMIT_INTERVAL_MAX: u32 = 604_800;
+const START_LIMIT_BURST_MAX: u32 = 100;
+
+fn parse_u32_directive(rest: &str) -> Option<u32> {
+    rest.trim().parse().ok()
+}
+
+fn positive_bounded(label: &str, v: Option<&Value>, max: u32) -> Result<Option<u32>, BackendError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => {
+            let n = n
+                .as_u64()
+                .ok_or_else(|| BackendError(format!("{label} must be an integer in 1..{max}")))?;
+            if n == 0 || n > u64::from(max) {
+                return Err(BackendError(format!(
+                    "{label} must be an integer in 1..{max}"
+                )));
+            }
+            Ok(Some(n as u32))
+        }
+        Some(_) => Err(BackendError(format!(
+            "{label} must be an integer in 1..{max}"
+        ))),
+    }
+}
+
+fn parse_restart_limits(
+    obj: &Map<String, Value>,
+    kind: Kind,
+    restart: Option<&str>,
+) -> Result<(Option<u32>, Option<u32>, Option<u32>), BackendError> {
+    let restart_sec =
+        positive_bounded("spec.restart_sec", obj.get("restart_sec"), RESTART_SEC_MAX)?;
+    let start_limit_interval_sec = positive_bounded(
+        "spec.start_limit_interval_sec",
+        obj.get("start_limit_interval_sec"),
+        START_LIMIT_INTERVAL_MAX,
+    )?;
+    let start_limit_burst = positive_bounded(
+        "spec.start_limit_burst",
+        obj.get("start_limit_burst"),
+        START_LIMIT_BURST_MAX,
+    )?;
+    let any =
+        restart_sec.is_some() || start_limit_interval_sec.is_some() || start_limit_burst.is_some();
+    if any && kind != Kind::Simple {
+        return Err(BackendError(
+            "spec.restart_sec, spec.start_limit_interval_sec, and spec.start_limit_burst are only valid on simple operations".into(),
+        ));
+    }
+    let restarts = matches!(restart, Some(s) if s != "no");
+    if any && !restarts {
+        return Err(BackendError(
+            "spec.restart_sec, spec.start_limit_interval_sec, and spec.start_limit_burst are only valid when restart is on-failure or always".into(),
+        ));
+    }
+    if restarts {
+        Ok((
+            Some(restart_sec.unwrap_or(30)),
+            Some(start_limit_interval_sec.unwrap_or(300)),
+            Some(start_limit_burst.unwrap_or(3)),
+        ))
+    } else {
+        Ok((None, None, None))
+    }
+}
+
 fn spec_object(args: &Value) -> Result<&Value, BackendError> {
     args.get("spec")
         .ok_or_else(|| BackendError("missing required argument: spec".into()))
@@ -683,6 +758,8 @@ pub fn parse_spec(
         }
         None => None,
     };
+    let (restart_sec, start_limit_interval_sec, start_limit_burst) =
+        parse_restart_limits(obj, kind, restart.as_deref())?;
 
     let nice = match obj.get("nice") {
         Some(Value::Number(n)) => {
@@ -736,6 +813,9 @@ pub fn parse_spec(
         after,
         wants_network_online,
         restart,
+        restart_sec,
+        start_limit_interval_sec,
+        start_limit_burst,
         nice,
         schedule,
         enabled,
@@ -794,7 +874,10 @@ fn canonical_spec_json(spec: &NormalizedSpec) -> Value {
         "path": spec.path,
         "purpose": spec.purpose,
         "restart": spec.restart,
+        "restart_sec": spec.restart_sec,
         "schedule": schedule,
+        "start_limit_burst": spec.start_limit_burst,
+        "start_limit_interval_sec": spec.start_limit_interval_sec,
         "start_now": spec.start_now,
         "tags": spec.tags,
         "title": spec.title,
@@ -849,6 +932,12 @@ fn render_service(spec: &NormalizedSpec) -> String {
     if spec.wants_network_online {
         body.push_str("Wants=network-online.target\n");
     }
+    if let Some(interval) = spec.start_limit_interval_sec {
+        body.push_str(&format!("StartLimitIntervalSec={interval}\n"));
+    }
+    if let Some(burst) = spec.start_limit_burst {
+        body.push_str(&format!("StartLimitBurst={burst}\n"));
+    }
     body.push_str("\n[Service]\n");
     body.push_str(&format!("Type={}\n", spec.kind.service_type()));
     if spec.kind == Kind::OneshotLinger {
@@ -872,8 +961,8 @@ fn render_service(spec: &NormalizedSpec) -> String {
     ));
     if let Some(restart) = &spec.restart {
         body.push_str(&format!("Restart={restart}\n"));
-        if restart != "no" {
-            body.push_str("RestartSec=3\n");
+        if let Some(sec) = spec.restart_sec {
+            body.push_str(&format!("RestartSec={sec}\n"));
         }
     }
     if let Some(nice) = spec.nice {
@@ -1022,6 +1111,12 @@ fn parse_meta(text: &str) -> FileMeta {
             }
         } else if t.starts_with("Wants=") && t.contains("network-online.target") {
             meta.wants_network_online = true;
+        } else if let Some(rest) = t.strip_prefix("RestartSec=") {
+            meta.restart_sec = parse_u32_directive(rest);
+        } else if let Some(rest) = t.strip_prefix("StartLimitIntervalSec=") {
+            meta.start_limit_interval_sec = parse_u32_directive(rest);
+        } else if let Some(rest) = t.strip_prefix("StartLimitBurst=") {
+            meta.start_limit_burst = parse_u32_directive(rest);
         } else if let Some(rest) = t.strip_prefix("Restart=") {
             meta.restart = Some(rest.trim().to_string());
         } else if let Some(rest) = t.strip_prefix("Nice=") {
@@ -1283,6 +1378,9 @@ fn editable_spec_json(
         "after": after,
         "wants_network_online": svc.wants_network_online,
         "restart": svc.restart,
+        "restart_sec": svc.restart_sec,
+        "start_limit_interval_sec": svc.start_limit_interval_sec,
+        "start_limit_burst": svc.start_limit_burst,
         "nice": svc.nice,
         "schedule": schedule_view(timer_meta),
         "enabled": enablement_is_on(enablement),
@@ -2325,6 +2423,17 @@ mod tests {
         assert!(got.get("start_now").is_none());
         if spec.kind == Kind::Simple {
             assert_eq!(got["restart"], json!("on-failure"));
+            assert_eq!(got["restart_sec"], json!(spec.restart_sec));
+            assert_eq!(
+                got["start_limit_interval_sec"],
+                json!(spec.start_limit_interval_sec)
+            );
+            assert_eq!(got["start_limit_burst"], json!(spec.start_limit_burst));
+        } else {
+            assert!(got["restart"].is_null());
+            assert!(got["restart_sec"].is_null());
+            assert!(got["start_limit_interval_sec"].is_null());
+            assert!(got["start_limit_burst"].is_null());
         }
         match &spec.schedule {
             Some(Schedule::Calendar { on_calendar, .. }) => {
@@ -2350,6 +2459,171 @@ mod tests {
             }
             None => assert!(got["schedule"].is_null()),
         }
+        systemd::set_write_prefix(None);
+    }
+
+    fn simple_args(extra: Value) -> Value {
+        let mut spec = json!({
+            "unit": "managed-test-restart",
+            "kind": "simple",
+            "exec": { "path": "/bin/true", "argv": [] },
+            "restart": "on-failure"
+        });
+        if let (Value::Object(dst), Value::Object(src)) = (&mut spec, extra) {
+            for (k, v) in src {
+                dst.insert(k, v);
+            }
+        }
+        json!({ "spec": spec })
+    }
+
+    #[test]
+    fn restarting_simple_defaults_bounded_backoff() {
+        systemd::set_write_prefix(Some("managed-*".into()));
+        let spec = parse_spec(&simple_args(json!({})), None, Some("t0".into())).unwrap();
+        assert_eq!(spec.restart_sec, Some(30));
+        assert_eq!(spec.start_limit_interval_sec, Some(300));
+        assert_eq!(spec.start_limit_burst, Some(3));
+        let service = render_service(&spec);
+        let unit = service.split("[Service]").next().unwrap();
+        let svc = service.split("[Service]").nth(1).unwrap();
+        assert!(unit.contains("StartLimitIntervalSec=300\n"));
+        assert!(unit.contains("StartLimitBurst=3\n"));
+        assert!(!unit.contains("RestartSec="));
+        assert!(svc.contains("Restart=on-failure\n"));
+        assert!(svc.contains("RestartSec=30\n"));
+        assert!(!svc.contains("RestartSec=3\n"));
+        assert!(!svc.contains("StartLimit"));
+        let got = reconstruct_from_render(&spec);
+        assert_eq!(got["restart_sec"], json!(30));
+        assert_eq!(got["start_limit_interval_sec"], json!(300));
+        assert_eq!(got["start_limit_burst"], json!(3));
+        systemd::set_write_prefix(None);
+    }
+
+    #[test]
+    fn restart_limits_round_trip_when_set() {
+        systemd::set_write_prefix(Some("managed-*".into()));
+        let spec = parse_spec(
+            &simple_args(json!({
+                "restart": "always",
+                "restart_sec": 45,
+                "start_limit_interval_sec": 600,
+                "start_limit_burst": 5
+            })),
+            None,
+            Some("t0".into()),
+        )
+        .unwrap();
+        assert_eq!(spec.restart_sec, Some(45));
+        assert_eq!(spec.start_limit_interval_sec, Some(600));
+        assert_eq!(spec.start_limit_burst, Some(5));
+        let service = render_service(&spec);
+        assert!(service.contains("RestartSec=45\n"));
+        assert!(service.contains("StartLimitIntervalSec=600\n"));
+        assert!(service.contains("StartLimitBurst=5\n"));
+        let got = reconstruct_from_render(&spec);
+        assert_eq!(got["restart"], json!("always"));
+        assert_eq!(got["restart_sec"], json!(45));
+        assert_eq!(got["start_limit_interval_sec"], json!(600));
+        assert_eq!(got["start_limit_burst"], json!(5));
+        let again = parse_spec(&json!({ "spec": got }), None, Some("t0".into())).unwrap();
+        assert_eq!(again.restart_sec, Some(45));
+        assert_eq!(again.start_limit_interval_sec, Some(600));
+        assert_eq!(again.start_limit_burst, Some(5));
+        systemd::set_write_prefix(None);
+    }
+
+    #[test]
+    fn restart_no_omits_backoff_and_refuses_limits() {
+        systemd::set_write_prefix(Some("managed-*".into()));
+        let spec = parse_spec(
+            &simple_args(json!({ "restart": "no" })),
+            None,
+            Some("t0".into()),
+        )
+        .unwrap();
+        assert_eq!(spec.restart_sec, None);
+        assert_eq!(spec.start_limit_interval_sec, None);
+        assert_eq!(spec.start_limit_burst, None);
+        let service = render_service(&spec);
+        assert!(service.contains("Restart=no\n"));
+        assert!(!service.contains("RestartSec="));
+        assert!(!service.contains("StartLimit"));
+        let err = parse_spec(
+            &simple_args(json!({ "restart": "no", "restart_sec": 30 })),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only valid when restart is on-failure or always"),
+            "got: {err}"
+        );
+        systemd::set_write_prefix(None);
+    }
+
+    #[test]
+    fn oneshot_omits_restart_limits() {
+        systemd::set_write_prefix(Some("managed-*".into()));
+        let spec = parse_spec(&spec_json(), None, Some("t0".into())).unwrap();
+        assert_eq!(spec.restart, None);
+        assert_eq!(spec.restart_sec, None);
+        let service = render_service(&spec);
+        assert!(!service.contains("Restart="));
+        assert!(!service.contains("RestartSec="));
+        assert!(!service.contains("StartLimit"));
+        let err = parse_spec(
+            &json!({
+                "spec": {
+                    "unit": "managed-test-oneshot-limit",
+                    "kind": "oneshot",
+                    "exec": { "path": "/bin/true", "argv": [] },
+                    "start_limit_burst": 3
+                }
+            }),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("only valid on simple operations"),
+            "got: {err}"
+        );
+        systemd::set_write_prefix(None);
+    }
+
+    #[test]
+    fn restart_limits_reject_non_positive_and_unbounded() {
+        systemd::set_write_prefix(Some("managed-*".into()));
+        for bad in [json!(0), json!(-1), json!(86_401), json!("30"), json!(1.5)] {
+            let err =
+                parse_spec(&simple_args(json!({ "restart_sec": bad })), None, None).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("spec.restart_sec") && msg.contains("1..86400"),
+                "got: {msg}"
+            );
+        }
+        let err =
+            parse_spec(&simple_args(json!({ "start_limit_burst": 0 })), None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("spec.start_limit_burst")
+                && err.to_string().contains("1..100"),
+            "got: {err}"
+        );
+        let err = parse_spec(
+            &simple_args(json!({ "start_limit_interval_sec": 604_801 })),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("spec.start_limit_interval_sec")
+                && err.to_string().contains("1..604800"),
+            "got: {err}"
+        );
         systemd::set_write_prefix(None);
     }
 

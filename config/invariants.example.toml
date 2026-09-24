@@ -1,0 +1,15 @@
+# Paths are expanded from $HOME. No username is stored.
+# Copy to $XDG_CONFIG_HOME/systemd-ops/invariants.toml, or pass --invariants PATH.
+
+[paths]
+home = "$HOME"
+hcom_db = "$HOME/.hcom/hcom.db"
+dotfiles = "$HOME/dotfiles"
+systemd_ops_root = "$HOME/workspace/systemd-ops"
+actor_registry = "$HOME/.omp/agent/sessions"
+
+# Optional extra scope manifests. The resolved --scope-root is always checked.
+# scope_manifests = ["$HOME/workspace/example/.systemd-ops/scope.toml"]
+
+# Omit to use the active manager unit directory (user: $XDG_CONFIG_HOME/systemd/user).
+# unit_dir = "$HOME/.config/systemd/user"
