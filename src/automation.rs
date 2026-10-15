@@ -5836,6 +5836,65 @@ mod tests {
     }
 
     #[test]
+    fn causal_fingerprint_move_and_child_completion_rederive_parent() {
+        let parent = semantic_operation(
+            "managed-parent",
+            None,
+            "parent-in",
+            "gen",
+            Some("parent-in"),
+            Some("gen"),
+            None,
+            false,
+            "healthy",
+        );
+        let child = semantic_operation(
+            "managed-child",
+            Some("managed-parent"),
+            "child-in",
+            "gen",
+            Some("child-in"),
+            Some("gen"),
+            None,
+            false,
+            "healthy",
+        );
+
+        let mut ready = vec![parent, child];
+        derive_semantic_states(&mut ready);
+        assert_eq!(ready[0]["automation"]["semantic_state"], "ready");
+        assert_eq!(ready[1]["automation"]["semantic_state"], "ready");
+        assert_eq!(ready[0]["health"], "healthy");
+
+        let mut moved = ready.clone();
+        moved[1]["automation"]["observation"]["input_fingerprint"] = json!("child-in-2");
+        derive_semantic_states(&mut moved);
+        assert_eq!(moved[1]["automation"]["semantic_state"], "stale");
+        assert_eq!(moved[0]["automation"]["semantic_state"], "waiting");
+        assert_eq!(moved[0]["health"], "healthy");
+        assert_eq!(
+            moved[0]["automation"]["checkpoint"]["input_fingerprint"],
+            "parent-in"
+        );
+
+        let mut again = moved.clone();
+        derive_semantic_states(&mut again);
+        assert_eq!(again, moved);
+
+        let mut reconciled = moved.clone();
+        reconciled[1]["automation"]["checkpoint"]["input_fingerprint"] = json!("child-in-2");
+        derive_semantic_states(&mut reconciled);
+        assert_eq!(reconciled[1]["automation"]["semantic_state"], "ready");
+        assert_eq!(reconciled[0]["automation"]["semantic_state"], "ready");
+
+        let mut closed = moved;
+        closed[1]["automation"]["lifecycle"]["status"] = json!("completed");
+        derive_semantic_states(&mut closed);
+        assert_eq!(closed[1]["automation"]["semantic_state"], "stale");
+        assert_eq!(closed[0]["automation"]["semantic_state"], "ready");
+    }
+
+    #[test]
     fn old_input_blocker_expires_without_deleting_history() {
         let mut operations = vec![semantic_operation(
             "managed-proof",
